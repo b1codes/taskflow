@@ -14,6 +14,18 @@ Taskflow is a Go-based Model Context Protocol (MCP) server and CLI tool that syn
 
 An LLM agent loses context between invocations. Taskflow solves this by maintaining a structured session history that is returned to the agent every time a task is resumed. The cross-project snag index goes further: if the agent hit the same error in a different project last week and solved it, that resolution is surfaced automatically.
 
+### Portability Principle
+
+Taskflow must be plug-and-play for anyone who clones the repository. The setup contract is:
+
+1. Clone the repo.
+2. Set `CLICKUP_API_KEY`.
+3. `go build && taskflow init`.
+
+That's it. No hardcoded workspace IDs, space IDs, list IDs, or status names anywhere in the codebase. All ClickUp topology is discovered dynamically via the API key at runtime. Different developers have different ClickUp workspaces with different status labels, folder structures, and conventions — taskflow adapts to all of them because it queries ClickUp's API to understand the environment it's operating in.
+
+Taskflow is also agent-agnostic. Any coding agent that speaks MCP can use it. The global SQLite database is the shared state, and the MCP server is the universal interface. No agent-specific configuration is required.
+
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
@@ -24,7 +36,10 @@ An LLM agent loses context between invocations. Taskflow solves this by maintain
 | Data model | Normalized tables (not JSONB blobs) | Makes snag index queryable and checkpoint history clean |
 | Git context | Auto-capture with opt-out | Enriches checkpoints without manual effort |
 | ClickUp integration depth | Full bidirectional sync (read context, post comments, update status) | Taskflow becomes the single pane of glass |
-| Authentication | ClickUp API key via environment variable | Simplest path for single-user use; rate-limit-aware client |
+| ClickUp topology | Dynamically discovered via API, never hardcoded | Any developer's ClickUp workspace works out of the box |
+| Status mapping | Resolved by ClickUp status type (`open`, `active`, `closed`), not name | Works regardless of what a workspace calls its statuses |
+| Authentication | ClickUp API key via environment variable | Single setup step; rate-limit-aware client |
+| Agent compatibility | Agent-agnostic via MCP standard | Any MCP-speaking agent works without configuration |
 
 ---
 
@@ -144,6 +159,24 @@ The database lives at `~/.taskflow/sessions.db`. WAL mode is enabled on open for
 | `last_attempted_at` | `DATETIME` | | |
 | `error_msg` | `TEXT` | | Last failure reason |
 
+### `clickup_cache`
+
+Caches ClickUp topology discovered via the API so that status mapping and workspace navigation work without repeated API calls.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | |
+| `entity_type` | `TEXT` | `NOT NULL` | `workspace`, `space`, `folder`, `list`, `status` |
+| `entity_id` | `TEXT` | `NOT NULL` | ClickUp's ID for this entity |
+| `parent_id` | `TEXT` | | Parent entity ID (e.g., a list's space ID) |
+| `name` | `TEXT` | `NOT NULL` | Display name |
+| `status_type` | `TEXT` | | For `status` entities: `open`, `active`, `closed`, `custom` |
+| `order_index` | `INTEGER` | | Position within parent (for status ordering) |
+| `extra` | `TEXT` | | JSON blob for additional metadata (color, etc.) |
+| `fetched_at` | `DATETIME` | `NOT NULL` | When this was last fetched from ClickUp |
+
+The cache uses a TTL model: entries older than 24 hours are considered stale and re-fetched on next access. Manual refresh is available via `taskflow init --refresh`.
+
 ### Indexes
 
 ```sql
@@ -152,6 +185,8 @@ CREATE INDEX idx_sessions_status ON sessions(status);
 CREATE INDEX idx_sessions_project_status ON sessions(project_path, status);
 CREATE INDEX idx_snags_error_signature ON snags(error_signature);
 CREATE INDEX idx_sync_queue_status ON sync_queue(status);
+CREATE UNIQUE INDEX idx_clickup_cache_entity ON clickup_cache(entity_type, entity_id);
+CREATE INDEX idx_clickup_cache_parent ON clickup_cache(entity_type, parent_id);
 ```
 
 ### Error Signature Normalization
@@ -186,15 +221,16 @@ These five operations are exposed as both MCP tools (via `mcp-go`) and CLI comma
 **Behavior:**
 
 1. Calls ClickUp API to validate `task_id` exists. Caches `task_name` and `task_description` locally.
-2. Checks for an existing session with this `task_id`:
+2. **Discovers the task's list statuses** if not already cached (fetches list details, caches all available statuses with their types in `clickup_cache`).
+3. Checks for an existing session with this `task_id`:
    - **No prior session** → creates a new `ACTIVE` session.
    - **`PAUSED` session exists** → resumes it (sets status to `ACTIVE`, updates `updated_at`).
    - **`ACTIVE` session already exists** → returns it idempotently (no duplicate created).
    - **`COMPLETED` or `ARCHIVED` session exists** → creates a new session (new attempt at the same task).
-3. Captures git context (branch, SHA, dirty files) from `project_path`.
-4. Writes `.b1codes/session.lock` in `project_path` containing the session ID.
-5. Enqueues `UPDATE_STATUS` → ClickUp "in progress".
-6. Returns the agentic contract blob.
+4. Captures git context (branch, SHA, dirty files) from `project_path`.
+5. Writes `.b1codes/session.lock` in `project_path` containing the session ID.
+6. Enqueues `UPDATE_STATUS` → ClickUp, resolved dynamically: finds the first status with `status_type = 'active'` from the cached list statuses. If no `active`-type status exists, logs a warning and skips the status update.
+7. Returns the agentic contract blob.
 
 **Agentic Contract (return value):**
 
@@ -315,15 +351,23 @@ The `history.checkpoints` array contains the last 3 checkpoints (newest first). 
 1. If `summary` is provided, creates a final checkpoint.
 2. Sets session status. Valid values: `COMPLETED`, `ARCHIVED`, `PAUSED`.
 3. Removes `.b1codes/session.lock` from the project directory (unless `PAUSED`).
-4. Enqueues `UPDATE_STATUS` → ClickUp. Mapping: `COMPLETED` → done, `PAUSED` → in progress, `ARCHIVED` → closed.
+4. Enqueues `UPDATE_STATUS` → ClickUp, resolved dynamically from `clickup_cache`:
+   - `COMPLETED` → first status with `status_type = 'closed'`
+   - `PAUSED` → first status with `status_type = 'active'` (task is still in progress)
+   - `ARCHIVED` → first status with `status_type = 'closed'`
+   - If no matching status type is found, log a warning and skip the status update. Comments still post.
 5. Enqueues `POST_COMMENT` → ClickUp with a session summary including duration, checkpoint count, snag count, and final resolution.
 
 ### CLI-Only Commands
 
 - **`taskflow serve`** — Starts the MCP server on stdio. The sync worker runs as a background goroutine for the server's lifetime.
-- **`taskflow init`** — Manually initializes `~/.taskflow/sessions.db`. Also runs automatically on first use of any command.
+- **`taskflow init`** — Initializes `~/.taskflow/sessions.db` and **scans the user's ClickUp workspace topology** (workspaces → spaces → folders → lists → statuses), caching everything in `clickup_cache`. This is the one-time setup step after setting `CLICKUP_API_KEY`. Use `--refresh` to re-scan and update the cache. Also runs automatically (database creation only, not the full scan) on first use of any command.
 - **`taskflow sync`** — Manually drains all `PENDING` and retryable `FAILED` items in the sync queue, then exits.
 - **`taskflow config set <key> <value>`** — Set configuration values (e.g., `clickup_api_key`, `auto_git_context`).
+
+### MCP-Only Tools
+
+- **`tf_init`** — MCP-exposed version of `taskflow init`. Scans ClickUp workspace topology and returns a summary of discovered workspaces, spaces, and lists. Useful for an agent to understand the user's ClickUp environment.
 
 ---
 
@@ -457,8 +501,8 @@ ClickUp integration is validated manually or behind a `//go:build clickup` tag t
 
 | Phase | Scope | Deliverable |
 |---|---|---|
-| **Phase 1: Skeleton** | `cmd/taskflow/main.go`, cobra root + `serve`/`init` commands, SQLite initialization with migrations, `config/` package, WAL mode setup | A binary that boots, creates `~/.taskflow/`, initializes the database, and responds to `taskflow init` and `taskflow --help` |
+| **Phase 1: Skeleton** | `cmd/taskflow/main.go`, cobra root + `serve`/`init` commands, SQLite initialization with all table migrations (including `clickup_cache`), `config/` package, WAL mode setup | A binary that boots, creates `~/.taskflow/`, initializes the database, and responds to `taskflow init` and `taskflow --help` |
 | **Phase 2: Core Sessions** | `session/`, `store/`, `gitctx/`, all CLI commands (start/stop/list/checkpoint/snag), `.b1codes/session.lock` management | Fully functional local session tracking via CLI. No MCP, no ClickUp. All unit tests passing. |
-| **Phase 3: MCP Server** | `server/` package, `mcp-go` integration, register all five MCP tools, wire handlers to same `session/` logic as CLI | `taskflow serve` starts an MCP server that an LLM agent can invoke. The agentic contract blob works end-to-end. |
-| **Phase 4: ClickUp Integration** | `clickup/` client, `sync/` queue + worker, enqueue logic wired into tool handlers | Full bidirectional sync. Checkpoints and snags appear as ClickUp comments. Task status updates flow. Rate limiting works. |
-| **Phase 5: Resilience & Polish** | Integration tests, concurrent access hardening, `taskflow sync` CLI command, error message polish, README documentation | Production-ready for daily use. |
+| **Phase 3: MCP Server** | `server/` package, `mcp-go` integration, register all five core MCP tools + `tf_init`, wire handlers to same `session/` logic as CLI | `taskflow serve` starts an MCP server that an LLM agent can invoke. The agentic contract blob works end-to-end. |
+| **Phase 4: ClickUp Integration** | `clickup/` client with dynamic topology discovery, `clickup_cache` population, `sync/` queue + worker, enqueue logic wired into tool handlers, dynamic status resolution | Full bidirectional sync. `taskflow init` scans ClickUp workspace. Checkpoints and snags appear as ClickUp comments. Status updates resolved by type, not name. Rate limiting works. |
+| **Phase 5: Resilience & Polish** | Integration tests, concurrent access hardening, `taskflow sync` CLI command, cache TTL/refresh, error message polish, README documentation | Production-ready for daily use. Plug-and-play: clone, set API key, build, init, go. |
