@@ -36,6 +36,17 @@ type Snag struct {
 	ResolvedAt     *time.Time `json:"resolved_at"`
 }
 
+type Decision struct {
+	ID        string    `json:"id"`
+	SessionID string    `json:"session_id"`
+	Topic     string    `json:"topic"`
+	Decision  string    `json:"decision"`
+	Rationale string    `json:"rationale"`
+	Status    string    `json:"status"`
+	Files     []string  `json:"files"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type GitContext struct {
 	Branch     string   `json:"branch"`
 	SHA        string   `json:"sha"`

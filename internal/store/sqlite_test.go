@@ -31,7 +31,7 @@ func TestSQLiteStore_Init(t *testing.T) {
 		tables[name] = true
 	}
 
-	requiredTables := []string{"schema_version", "sessions", "checkpoints", "snags", "sync_queue", "clickup_cache"}
+	requiredTables := []string{"schema_version", "sessions", "checkpoints", "snags", "decisions", "sync_queue", "clickup_cache"}
 	for _, table := range requiredTables {
 		if !tables[table] {
 			t.Errorf("expected table %s to exist", table)
@@ -257,5 +257,53 @@ func TestSQLiteStore_SnagCRUDAndMatch(t *testing.T) {
 	}
 	if len(resolutions) != 1 || resolutions[0].ID != snag1.ID {
 		t.Errorf("expected to find snag-1 as resolution, got: %d", len(resolutions))
+	}
+}
+
+func TestSQLiteStore_DecisionCRUD(t *testing.T) {
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	sess := &session.Session{
+		ID:          "sess-dec-123",
+		TaskID:      "task-dec",
+		ProjectPath: "/tmp/project",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	d := &session.Decision{
+		ID:        "dec-123",
+		SessionID: "sess-dec-123",
+		Topic:     "Folder Naming",
+		Decision:  "Retain /internal/gitctx",
+		Rationale: "Go idiomatic naming convention",
+		Status:    "no_change",
+		Files:     []string{"internal/gitctx"},
+		CreatedAt: time.Now().Round(time.Second),
+	}
+
+	if err := st.CreateDecision(ctx, d); err != nil {
+		t.Fatalf("CreateDecision failed: %v", err)
+	}
+
+	decisions, err := st.ListDecisionsBySession(ctx, "sess-dec-123")
+	if err != nil {
+		t.Fatalf("ListDecisionsBySession failed: %v", err)
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("expected 1 decision, got %d", len(decisions))
+	}
+	got := decisions[0]
+	if got.Topic != d.Topic || got.Decision != d.Decision || got.Rationale != d.Rationale || len(got.Files) != 1 || got.Files[0] != "internal/gitctx" {
+		t.Errorf("decision mismatch: %+v", got)
 	}
 }

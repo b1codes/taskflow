@@ -22,6 +22,7 @@ Running the built binary:
 ./taskflow init                # scan ClickUp workspace, populate local cache
 ./taskflow start <task_id> <project_path>
 ./taskflow checkpoint <session_id> "summary" --files a.go,b.go
+./taskflow decision <session_id> --topic "..." --decision "..." --rationale "..."
 ./taskflow snag <session_id> "error text" --category build
 ./taskflow stop <session_id> --summary "..." --status completed
 ./taskflow list --status active,paused
@@ -53,7 +54,7 @@ A per-project advisory lock lives at `<project_path>/.b1codes/session.lock` (`in
 
 ### Agentic contract
 
-`Service.BuildAgenticContract` assembles the JSON payload returned by `tf_start`/CLI `start` — recent checkpoints, unresolved snags, and cross-session "related resolutions" (snags with a matching normalized error signature resolved in *other* sessions/projects, found via `store.FindMatchingResolutions`). This is the primary mechanism for giving an LLM agent continuity across session starts/resumes.
+`Service.BuildAgenticContract` assembles the JSON payload returned by `tf_start`/CLI `start` — recent checkpoints, logged decisions & dialogue rationales, unresolved snags, and cross-session "related resolutions" (snags with a matching normalized error signature resolved in *other* sessions/projects, found via `store.FindMatchingResolutions`). This is the primary mechanism for giving an LLM agent continuity across session starts/resumes.
 
 ## Design docs
 

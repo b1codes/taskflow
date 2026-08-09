@@ -111,6 +111,16 @@ func (s *Server) registerTools() {
 		mcp.WithString("resolution", mcp.Description("Optional resolution description if already resolved")),
 	), s.handleSnag)
 
+	s.mcpServer.AddTool(mcp.NewTool("tf_decision",
+		mcp.WithDescription("Log a design choice, trade-off, or non-action justification agreed upon during dialogue"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
+		mcp.WithString("topic", mcp.Required(), mcp.Description("Topic or subject of the decision (e.g. 'Folder Naming for /internal/gitctx')")),
+		mcp.WithString("decision", mcp.Required(), mcp.Description("The agreed decision outcome (e.g. 'Retain current folder name')")),
+		mcp.WithString("rationale", mcp.Required(), mcp.Description("Detailed explanation and context for why this choice was made")),
+		mcp.WithString("status", mcp.Description("Outcome status: no_change (default), accepted, rejected_alternative, postponed")),
+		mcp.WithArray("files", mcp.WithStringItems(), mcp.Description("Optional list of related file or folder paths")),
+	), s.handleDecision)
+
 	s.mcpServer.AddTool(mcp.NewTool("tf_list",
 		mcp.WithDescription("List coding sessions"),
 		mcp.WithString("status", mcp.Description("Optional comma-separated statuses to filter (active, paused, completed, archived)")),
@@ -190,6 +200,39 @@ func (s *Server) handleSnag(ctx context.Context, request mcp.CallToolRequest) (*
 	resolution := request.GetString("resolution", "")
 
 	res, err := s.service.LogSnag(ctx, sessionID, errorText, category, resolution)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	b, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	return mcp.NewToolResultText(string(b)), nil
+}
+
+func (s *Server) handleDecision(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	topic, err := request.RequireString("topic")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	decision, err := request.RequireString("decision")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	rationale, err := request.RequireString("rationale")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	status := request.GetString("status", "no_change")
+	files := request.GetStringSlice("files", nil)
+
+	res, err := s.service.LogDecision(ctx, sessionID, topic, decision, rationale, status, files)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

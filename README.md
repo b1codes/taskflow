@@ -6,6 +6,7 @@ Taskflow is a developer productivity tool and context engine that connects your 
 
 - **Session Tracking**: Start, checkpoint, pause, resume, and stop task-aligned coding sessions.
 - **Git Context Capturing**: Automatically capture git status, active branch, and commit diff context.
+- **Dialogue & Rationale Tracking**: Log design choices, trade-offs, and non-change justifications during user dialogue to ensure rationale is documented in ClickUp.
 - **Dynamic ClickUp Sync**: Map task statuses dynamically and enqueue progress comments asynchronously.
 - **MCP Server Protocol**: Expose standard tools to LLM models for seamless agent integration.
 - **Offline Resilience**: Maintain a WAL-mode SQLite database with a rate-limited retry worker to guarantee sync delivery.
@@ -39,6 +40,11 @@ Taskflow is a developer productivity tool and context engine that connects your 
 ### Save progress (checkpoint)
 ```bash
 ./taskflow checkpoint <session_id> "Refactored user router" --files router.go,main.go
+```
+
+### Log design decisions & dialogue rationales
+```bash
+./taskflow decision <session_id> --topic "Folder Naming" --decision "Retain /internal/gitctx" --rationale "Follows Go package naming conventions"
 ```
 
 ### Log snags and blockers

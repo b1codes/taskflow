@@ -85,6 +85,7 @@ type TaskContractInfo struct {
 type ContractHistory struct {
 	Checkpoints        []CheckpointContractInfo `json:"checkpoints"`
 	Snags              []SnagContractInfo       `json:"snags"`
+	Decisions          []DecisionContractInfo   `json:"decisions"`
 	RelatedResolutions []RelatedResolution      `json:"related_resolutions"`
 }
 
@@ -99,6 +100,15 @@ type SnagContractInfo struct {
 	Category   string    `json:"category"`
 	Resolution string    `json:"resolution"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type DecisionContractInfo struct {
+	Topic     string    `json:"topic"`
+	Decision  string    `json:"decision"`
+	Rationale string    `json:"rationale"`
+	Status    string    `json:"status"`
+	Files     []string  `json:"files"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type RelatedResolution struct {
@@ -353,6 +363,56 @@ func (s *Service) LogSnag(ctx context.Context, sessionID, errorText, category, r
 	}, nil
 }
 
+func (s *Service) LogDecision(ctx context.Context, sessionID, topic, decision, rationale, status string, files []string) (*Decision, error) {
+	sess, err := s.store.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session to log decision: %w", err)
+	}
+
+	if sess.Status != StatusActive {
+		return nil, fmt.Errorf("cannot log decision for non-active session (status: %s)", sess.Status)
+	}
+
+	if status == "" {
+		status = "no_change"
+	}
+
+	d := &Decision{
+		ID:        uuid.New().String(),
+		SessionID: sessionID,
+		Topic:     topic,
+		Decision:  decision,
+		Rationale: rationale,
+		Status:    status,
+		Files:     files,
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.store.CreateDecision(ctx, d); err != nil {
+		return nil, fmt.Errorf("failed to create decision: %w", err)
+	}
+
+	_ = s.store.UpdateSessionUpdatedAt(ctx, sessionID, time.Now())
+
+	var filesStr = "none"
+	if len(d.Files) > 0 {
+		filesStr = strings.Join(d.Files, ", ")
+	}
+	commentText := fmt.Sprintf("## 💡 Decision & Rationale Logged: %s\n**Topic:** %s\n**Decision:** %s\n**Outcome:** %s\n**Rationale:** %s\n\n**Related Path(s):** %s",
+		d.CreatedAt.Format(time.RFC3339),
+		d.Topic,
+		d.Decision,
+		d.Status,
+		d.Rationale,
+		filesStr,
+	)
+	s.enqueueSync(ctx, sess.TaskID, "POST_DECISION", struct {
+		CommentText string `json:"comment_text"`
+	}{CommentText: commentText})
+
+	return d, nil
+}
+
 func (s *Service) List(ctx context.Context, filter SessionFilter) ([]*SessionSummary, error) {
 	sessions, err := s.store.ListSessions(ctx, filter)
 	if err != nil {
@@ -437,14 +497,16 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	// 2. Enqueue session summary comment
 	dbCheckpoints, _ := s.store.ListCheckpoints(ctx, sessionID, 0)
 	dbSnags, _ := s.store.ListSnagsBySession(ctx, sessionID)
+	dbDecisions, _ := s.store.ListDecisionsBySession(ctx, sessionID)
 	duration := time.Since(sess.StartedAt).Round(time.Second)
 
-	commentText := fmt.Sprintf("## Session Finished: %s\n**Status:** %s\n**Duration:** %s\n**Checkpoints:** %d\n**Snags:** %d",
+	commentText := fmt.Sprintf("## Session Finished: %s\n**Status:** %s\n**Duration:** %s\n**Checkpoints:** %d\n**Snags:** %d\n**Decisions Logged:** %d",
 		time.Now().Format(time.RFC3339),
 		tStatus,
 		duration.String(),
 		len(dbCheckpoints),
 		len(dbSnags),
+		len(dbDecisions),
 	)
 	s.enqueueSync(ctx, sess.TaskID, "POST_COMMENT", struct {
 		CommentText string `json:"comment_text"`
@@ -511,6 +573,21 @@ func (s *Service) BuildAgenticContract(ctx context.Context, sess *Session, gitCt
 		}
 	}
 
+	dbDecisions, err := s.store.ListDecisionsBySession(ctx, sess.ID)
+	var decisions []DecisionContractInfo
+	if err == nil {
+		for _, d := range dbDecisions {
+			decisions = append(decisions, DecisionContractInfo{
+				Topic:     d.Topic,
+				Decision:  d.Decision,
+				Rationale: d.Rationale,
+				Status:    d.Status,
+				Files:     d.Files,
+				CreatedAt: d.CreatedAt,
+			})
+		}
+	}
+
 	contract := &AgenticContract{
 		SessionID: sess.ID,
 		Task: TaskContractInfo{
@@ -521,6 +598,7 @@ func (s *Service) BuildAgenticContract(ctx context.Context, sess *Session, gitCt
 		History: ContractHistory{
 			Checkpoints:        checkpoints,
 			Snags:              unresolvedSnags,
+			Decisions:          decisions,
 			RelatedResolutions: relatedResolutions,
 		},
 		Resumed: resumed,

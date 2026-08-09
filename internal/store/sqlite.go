@@ -322,6 +322,45 @@ func (s *SQLiteStore) UpdateSnagResolution(ctx context.Context, id string, resol
 	return nil
 }
 
+// Decisions
+func (s *SQLiteStore) CreateDecision(ctx context.Context, d *session.Decision) error {
+	query := `INSERT INTO decisions (id, session_id, topic, decision, rationale, status, files, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	filesJSON := jsonMarshal(d.Files)
+	statusStr := d.Status
+	if statusStr == "" {
+		statusStr = "no_change"
+	}
+	_, err := s.db.ExecContext(ctx, query, d.ID, d.SessionID, d.Topic, d.Decision, d.Rationale, statusStr, filesJSON, d.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to create decision: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListDecisionsBySession(ctx context.Context, sessionID string) ([]*session.Decision, error) {
+	query := `SELECT id, session_id, topic, decision, rationale, status, files, created_at FROM decisions WHERE session_id = ? ORDER BY created_at ASC`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var decisions []*session.Decision
+	for rows.Next() {
+		var d session.Decision
+		var filesStr string
+		err := rows.Scan(&d.ID, &d.SessionID, &d.Topic, &d.Decision, &d.Rationale, &d.Status, &filesStr, &d.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan decision row: %w", err)
+		}
+		jsonUnmarshal(filesStr, &d.Files)
+		decisions = append(decisions, &d)
+	}
+
+	return decisions, nil
+}
+
 // ClickUp Cache
 func (s *SQLiteStore) UpsertCacheEntry(ctx context.Context, entry *CacheEntry) error {
 	query := `INSERT INTO clickup_cache (entity_type, entity_id, parent_id, name, status_type, order_index, extra, fetched_at)

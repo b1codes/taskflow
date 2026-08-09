@@ -12,6 +12,7 @@ type mockStore struct {
 	sessions    map[string]*Session
 	checkpoints map[string][]*Checkpoint
 	snags       map[string][]*Snag
+	decisions   map[string][]*Decision
 }
 
 func newMockStore() *mockStore {
@@ -19,6 +20,7 @@ func newMockStore() *mockStore {
 		sessions:    make(map[string]*Session),
 		checkpoints: make(map[string][]*Checkpoint),
 		snags:       make(map[string][]*Snag),
+		decisions:   make(map[string][]*Decision),
 	}
 }
 
@@ -155,6 +157,15 @@ func (m *mockStore) UpdateSnagResolution(ctx context.Context, id string, resolut
 	return errors.New("not found")
 }
 
+func (m *mockStore) CreateDecision(ctx context.Context, d *Decision) error {
+	m.decisions[d.SessionID] = append(m.decisions[d.SessionID], d)
+	return nil
+}
+
+func (m *mockStore) ListDecisionsBySession(ctx context.Context, sessionID string) ([]*Decision, error) {
+	return m.decisions[sessionID], nil
+}
+
 func (m *mockStore) CountPendingByTaskID(ctx context.Context, taskID string) (int, error) {
 	return 0, nil
 }
@@ -277,5 +288,40 @@ func TestService_SnagAndCheckpoint(t *testing.T) {
 	}
 	if snagRes.Snag.ErrorSignature != "panic in <file>:<line>" {
 		t.Errorf("expected normalized signature, got: %s", snagRes.Snag.ErrorSignature)
+	}
+}
+
+func TestService_Decision(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "taskflow-srv-test3-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := newMockStore()
+	git := &mockGit{ctx: &GitContext{Branch: "main", SHA: "sha123"}}
+	srv := NewService(store, git, nil)
+
+	ctx := context.Background()
+
+	res, _ := srv.Start(ctx, "task-1", tempDir, true)
+
+	dec, err := srv.LogDecision(ctx, res.Session.ID, "Folder Naming", "Retain /internal/gitctx", "Follows Go naming convention", "no_change", []string{"internal/gitctx"})
+	if err != nil {
+		t.Fatalf("LogDecision failed: %v", err)
+	}
+	if dec.Topic != "Folder Naming" {
+		t.Errorf("expected topic 'Folder Naming', got: %s", dec.Topic)
+	}
+
+	contract, err := srv.BuildAgenticContract(ctx, res.Session, git.ctx, false)
+	if err != nil {
+		t.Fatalf("BuildAgenticContract failed: %v", err)
+	}
+	if len(contract.History.Decisions) != 1 {
+		t.Fatalf("expected 1 decision in history contract, got: %d", len(contract.History.Decisions))
+	}
+	if contract.History.Decisions[0].Decision != "Retain /internal/gitctx" {
+		t.Errorf("expected decision text 'Retain /internal/gitctx', got: %s", contract.History.Decisions[0].Decision)
 	}
 }

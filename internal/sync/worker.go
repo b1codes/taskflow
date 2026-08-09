@@ -128,7 +128,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 
 	var opErr error
 	switch op.Operation {
-	case "POST_COMMENT", "POST_SNAG":
+	case "POST_COMMENT", "POST_SNAG", "POST_DECISION":
 		opErr = w.clickup.PostComment(ctx, op.TaskID, payload.CommentText)
 	case "UPDATE_STATUS":
 		statusName, err := clickup.ResolveStatus(ctx, w.store, w.clickup, op.TaskID, payload.StatusType)

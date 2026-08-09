@@ -82,6 +82,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_clickup_cache_entity ON clickup_cache(enti
 CREATE INDEX IF NOT EXISTS idx_clickup_cache_parent ON clickup_cache(entity_type, parent_id);
 `,
 	},
+	{
+		version: 2,
+		sql: `
+CREATE TABLE IF NOT EXISTS decisions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    topic TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'no_change',
+    files TEXT,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_session_id ON decisions(session_id);
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

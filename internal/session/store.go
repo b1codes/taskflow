@@ -20,6 +20,8 @@ type SessionStore interface {
 	ListSnagsBySession(ctx context.Context, sessionID string) ([]*Snag, error)
 	FindMatchingResolutions(ctx context.Context, signature string) ([]*Snag, error)
 	UpdateSnagResolution(ctx context.Context, id string, resolution string, resolvedAt time.Time) error
+	CreateDecision(ctx context.Context, d *Decision) error
+	ListDecisionsBySession(ctx context.Context, sessionID string) ([]*Decision, error)
 	CountPendingByTaskID(ctx context.Context, taskID string) (int, error)
 	EnqueueSync(ctx context.Context, op SyncOp) error
 }
