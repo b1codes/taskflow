@@ -543,6 +543,15 @@ func (s *SQLiteStore) ClearCache(ctx context.Context) error {
 	return nil
 }
 
+func (s *SQLiteStore) DeleteCacheEntries(ctx context.Context, entityType, parentID string) error {
+	query := `DELETE FROM clickup_cache WHERE entity_type = ? AND parent_id = ?`
+	_, err := s.db.ExecContext(ctx, query, entityType, parentID)
+	if err != nil {
+		return fmt.Errorf("failed to delete cache entries: %w", err)
+	}
+	return nil
+}
+
 // Sync Queue
 func (s *SQLiteStore) EnqueueSync(ctx context.Context, op session.SyncOp) error {
 	query := `INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at) 

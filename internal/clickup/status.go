@@ -37,6 +37,8 @@ func ResolveStatus(ctx context.Context, st store.Store, client *Client, taskID s
 			return "", fmt.Errorf("failed to get list details from ClickUp: %w", err)
 		}
 
+		_ = st.DeleteCacheEntries(ctx, "status", listID)
+
 		for _, stItem := range details.Statuses {
 			err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
 				EntityType: "status",

@@ -29,6 +29,7 @@ type Store interface {
 	GetListStatuses(ctx context.Context, listID string) ([]*CacheEntry, error)
 	IsCacheStale(ctx context.Context, entityType, entityID string, ttl time.Duration) (bool, error)
 	ClearCache(ctx context.Context) error
+	DeleteCacheEntries(ctx context.Context, entityType, parentID string) error
 
 	// Sync Queue
 	DequeuePending(ctx context.Context, limit int) ([]*session.SyncOp, error)
