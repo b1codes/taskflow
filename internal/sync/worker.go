@@ -32,6 +32,12 @@ func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *
 }
 
 func (w *Worker) Run(ctx context.Context) error {
+	if w.clickup == nil {
+		// With no ClickUp client configured, wait for shutdown without spinning
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
 	// Reset any stale in-flight ops on worker startup
 	_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
 
@@ -63,6 +69,10 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) DrainOnce(ctx context.Context) (int, error) {
+	if w.clickup == nil {
+		return 0, nil
+	}
+
 	_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
 
 	pending, err := w.store.DequeuePending(ctx, 100)
@@ -97,6 +107,10 @@ func (w *Worker) DrainOnce(ctx context.Context) (int, error) {
 }
 
 func (w *Worker) processBatch(ctx context.Context, limit int) (int, error) {
+	if w.clickup == nil {
+		return 0, nil
+	}
+
 	ops, err := w.store.DequeuePending(ctx, limit)
 	if err != nil {
 		return 0, err
@@ -133,7 +147,7 @@ func (w *Worker) processBatch(ctx context.Context, limit int) (int, error) {
 
 func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	if w.clickup == nil {
-		return w.store.MarkDone(ctx, op.ID)
+		return nil
 	}
 
 	if err := w.store.MarkInFlight(ctx, op.ID); err != nil {

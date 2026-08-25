@@ -29,7 +29,7 @@ var syncCmd = &cobra.Command{
 		if cfg.ClickUp.APIKey != "" {
 			cuClient = clickup.New(cfg.ClickUp.APIKey)
 		} else {
-			fmt.Println("Warning: CLICKUP_API_KEY is not set. Sync operations will be marked as done without hitting ClickUp API.")
+			fmt.Println("Warning: CLICKUP_API_KEY is not set. Sync operations will remain queued until an API key is configured.")
 		}
 
 		worker := sync.NewWorker(st, cuClient, &cfg.Sync)

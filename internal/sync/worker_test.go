@@ -329,5 +329,107 @@ func TestWorker_Reaper_RecoversStrandedInFlight(t *testing.T) {
 	}
 }
 
+func TestWorker_NilClient_LeavesOpsPendingAndDrainsLater(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-nil-client",
+		TaskID:      "task-nil-client",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "test op 1"})
+	op1 := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-nil-client",
+		Payload:    string(payloadBytes),
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op1); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	payloadBytes2, _ := json.Marshal(SyncPayload{CommentText: "test op 2"})
+	op2 := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-nil-client",
+		Payload:    string(payloadBytes2),
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op2); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  5,
+		RateLimitMS: 1,
+	}
+
+	// 1. Run with nil client: should report 0 processed and leave ops in PENDING
+	nilWorker := NewWorker(st, nil, syncCfg)
+	count, err := nilWorker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce with nil client failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 processed with nil client, got %d", count)
+	}
+
+	pendingCount, err := st.CountPendingByTaskID(ctx, "task-nil-client")
+	if err != nil {
+		t.Fatalf("CountPendingByTaskID failed: %v", err)
+	}
+	if pendingCount != 2 {
+		t.Fatalf("expected 2 pending ops retained, got %d", pendingCount)
+	}
+
+	// 2. Configure a valid client and server: should drain backlog successfully
+	var serverRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := clickup.New("valid-key").WithBaseURL(server.URL)
+	configuredWorker := NewWorker(st, client, syncCfg)
+
+	count, err = configuredWorker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce with configured client failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 processed ops, got %d", count)
+	}
+	if serverRequests.Load() != 2 {
+		t.Errorf("expected 2 server requests, got %d", serverRequests.Load())
+	}
+
+	pendingCount, err = st.CountPendingByTaskID(ctx, "task-nil-client")
+	if err != nil {
+		t.Fatalf("CountPendingByTaskID failed: %v", err)
+	}
+	if pendingCount != 0 {
+		t.Errorf("expected 0 pending ops left after drain, got %d", pendingCount)
+	}
+}
+
+
 
 
