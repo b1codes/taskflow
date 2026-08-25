@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
@@ -54,7 +55,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 			processed, err := w.processBatch(ctx, 10)
 			if err != nil {
-				// Continue loop even on batch processing errors
+				fmt.Fprintf(os.Stderr, "[sync] batch processing error: %v\n", err)
 			}
 
 			if processed == 0 {
@@ -151,11 +152,13 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	}
 
 	if err := w.store.MarkInFlight(ctx, op.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] failed to mark op %d in-flight: %v\n", op.ID, err)
 		return err
 	}
 
 	var payload SyncPayload
 	if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] invalid payload for op %d (task %s): %v\n", op.ID, op.TaskID, err)
 		_ = w.store.MarkFailed(context.Background(), op.ID, fmt.Sprintf("invalid payload: %v", err))
 		return err
 	}
@@ -178,6 +181,8 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	}
 
 	if opErr != nil {
+		fmt.Fprintf(os.Stderr, "[sync] op %d failed (op: %s, task: %s, retry: %d/%d): %v\n",
+			op.ID, op.Operation, op.TaskID, op.Retries+1, op.MaxRetries, opErr)
 		_ = w.store.MarkFailed(context.Background(), op.ID, opErr.Error())
 		return opErr
 	}

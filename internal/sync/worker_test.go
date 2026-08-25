@@ -1,10 +1,14 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -429,6 +433,78 @@ func TestWorker_NilClient_LeavesOpsPendingAndDrainsLater(t *testing.T) {
 		t.Errorf("expected 0 pending ops left after drain, got %d", pendingCount)
 	}
 }
+
+func TestWorker_LogsFailureToStderr(t *testing.T) {
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-log-test",
+		TaskID:      "task-log-test",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "test log fail"})
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-log-test",
+		Payload:    string(payloadBytes),
+		MaxRetries: 3,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  3,
+		RateLimitMS: 1,
+	}
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("failed to create pipe: %v", pipeErr)
+	}
+	os.Stderr = w
+
+	worker := NewWorker(st, client, syncCfg)
+	_, _ = worker.DrainOnce(ctx)
+
+	// Restore stderr
+	w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	stderrOutput := buf.String()
+
+	if !strings.Contains(stderrOutput, "[sync] op") || !strings.Contains(stderrOutput, "failed") {
+		t.Errorf("expected stderr to contain '[sync] op ... failed', got: %q", stderrOutput)
+	}
+	if !strings.Contains(stderrOutput, "task-log-test") {
+		t.Errorf("expected stderr to contain task ID 'task-log-test', got: %q", stderrOutput)
+	}
+}
+
 
 
 

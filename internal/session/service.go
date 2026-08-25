@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -121,6 +122,7 @@ type RelatedResolution struct {
 func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, payloadVal interface{}) {
 	b, err := json.Marshal(payloadVal)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[session] failed to marshal sync payload (task: %s, op: %s): %v\n", taskID, operation, err)
 		return
 	}
 	op := SyncOp{
@@ -130,7 +132,9 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 		MaxRetries: 5,
 		CreatedAt:  time.Now(),
 	}
-	_ = s.store.EnqueueSync(ctx, op)
+	if err := s.store.EnqueueSync(ctx, op); err != nil {
+		fmt.Fprintf(os.Stderr, "[session] failed to enqueue sync op (task: %s, op: %s): %v\n", taskID, operation, err)
+	}
 }
 
 func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit bool) (*StartResult, error) {
