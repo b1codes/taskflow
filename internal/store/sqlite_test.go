@@ -13,6 +13,7 @@ import (
 )
 
 func TestSQLiteStore_Init(t *testing.T) {
+	t.Parallel()
 	st, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create in-memory store: %v", err)
@@ -73,6 +74,7 @@ func TestSQLiteStore_Init(t *testing.T) {
 }
 
 func TestSQLiteStore_SessionCRUD(t *testing.T) {
+	t.Parallel()
 	st, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
@@ -137,6 +139,7 @@ func TestSQLiteStore_SessionCRUD(t *testing.T) {
 }
 
 func TestSQLiteStore_CheckpointCRUD(t *testing.T) {
+	t.Parallel()
 	st, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
@@ -186,6 +189,7 @@ func TestSQLiteStore_CheckpointCRUD(t *testing.T) {
 }
 
 func TestSQLiteStore_SnagCRUDAndMatch(t *testing.T) {
+	t.Parallel()
 	st, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
@@ -264,6 +268,7 @@ func TestSQLiteStore_SnagCRUDAndMatch(t *testing.T) {
 }
 
 func TestSQLiteStore_DecisionCRUD(t *testing.T) {
+	t.Parallel()
 	st, err := New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
@@ -314,6 +319,7 @@ func TestSQLiteStore_DecisionCRUD(t *testing.T) {
 // TestPragmas_AppliedPerConnection verifies that foreign_keys and busy_timeout
 // are set on every pooled connection, not just one arbitrary connection.
 func TestPragmas_AppliedPerConnection(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "pragma_test.db")
 	st, err := New(dbPath)
 	if err != nil {
@@ -371,6 +377,7 @@ func TestPragmas_AppliedPerConnection(t *testing.T) {
 // (mirroring `taskflow serve` + a CLI command) and runs concurrent writes.
 // With busy_timeout=0 (the old bug), most of these would fail with SQLITE_BUSY.
 func TestConcurrentWriters_BusyTimeout(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "concurrent_test.db")
 
 	st1, err := New(dbPath)
@@ -447,6 +454,7 @@ func TestConcurrentWriters_BusyTimeout(t *testing.T) {
 // TestForeignKeys_RejectOrphan verifies that inserting a checkpoint referencing
 // a non-existent session is rejected by the FK constraint.
 func TestForeignKeys_RejectOrphan(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "fk_test.db")
 	st, err := New(dbPath)
 	if err != nil {
@@ -468,4 +476,67 @@ func TestForeignKeys_RejectOrphan(t *testing.T) {
 		t.Fatal("expected foreign key violation error, but insert succeeded")
 	}
 	t.Logf("FK violation correctly rejected orphan insert: %v", err)
+}
+
+// TestMemoryStore_MultipleConnections forces the pool to open several
+// connections against a :memory: store and verifies that data written on one
+// connection is visible from all others. Without cache=shared (or with a bare
+// ":memory:" DSN), each connection gets its own empty database and this fails.
+func TestMemoryStore_MultipleConnections(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	// Temporarily allow multiple connections so we can exercise the pool.
+	// (New pins :memory: to MaxOpenConns=1; lift it for this test.)
+	st.db.SetMaxOpenConns(4)
+
+	ctx := context.Background()
+
+	// Write a session using the store's normal API.
+	sess := &session.Session{
+		ID:          "sess-multi-conn",
+		TaskID:      "task-multi",
+		ProjectPath: "/tmp/multi",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// Open several independent connections from the pool and read back
+	// the session on each one. If shared cache is not enabled, some
+	// connections will see "no such table: sessions".
+	const numConns = 4
+	var wg sync.WaitGroup
+
+	for i := 0; i < numConns; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			conn, err := st.db.Conn(ctx)
+			if err != nil {
+				t.Errorf("conn %d: failed to get connection: %v", idx, err)
+				return
+			}
+			defer conn.Close()
+
+			var id string
+			err = conn.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = ?", "sess-multi-conn").Scan(&id)
+			if err != nil {
+				t.Errorf("conn %d: failed to read session: %v", idx, err)
+				return
+			}
+			if id != "sess-multi-conn" {
+				t.Errorf("conn %d: expected id 'sess-multi-conn', got %q", idx, id)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

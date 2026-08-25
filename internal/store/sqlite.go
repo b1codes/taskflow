@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/b1codes/taskflow/internal/session"
@@ -31,9 +32,9 @@ func New(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// In-memory databases: restrict to one connection so all queries
-	// hit the same database instance (without cache=shared each
-	// connection would get its own empty database).
+	// In-memory databases use a unique named DB with cache=shared
+	// (see buildDSN) so all pooled connections see the same data.
+	// Pin to one connection as a belt-and-suspenders safeguard.
 	if dbPath == ":memory:" {
 		db.SetMaxOpenConns(1)
 	}
@@ -47,14 +48,22 @@ func New(dbPath string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
+// memDBSeq ensures each store.New(":memory:") gets a unique named
+// in-memory database, so parallel tests don't share state.
+var memDBSeq atomic.Int64
+
 // buildDSN constructs a SQLite URI with PRAGMAs embedded as query parameters.
 // modernc.org/sqlite applies _pragma parameters on every new connection,
 // unlike db.Exec("PRAGMA ...") which only reaches one pooled connection.
 // foreign_keys and busy_timeout are per-connection settings in SQLite.
 func buildDSN(dbPath string) string {
 	if dbPath == ":memory:" {
+		// Use a unique named in-memory DB with cache=shared so all
+		// pooled connections see the same tables and data. Each call
+		// gets its own name to keep parallel tests isolated.
 		// journal_mode=WAL is not applicable to in-memory databases.
-		return "file::memory:?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+		id := memDBSeq.Add(1)
+		return fmt.Sprintf("file:memdb_%d?mode=memory&cache=shared&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", id)
 	}
 	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", dbPath)
 }
