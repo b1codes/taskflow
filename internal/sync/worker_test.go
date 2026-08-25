@@ -594,6 +594,198 @@ func TestWorker_RateLimit429_DoesNotConsumeRetry(t *testing.T) {
 	}
 }
 
+func TestWorker_UpdateStatus_Success(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-status-success",
+		TaskID:      "task-status-success",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{StatusType: "closed"})
+	op := session.SyncOp{
+		Operation:  "UPDATE_STATUS",
+		TaskID:     "task-status-success",
+		Payload:    string(payloadBytes),
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	var statusUpdated atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" && r.URL.Path == "/task/task-status-success" {
+			_, _ = w.Write([]byte(`{
+				"id": "task-status-success",
+				"name": "Status Task",
+				"list": {"id": "list-succ", "name": "Success List"}
+			}`))
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/list/list-succ" {
+			_, _ = w.Write([]byte(`{
+				"id": "list-succ",
+				"name": "Success List",
+				"statuses": [
+					{"status": "Open", "type": "open", "orderindex": 0},
+					{"status": "Closed", "type": "closed", "orderindex": 1}
+				]
+			}`))
+			return
+		}
+		if r.Method == "PUT" && r.URL.Path == "/task/task-status-success" {
+			statusUpdated.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  5,
+		RateLimitMS: 1,
+	}
+
+	worker := NewWorker(st, client, syncCfg)
+	count, err := worker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 op processed, got %d", count)
+	}
+	if statusUpdated.Load() != 1 {
+		t.Errorf("expected status to be updated in ClickUp, got %d calls", statusUpdated.Load())
+	}
+}
+
+func TestWorker_UpdateStatus_NoMatchingStatus_LogsFailure(t *testing.T) {
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-status-nomatch",
+		TaskID:      "task-status-nomatch",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{StatusType: "unsupported_type"})
+	op := session.SyncOp{
+		Operation:  "UPDATE_STATUS",
+		TaskID:     "task-status-nomatch",
+		Payload:    string(payloadBytes),
+		MaxRetries: 3,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" && r.URL.Path == "/task/task-status-nomatch" {
+			_, _ = w.Write([]byte(`{
+				"id": "task-status-nomatch",
+				"name": "Status Task",
+				"list": {"id": "list-nomatch", "name": "List"}
+			}`))
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/list/list-nomatch" {
+			_, _ = w.Write([]byte(`{
+				"id": "list-nomatch",
+				"name": "List",
+				"statuses": [
+					{"status": "Open", "type": "open", "orderindex": 0},
+					{"status": "Closed", "type": "closed", "orderindex": 1}
+				]
+			}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  3,
+		RateLimitMS: 1,
+	}
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("failed to create pipe: %v", pipeErr)
+	}
+	os.Stderr = w
+
+	worker := NewWorker(st, client, syncCfg)
+	count, _ := worker.DrainOnce(ctx)
+
+	// Restore stderr
+	w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	stderrOutput := buf.String()
+
+	if count != 0 {
+		t.Errorf("expected 0 ops successfully processed, got %d", count)
+	}
+
+	if !strings.Contains(stderrOutput, "failed") || !strings.Contains(stderrOutput, "no matching status found") {
+		t.Errorf("expected stderr to contain failure log with 'no matching status found', got: %q", stderrOutput)
+	}
+
+	// Verify the op was marked FAILED in the store with the error message
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	ops, err := st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable failed: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 retryable failed op, got %d", len(ops))
+	}
+	if !strings.Contains(ops[0].ErrorMsg, "no matching status found") {
+		t.Errorf("expected op ErrorMsg to describe missing status, got: %q", ops[0].ErrorMsg)
+	}
+}
+
+
 
 
 

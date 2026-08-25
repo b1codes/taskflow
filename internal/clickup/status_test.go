@@ -2,8 +2,10 @@ package clickup
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,9 +23,13 @@ func TestResolveStatus(t *testing.T) {
 
 	ctx := context.Background()
 
+	var getTaskCalls atomic.Int32
+	var getListCalls atomic.Int32
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/task/task-123" {
+			getTaskCalls.Add(1)
 			_, _ = w.Write([]byte(`{
 				"id": "task-123",
 				"name": "Test Task",
@@ -33,6 +39,7 @@ func TestResolveStatus(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/list/list-abc" {
+			getListCalls.Add(1)
 			_, _ = w.Write([]byte(`{
 				"id": "list-abc",
 				"name": "Sprint 1",
@@ -50,7 +57,7 @@ func TestResolveStatus(t *testing.T) {
 
 	client := New("api-key").WithBaseURL(server.URL)
 
-	// 1. Initial resolution with empty cache (triggers refresh from API)
+	// 1. Initial resolution with empty cache (triggers refresh from API for both task and list)
 	statusName, err := ResolveStatus(ctx, st, client, "task-123", "closed")
 	if err != nil {
 		t.Fatalf("ResolveStatus failed: %v", err)
@@ -58,8 +65,14 @@ func TestResolveStatus(t *testing.T) {
 	if statusName != "done" {
 		t.Errorf("expected status 'done' for type 'closed', got %q", statusName)
 	}
+	if getTaskCalls.Load() != 1 {
+		t.Errorf("expected 1 getTask call, got %d", getTaskCalls.Load())
+	}
+	if getListCalls.Load() != 1 {
+		t.Errorf("expected 1 getList call, got %d", getListCalls.Load())
+	}
 
-	// 2. Subsequent resolution (cache hit)
+	// 2. Subsequent resolution (cache hit for both task -> list mapping and statuses)
 	statusActive, err := ResolveStatus(ctx, st, client, "task-123", "active")
 	if err != nil {
 		t.Fatalf("ResolveStatus cache hit failed: %v", err)
@@ -67,14 +80,21 @@ func TestResolveStatus(t *testing.T) {
 	if statusActive != "in progress" {
 		t.Errorf("expected status 'in progress' for type 'active', got %q", statusActive)
 	}
-
-	// 3. Unknown target type
-	unknownStatus, err := ResolveStatus(ctx, st, client, "task-123", "nonexistent_type")
-	if err != nil {
-		t.Fatalf("ResolveStatus unknown type failed: %v", err)
+	// Verify neither task nor list API was called again
+	if getTaskCalls.Load() != 1 {
+		t.Errorf("expected still 1 getTask call, got %d", getTaskCalls.Load())
 	}
-	if unknownStatus != "" {
-		t.Errorf("expected empty status for unknown type, got %q", unknownStatus)
+	if getListCalls.Load() != 1 {
+		t.Errorf("expected still 1 getList call, got %d", getListCalls.Load())
+	}
+
+	// 3. Unknown target type returns ErrNoMatchingStatus
+	_, err = ResolveStatus(ctx, st, client, "task-123", "nonexistent_type")
+	if err == nil {
+		t.Fatalf("expected error for nonexistent_type, got nil")
+	}
+	if !errors.Is(err, ErrNoMatchingStatus) {
+		t.Errorf("expected ErrNoMatchingStatus, got: %v", err)
 	}
 }
 
@@ -134,3 +154,65 @@ func TestResolveStatus_StaleCache(t *testing.T) {
 		t.Errorf("expected refreshed status 'refreshed-closed', got %q", statusName)
 	}
 }
+
+func TestResolveStatus_StaleTaskCache(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Seed stale task cache entry
+	_ = st.UpsertCacheEntry(ctx, &store.CacheEntry{
+		EntityType: "task",
+		EntityID:   "task-stale-task",
+		ParentID:   "old-list",
+		Name:       "Old Task Name",
+		FetchedAt:  time.Now().Add(-48 * time.Hour), // 48 hours old (> 24h TTL)
+	})
+
+	var getTaskCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/task/task-stale-task" {
+			getTaskCalls.Add(1)
+			_, _ = w.Write([]byte(`{
+				"id": "task-stale-task",
+				"name": "Refreshed Task",
+				"status": {"status": "in progress", "type": "active"},
+				"list": {"id": "new-list", "name": "New List"}
+			}`))
+			return
+		}
+		if r.URL.Path == "/list/new-list" {
+			_, _ = w.Write([]byte(`{
+				"id": "new-list",
+				"name": "New List",
+				"statuses": [
+					{"status": "Completed", "type": "closed", "orderindex": 0}
+				]
+			}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := New("api-key").WithBaseURL(server.URL)
+
+	statusName, err := ResolveStatus(ctx, st, client, "task-stale-task", "closed")
+	if err != nil {
+		t.Fatalf("ResolveStatus failed: %v", err)
+	}
+	if statusName != "Completed" {
+		t.Errorf("expected status 'Completed', got %q", statusName)
+	}
+	if getTaskCalls.Load() != 1 {
+		t.Errorf("expected task to be refetched on stale cache, calls: %d", getTaskCalls.Load())
+	}
+}
+

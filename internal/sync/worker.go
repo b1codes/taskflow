@@ -172,10 +172,8 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 		statusName, err := clickup.ResolveStatus(ctx, w.store, w.clickup, op.TaskID, payload.StatusType)
 		if err != nil {
 			opErr = err
-		} else if statusName != "" {
-			opErr = w.clickup.UpdateTaskStatus(ctx, op.TaskID, statusName)
 		} else {
-			opErr = nil
+			opErr = w.clickup.UpdateTaskStatus(ctx, op.TaskID, statusName)
 		}
 	default:
 		opErr = fmt.Errorf("unknown operation: %s", op.Operation)
