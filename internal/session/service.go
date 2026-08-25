@@ -172,16 +172,26 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	if existing != nil {
 		if existing.Status == StatusActive {
 			sessionID = existing.ID
+			existing.TaskName = taskName
+			existing.UpdatedAt = time.Now()
 			sess = existing
+			isResumed = true
+			if taskName != "" {
+				_ = s.store.UpdateSessionTaskName(ctx, sess.ID, taskName)
+			}
 		} else if existing.Status == StatusPaused {
 			if err := s.store.UpdateSessionStatus(ctx, existing.ID, StatusActive); err != nil {
 				return nil, fmt.Errorf("failed to resume session status: %w", err)
 			}
 			sessionID = existing.ID
 			existing.Status = StatusActive
+			existing.TaskName = taskName
 			existing.UpdatedAt = time.Now()
 			sess = existing
 			isResumed = true
+			if taskName != "" {
+				_ = s.store.UpdateSessionTaskName(ctx, sess.ID, taskName)
+			}
 		} else {
 			// Completed or Archived -> new session
 			sessionID = uuid.New().String()

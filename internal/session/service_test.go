@@ -73,6 +73,15 @@ func (m *mockStore) UpdateSessionGitBranch(ctx context.Context, id string, branc
 	return nil
 }
 
+func (m *mockStore) UpdateSessionTaskName(ctx context.Context, id string, taskName string) error {
+	s, ok := m.sessions[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	s.TaskName = taskName
+	return nil
+}
+
 func (m *mockStore) UpdateSessionUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error {
 	s, ok := m.sessions[id]
 	if !ok {
@@ -182,12 +191,18 @@ func (mg *mockGit) Capture(projectPath string) (*GitContext, error) {
 	return mg.ctx, nil
 }
 
-type mockClickUp struct{}
+type mockClickUp struct {
+	taskName string
+}
 
 func (mc *mockClickUp) GetTask(ctx context.Context, taskID string) (*ClickUpTaskInfo, error) {
+	name := "Mock ClickUp Task"
+	if mc.taskName != "" {
+		name = mc.taskName
+	}
 	return &ClickUpTaskInfo{
 		ID:          taskID,
-		Name:        "Mock ClickUp Task",
+		Name:        name,
 		Description: "Mock Description",
 		ListID:      "list-123",
 	}, nil
@@ -459,5 +474,58 @@ func TestService_UnknownSession_NoPanic(t *testing.T) {
 		t.Errorf("expected error on nilSrv.Stop, got nil")
 	}
 }
+
+func TestService_Start_ActiveSession_ReportsResumedAndRefreshesTaskName(t *testing.T) {
+	t.Parallel()
+
+	tempDir, err := os.MkdirTemp("", "taskflow-srv-resume-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := newMockStore()
+	git := &mockGit{ctx: &GitContext{Branch: "main", SHA: "sha123"}}
+	clickup := &mockClickUp{taskName: "Initial Task Name"}
+	srv := NewService(store, git, clickup)
+
+	ctx := context.Background()
+
+	// First Start: should be fresh session (Resumed = false)
+	res1, err := srv.Start(ctx, "task-restart", tempDir, true)
+	if err != nil {
+		t.Fatalf("First Start failed: %v", err)
+	}
+	if res1.AgenticContract.Resumed {
+		t.Errorf("expected first Start to have Resumed: false, got true")
+	}
+	if res1.Session.TaskName != "Initial Task Name" {
+		t.Errorf("expected task name 'Initial Task Name', got %q", res1.Session.TaskName)
+	}
+
+	// Task was renamed in ClickUp
+	clickup.taskName = "Renamed Task in ClickUp"
+
+	// Second Start on the same active task without stopping
+	res2, err := srv.Start(ctx, "task-restart", tempDir, true)
+	if err != nil {
+		t.Fatalf("Second Start failed: %v", err)
+	}
+
+	// Acceptance criteria: Resumed must be true and session ID must match
+	if !res2.AgenticContract.Resumed {
+		t.Errorf("expected second Start on ACTIVE session to have Resumed: true, got false")
+	}
+	if res2.Session.ID != res1.Session.ID {
+		t.Errorf("expected same session ID %s, got %s", res1.Session.ID, res2.Session.ID)
+	}
+	if res2.Session.TaskName != "Renamed Task in ClickUp" {
+		t.Errorf("expected refreshed task name 'Renamed Task in ClickUp', got %q", res2.Session.TaskName)
+	}
+	if res2.AgenticContract.Task.Name != "Renamed Task in ClickUp" {
+		t.Errorf("expected contract task name 'Renamed Task in ClickUp', got %q", res2.AgenticContract.Task.Name)
+	}
+}
+
 
 

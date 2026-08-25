@@ -794,5 +794,43 @@ func TestStore_SessionNotFound_ErrSessionNotFound(t *testing.T) {
 	}
 }
 
+func TestStore_UpdateSessionTaskName(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	sess := &session.Session{
+		ID:          "sess-name-update",
+		TaskID:      "task-name-update",
+		TaskName:    "Old Name",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := st.UpdateSessionTaskName(ctx, sess.ID, "New Name"); err != nil {
+		t.Fatalf("UpdateSessionTaskName failed: %v", err)
+	}
+
+	got, err := st.GetSession(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got.TaskName != "New Name" {
+		t.Errorf("expected TaskName 'New Name', got %q", got.TaskName)
+	}
+}
+
+
 
 

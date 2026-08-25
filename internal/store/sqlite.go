@@ -184,6 +184,15 @@ func (s *SQLiteStore) UpdateSessionGitBranch(ctx context.Context, id string, bra
 	return nil
 }
 
+func (s *SQLiteStore) UpdateSessionTaskName(ctx context.Context, id string, taskName string) error {
+	query := `UPDATE sessions SET task_name = ?, updated_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, taskName, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to update session task name: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) UpdateSessionUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error {
 	query := `UPDATE sessions SET updated_at = ? WHERE id = ?`
 	_, err := s.db.ExecContext(ctx, query, updatedAt, id)

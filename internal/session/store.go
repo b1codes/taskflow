@@ -23,6 +23,7 @@ type SessionStore interface {
 
 	UpdateSessionStatus(ctx context.Context, id string, status Status) error
 	UpdateSessionGitBranch(ctx context.Context, id string, branch string) error
+	UpdateSessionTaskName(ctx context.Context, id string, taskName string) error
 	UpdateSessionUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error
 	ListSessions(ctx context.Context, filter SessionFilter) ([]*Session, error)
 	CreateCheckpoint(ctx context.Context, cp *Checkpoint) error
