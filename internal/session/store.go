@@ -2,14 +2,25 @@ package session
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
+// ErrSessionNotFound is returned by SessionStore lookup methods when no matching session exists.
+var ErrSessionNotFound = errors.New("session not found")
+
 type SessionStore interface {
 	CreateSession(ctx context.Context, s *Session) error
+
+	// GetSession returns the session by its ID, or ErrSessionNotFound if not found.
 	GetSession(ctx context.Context, id string) (*Session, error)
+
+	// GetSessionByTaskID returns the most recent session for a given task ID, or ErrSessionNotFound if not found.
 	GetSessionByTaskID(ctx context.Context, taskID string) (*Session, error)
+
+	// GetActiveSessionByProject returns the active session for a project path, or ErrSessionNotFound if not found.
 	GetActiveSessionByProject(ctx context.Context, projectPath string) (*Session, error)
+
 	UpdateSessionStatus(ctx context.Context, id string, status Status) error
 	UpdateSessionGitBranch(ctx context.Context, id string, branch string) error
 	UpdateSessionUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error

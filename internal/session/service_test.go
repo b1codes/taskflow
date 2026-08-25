@@ -32,7 +32,7 @@ func (m *mockStore) CreateSession(ctx context.Context, s *Session) error {
 func (m *mockStore) GetSession(ctx context.Context, id string) (*Session, error) {
 	s, ok := m.sessions[id]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, ErrSessionNotFound
 	}
 	return s, nil
 }
@@ -43,7 +43,7 @@ func (m *mockStore) GetSessionByTaskID(ctx context.Context, taskID string) (*Ses
 			return s, nil
 		}
 	}
-	return nil, nil
+	return nil, ErrSessionNotFound
 }
 
 func (m *mockStore) GetActiveSessionByProject(ctx context.Context, projectPath string) (*Session, error) {
@@ -52,7 +52,7 @@ func (m *mockStore) GetActiveSessionByProject(ctx context.Context, projectPath s
 			return s, nil
 		}
 	}
-	return nil, nil
+	return nil, ErrSessionNotFound
 }
 
 func (m *mockStore) UpdateSessionStatus(ctx context.Context, id string, status Status) error {
@@ -396,4 +396,68 @@ func TestService_StopPausedWithSummary(t *testing.T) {
 		t.Errorf("expected first checkpoint summary 'pausing for the day', got %q", cps[1].Summary)
 	}
 }
+
+// nilReturningStore returns (nil, nil) on GetSession to test defensive nil guards against panic.
+type nilReturningStore struct {
+	*mockStore
+}
+
+func (n *nilReturningStore) GetSession(ctx context.Context, id string) (*Session, error) {
+	return nil, nil
+}
+
+func TestService_UnknownSession_NoPanic(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// Test case 1: Store returns ErrSessionNotFound (standard conforming contract)
+	store := newMockStore()
+	srv := NewService(store, nil, nil)
+
+	_, err := srv.Checkpoint(ctx, "nonexistent-id", "test checkpoint", nil, false)
+	if err == nil {
+		t.Errorf("expected error on Checkpoint with nonexistent session, got nil")
+	}
+
+	_, err = srv.LogSnag(ctx, "nonexistent-id", "some error", "build", "")
+	if err == nil {
+		t.Errorf("expected error on LogSnag with nonexistent session, got nil")
+	}
+
+	_, err = srv.LogDecision(ctx, "nonexistent-id", "topic", "dec", "rat", "", nil)
+	if err == nil {
+		t.Errorf("expected error on LogDecision with nonexistent session, got nil")
+	}
+
+	err = srv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false)
+	if err == nil {
+		t.Errorf("expected error on Stop with nonexistent session, got nil")
+	}
+
+	// Test case 2: Store returns (nil, nil) - verifies defensive nil guards prevent panic
+	nilStore := &nilReturningStore{mockStore: store}
+	nilSrv := NewService(nilStore, nil, nil)
+
+	_, err = nilSrv.Checkpoint(ctx, "nonexistent-id", "test checkpoint", nil, false)
+	if err == nil {
+		t.Errorf("expected error on nilSrv.Checkpoint, got nil")
+	}
+
+	_, err = nilSrv.LogSnag(ctx, "nonexistent-id", "some error", "build", "")
+	if err == nil {
+		t.Errorf("expected error on nilSrv.LogSnag, got nil")
+	}
+
+	_, err = nilSrv.LogDecision(ctx, "nonexistent-id", "topic", "dec", "rat", "", nil)
+	if err == nil {
+		t.Errorf("expected error on nilSrv.LogDecision, got nil")
+	}
+
+	err = nilSrv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false)
+	if err == nil {
+		t.Errorf("expected error on nilSrv.Stop, got nil")
+	}
+}
+
 

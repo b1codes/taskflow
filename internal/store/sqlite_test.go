@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -765,5 +766,33 @@ func TestRequeueRateLimited(t *testing.T) {
 		t.Errorf("expected retries to remain 0 after 429 requeue, got %d", requeued[0].Retries)
 	}
 }
+
+func TestStore_SessionNotFound_ErrSessionNotFound(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	sess, err := st.GetSession(ctx, "nonexistent-id")
+	if sess != nil || !errors.Is(err, session.ErrSessionNotFound) {
+		t.Errorf("expected ErrSessionNotFound for GetSession, got sess=%v, err=%v", sess, err)
+	}
+
+	sess, err = st.GetSessionByTaskID(ctx, "nonexistent-task")
+	if sess != nil || !errors.Is(err, session.ErrSessionNotFound) {
+		t.Errorf("expected ErrSessionNotFound for GetSessionByTaskID, got sess=%v, err=%v", sess, err)
+	}
+
+	sess, err = st.GetActiveSessionByProject(ctx, "/nonexistent/project")
+	if sess != nil || !errors.Is(err, session.ErrSessionNotFound) {
+		t.Errorf("expected ErrSessionNotFound for GetActiveSessionByProject, got sess=%v, err=%v", sess, err)
+	}
+}
+
 
 

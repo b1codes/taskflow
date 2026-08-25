@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -161,11 +162,14 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 
 	// 3. Check for existing session
 	existing, err := s.store.GetSessionByTaskID(ctx, taskID)
+	if err != nil && !errors.Is(err, ErrSessionNotFound) {
+		return nil, fmt.Errorf("failed to query existing session: %w", err)
+	}
 	var sessionID string
 	var isResumed bool
 	var sess *Session
 
-	if err == nil && existing != nil {
+	if existing != nil {
 		if existing.Status == StatusActive {
 			sessionID = existing.ID
 			sess = existing
@@ -247,6 +251,9 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session for checkpoint: %w", err)
 	}
+	if sess == nil {
+		return nil, fmt.Errorf("failed to get session for checkpoint: %w", ErrSessionNotFound)
+	}
 
 	if sess.Status != StatusActive {
 		return nil, fmt.Errorf("cannot create checkpoint for non-active session (status: %s)", sess.Status)
@@ -303,6 +310,9 @@ func (s *Service) LogSnag(ctx context.Context, sessionID, errorText, category, r
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session to log snag: %w", err)
+	}
+	if sess == nil {
+		return nil, fmt.Errorf("failed to get session to log snag: %w", ErrSessionNotFound)
 	}
 
 	sig := NormalizeErrorSignature(errorText)
@@ -375,6 +385,9 @@ func (s *Service) LogDecision(ctx context.Context, sessionID, topic, decision, r
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session to log decision: %w", err)
+	}
+	if sess == nil {
+		return nil, fmt.Errorf("failed to get session to log decision: %w", ErrSessionNotFound)
 	}
 
 	if sess.Status != StatusActive {
@@ -467,6 +480,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to get session: %w", err)
+	}
+	if sess == nil {
+		return fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
 	}
 
 	tStatus := Status(targetStatus)

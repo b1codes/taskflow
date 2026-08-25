@@ -124,7 +124,7 @@ func (s *SQLiteStore) GetSession(ctx context.Context, id string) (*session.Sessi
 	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("session not found: %s", id)
+			return nil, session.ErrSessionNotFound
 		}
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
@@ -141,7 +141,7 @@ func (s *SQLiteStore) GetSessionByTaskID(ctx context.Context, taskID string) (*s
 	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil // Return nil, nil when not found as per Go conventions or start check
+			return nil, session.ErrSessionNotFound
 		}
 		return nil, fmt.Errorf("failed to get session by task id: %w", err)
 	}
@@ -158,7 +158,7 @@ func (s *SQLiteStore) GetActiveSessionByProject(ctx context.Context, projectPath
 	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil
+			return nil, session.ErrSessionNotFound
 		}
 		return nil, fmt.Errorf("failed to get active session: %w", err)
 	}
