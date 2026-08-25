@@ -26,22 +26,16 @@ func New(dbPath string) (*SQLiteStore, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", buildDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// Set PRAGMAs
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA foreign_keys=ON;",
-	}
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to set pragma %q: %w", pragma, err)
-		}
+	// In-memory databases: restrict to one connection so all queries
+	// hit the same database instance (without cache=shared each
+	// connection would get its own empty database).
+	if dbPath == ":memory:" {
+		db.SetMaxOpenConns(1)
 	}
 
 	// Run Migrations
@@ -51,6 +45,18 @@ func New(dbPath string) (*SQLiteStore, error) {
 	}
 
 	return &SQLiteStore{db: db}, nil
+}
+
+// buildDSN constructs a SQLite URI with PRAGMAs embedded as query parameters.
+// modernc.org/sqlite applies _pragma parameters on every new connection,
+// unlike db.Exec("PRAGMA ...") which only reaches one pooled connection.
+// foreign_keys and busy_timeout are per-connection settings in SQLite.
+func buildDSN(dbPath string) string {
+	if dbPath == ":memory:" {
+		// journal_mode=WAL is not applicable to in-memory databases.
+		return "file::memory:?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	}
+	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", dbPath)
 }
 
 func (s *SQLiteStore) Close() error {

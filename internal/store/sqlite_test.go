@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -306,4 +309,163 @@ func TestSQLiteStore_DecisionCRUD(t *testing.T) {
 	if got.Topic != d.Topic || got.Decision != d.Decision || got.Rationale != d.Rationale || len(got.Files) != 1 || got.Files[0] != "internal/gitctx" {
 		t.Errorf("decision mismatch: %+v", got)
 	}
+}
+
+// TestPragmas_AppliedPerConnection verifies that foreign_keys and busy_timeout
+// are set on every pooled connection, not just one arbitrary connection.
+func TestPragmas_AppliedPerConnection(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pragma_test.db")
+	st, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	// Force the pool to open several concurrent connections and verify
+	// PRAGMAs on each one independently.
+	const numConns = 4
+
+	type pragmaResult struct {
+		foreignKeys int
+		busyTimeout int
+		journalMode string
+	}
+
+	results := make([]pragmaResult, numConns)
+	var wg sync.WaitGroup
+
+	for i := 0; i < numConns; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			conn, err := st.db.Conn(context.Background())
+			if err != nil {
+				t.Errorf("Conn failed: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			var r pragmaResult
+			_ = conn.QueryRowContext(context.Background(), "PRAGMA foreign_keys").Scan(&r.foreignKeys)
+			_ = conn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&r.busyTimeout)
+			_ = conn.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&r.journalMode)
+			results[idx] = r
+		}(i)
+	}
+	wg.Wait()
+
+	for i, r := range results {
+		if r.foreignKeys != 1 {
+			t.Errorf("conn %d: expected foreign_keys=1, got %d", i, r.foreignKeys)
+		}
+		if r.busyTimeout != 5000 {
+			t.Errorf("conn %d: expected busy_timeout=5000, got %d", i, r.busyTimeout)
+		}
+		if r.journalMode != "wal" {
+			t.Errorf("conn %d: expected journal_mode=wal, got %s", i, r.journalMode)
+		}
+	}
+}
+
+// TestConcurrentWriters_BusyTimeout opens two store handles on the same DB file
+// (mirroring `taskflow serve` + a CLI command) and runs concurrent writes.
+// With busy_timeout=0 (the old bug), most of these would fail with SQLITE_BUSY.
+func TestConcurrentWriters_BusyTimeout(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent_test.db")
+
+	st1, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(1) failed: %v", err)
+	}
+	defer st1.Close()
+
+	st2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(2) failed: %v", err)
+	}
+	defer st2.Close()
+
+	ctx := context.Background()
+
+	// Create a session to satisfy FK constraints.
+	sess := &session.Session{
+		ID:          "sess-concurrent",
+		TaskID:      "task-concurrent",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st1.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	const writesPerHandle = 20
+	errs := make(chan error, writesPerHandle*2)
+	var wg sync.WaitGroup
+
+	writer := func(st *SQLiteStore, prefix string) {
+		defer wg.Done()
+		for i := 0; i < writesPerHandle; i++ {
+			cp := &session.Checkpoint{
+				ID:        fmt.Sprintf("%s-%d", prefix, i),
+				SessionID: "sess-concurrent",
+				Summary:   fmt.Sprintf("checkpoint %s-%d", prefix, i),
+				CreatedAt: time.Now(),
+			}
+			if err := st.CreateCheckpoint(ctx, cp); err != nil {
+				errs <- err
+			}
+		}
+	}
+
+	wg.Add(2)
+	go writer(st1, "h1")
+	go writer(st2, "h2")
+	wg.Wait()
+	close(errs)
+
+	var failures []error
+	for err := range errs {
+		failures = append(failures, err)
+	}
+	if len(failures) > 0 {
+		t.Errorf("concurrent writes: %d/%d failed (expected 0); first error: %v",
+			len(failures), writesPerHandle*2, failures[0])
+	}
+
+	// Verify all rows were written.
+	checkpoints, err := st1.ListCheckpoints(ctx, "sess-concurrent", 0)
+	if err != nil {
+		t.Fatalf("ListCheckpoints failed: %v", err)
+	}
+	if len(checkpoints) != writesPerHandle*2 {
+		t.Errorf("expected %d checkpoints, got %d", writesPerHandle*2, len(checkpoints))
+	}
+}
+
+// TestForeignKeys_RejectOrphan verifies that inserting a checkpoint referencing
+// a non-existent session is rejected by the FK constraint.
+func TestForeignKeys_RejectOrphan(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fk_test.db")
+	st, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Attempt to insert a checkpoint referencing a session that does not exist.
+	cp := &session.Checkpoint{
+		ID:        "orphan-cp",
+		SessionID: "NO-SUCH-SESSION",
+		Summary:   "should be rejected by FK constraint",
+		CreatedAt: time.Now(),
+	}
+	err = st.CreateCheckpoint(ctx, cp)
+	if err == nil {
+		t.Fatal("expected foreign key violation error, but insert succeeded")
+	}
+	t.Logf("FK violation correctly rejected orphan insert: %v", err)
 }
