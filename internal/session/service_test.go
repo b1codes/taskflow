@@ -325,3 +325,75 @@ func TestService_Decision(t *testing.T) {
 		t.Errorf("expected decision text 'Retain /internal/gitctx', got: %s", contract.History.Decisions[0].Decision)
 	}
 }
+
+func TestService_StopPausedWithSummary(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "taskflow-srv-test-paused-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := newMockStore()
+	git := &mockGit{ctx: &GitContext{Branch: "main", SHA: "sha123"}}
+	srv := NewService(store, git, nil)
+
+	ctx := context.Background()
+
+	// 1. Start session (ACTIVE)
+	res, err := srv.Start(ctx, "task-1", tempDir, true)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	sessionID := res.Session.ID
+
+	// 2. Stop session as PAUSED with summary
+	err = srv.Stop(ctx, sessionID, "pausing for the day", "PAUSED", true)
+	if err != nil {
+		t.Fatalf("Stop (PAUSED) failed: %v", err)
+	}
+
+	pausedSess, err := store.GetSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	if pausedSess.Status != StatusPaused {
+		t.Fatalf("expected status PAUSED, got %s", pausedSess.Status)
+	}
+
+	// 3. Verify direct Checkpoint on PAUSED session is refused
+	_, err = srv.Checkpoint(ctx, sessionID, "mid-pause checkpoint", nil, true)
+	if err == nil {
+		t.Fatal("expected Checkpoint on PAUSED session to fail, but it succeeded")
+	}
+
+	// 4. Stop session as COMPLETED with summary (was previously failing with 'cannot create checkpoint for non-active session')
+	err = srv.Stop(ctx, sessionID, "finished the feature", "COMPLETED", true)
+	if err != nil {
+		t.Fatalf("Stop (COMPLETED with summary on PAUSED session) failed: %v", err)
+	}
+
+	completedSess, err := store.GetSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("failed to get completed session: %v", err)
+	}
+	if completedSess.Status != StatusCompleted {
+		t.Fatalf("expected status COMPLETED, got %s", completedSess.Status)
+	}
+
+	// 5. Verify both checkpoints were recorded
+	cps, err := store.ListCheckpoints(ctx, sessionID, 0)
+	if err != nil {
+		t.Fatalf("ListCheckpoints failed: %v", err)
+	}
+	if len(cps) != 2 {
+		t.Fatalf("expected 2 checkpoints, got %d", len(cps))
+	}
+	// ListCheckpoints returns in reverse chronological order
+	if cps[0].Summary != "finished the feature" {
+		t.Errorf("expected latest checkpoint summary 'finished the feature', got %q", cps[0].Summary)
+	}
+	if cps[1].Summary != "pausing for the day" {
+		t.Errorf("expected first checkpoint summary 'pausing for the day', got %q", cps[1].Summary)
+	}
+}
+

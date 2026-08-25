@@ -248,6 +248,10 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 		return nil, fmt.Errorf("cannot create checkpoint for non-active session (status: %s)", sess.Status)
 	}
 
+	return s.createCheckpoint(ctx, sess, summary, files, autoGit)
+}
+
+func (s *Service) createCheckpoint(ctx context.Context, sess *Session, summary string, files []string, autoGit bool) (*Checkpoint, error) {
 	var gitCtx *GitContext
 	if autoGit && s.git != nil {
 		gitCtx, _ = s.git.Capture(sess.ProjectPath)
@@ -255,7 +259,7 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 
 	cp := &Checkpoint{
 		ID:        uuid.New().String(),
-		SessionID: sessionID,
+		SessionID: sess.ID,
 		Summary:   summary,
 		Files:     files,
 		CreatedAt: time.Now(),
@@ -271,7 +275,7 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 		return nil, fmt.Errorf("failed to save checkpoint: %w", err)
 	}
 
-	_ = s.store.UpdateSessionUpdatedAt(ctx, sessionID, time.Now())
+	_ = s.store.UpdateSessionUpdatedAt(ctx, sess.ID, time.Now())
 
 	var filesStr = "none"
 	if len(cp.Files) > 0 {
@@ -471,7 +475,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	if summary != "" {
-		_, err := s.Checkpoint(ctx, sessionID, summary, nil, autoGit)
+		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit)
 		if err != nil {
 			return fmt.Errorf("failed to write stop checkpoint: %w", err)
 		}
