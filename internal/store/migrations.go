@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS idx_decisions_session_id ON decisions(session_id);
 `,
 	},
+	{
+		version: 3,
+		sql: `
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session_id ON checkpoints(session_id);
+CREATE INDEX IF NOT EXISTS idx_snags_session_id ON snags(session_id);
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

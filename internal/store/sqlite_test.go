@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -828,6 +829,93 @@ func TestStore_UpdateSessionTaskName(t *testing.T) {
 	}
 	if got.TaskName != "New Name" {
 		t.Errorf("expected TaskName 'New Name', got %q", got.TaskName)
+	}
+}
+
+func TestSQLiteStore_Indexes(t *testing.T) {
+	t.Parallel()
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	rows, err := st.db.Query("SELECT name FROM sqlite_master WHERE type='index'")
+	if err != nil {
+		t.Fatalf("failed to query indexes: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("failed to scan index name: %v", err)
+		}
+		indexes[name] = true
+	}
+
+	requiredIndexes := []string{
+		"idx_sessions_task_id",
+		"idx_sessions_status",
+		"idx_sessions_project_status",
+		"idx_snags_error_signature",
+		"idx_sync_queue_status",
+		"idx_clickup_cache_entity",
+		"idx_clickup_cache_parent",
+		"idx_decisions_session_id",
+		"idx_checkpoints_session_id",
+		"idx_snags_session_id",
+	}
+	for _, idx := range requiredIndexes {
+		if !indexes[idx] {
+			t.Errorf("expected index %s to exist", idx)
+		}
+	}
+}
+
+func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", buildDSN(":memory:"))
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize with schema version 2 and apply migration 1 and 2
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL); INSERT INTO schema_version (version) VALUES (2);`)
+	if err != nil {
+		t.Fatalf("failed to setup schema_version: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version <= 2 {
+			if _, err := db.Exec(m.sql); err != nil {
+				t.Fatalf("migration %d failed: %v", m.version, err)
+			}
+		}
+	}
+
+	// Now run runMigrations, which should apply migration 3
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations failed on upgrade: %v", err)
+	}
+
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil {
+		t.Fatalf("failed to scan version: %v", err)
+	}
+	if version != 3 {
+		t.Errorf("expected schema version 3 after upgrade, got %d", version)
+	}
+
+	// Check that indexes from migration 3 are now present
+	var count int
+	err = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_checkpoints_session_id', 'idx_snags_session_id')").Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to check indexes: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 new indexes, found %d", count)
 	}
 }
 

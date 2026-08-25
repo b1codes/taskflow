@@ -95,8 +95,8 @@ func TestCLI_Init(t *testing.T) {
 	if !strings.Contains(out, "Database initialized at") {
 		t.Errorf("expected 'Database initialized at' in output, got: %s", out)
 	}
-	if !strings.Contains(out, "Schema version: 2") {
-		t.Errorf("expected 'Schema version: 2' in output, got: %s", out)
+	if !strings.Contains(out, "Schema version: 3") {
+		t.Errorf("expected 'Schema version: 3' in output, got: %s", out)
 	}
 }
 
