@@ -140,11 +140,18 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 
 func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit bool) (*StartResult, error) {
 	// 1. Advisory lock check
-	lockSessionID, err := ReadLock(projectPath)
-	if err == nil && lockSessionID != "" {
-		prevSess, err := s.store.GetSession(ctx, lockSessionID)
-		if err == nil && prevSess != nil && prevSess.Status == StatusActive && prevSess.TaskID != taskID {
-			return nil, fmt.Errorf("An active session already exists in %s (session %s). Stop or pause it first.", projectPath, lockSessionID)
+	lockInfo, err := ReadLockInfo(projectPath)
+	if err == nil && lockInfo != nil && lockInfo.SessionID != "" {
+		isStale := false
+		if lockInfo.PID > 0 && !IsProcessAlive(lockInfo.PID) {
+			isStale = true
+		}
+
+		if !isStale {
+			prevSess, err := s.store.GetSession(ctx, lockInfo.SessionID)
+			if err == nil && prevSess != nil && prevSess.Status == StatusActive && prevSess.TaskID != taskID {
+				return nil, fmt.Errorf("An active session already exists in %s (session %s). Stop or pause it first.", projectPath, lockInfo.SessionID)
+			}
 		}
 	}
 
@@ -236,7 +243,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	}
 
 	// 5. Write lock
-	_ = WriteLock(projectPath, sessionID)
+	if err := WriteLock(projectPath, sessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "[session] warning: failed to write session lock in %s: %v\n", projectPath, err)
+	}
 
 	s.enqueueSync(ctx, sess.TaskID, "UPDATE_STATUS", struct {
 		StatusType string `json:"status_type"`

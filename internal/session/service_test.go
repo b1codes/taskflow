@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
@@ -526,6 +527,52 @@ func TestService_Start_ActiveSession_ReportsResumedAndRefreshesTaskName(t *testi
 		t.Errorf("expected contract task name 'Renamed Task in ClickUp', got %q", res2.AgenticContract.Task.Name)
 	}
 }
+
+func TestService_Start_StaleLockFromDeadProcessIgnored(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "taskflow-dead-lock-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := newMockStore()
+	git := &mockGit{ctx: &GitContext{Branch: "main", SHA: "sha123", DirtyFiles: []string{}}}
+	clickup := &mockClickUp{}
+	srv := NewService(store, git, clickup)
+	ctx := context.Background()
+
+	// Create an active session in store for old task
+	oldSess := &Session{
+		ID:          "old-crashed-session",
+		TaskID:      "task-crashed",
+		TaskName:    "Crashed Task",
+		ProjectPath: tempDir,
+		Status:      StatusActive,
+		StartedAt:   time.Now().Add(-1 * time.Hour),
+		UpdatedAt:   time.Now().Add(-1 * time.Hour),
+	}
+	_ = store.CreateSession(ctx, oldSess)
+
+	// Write lock file with a dead PID (e.g. 99999999)
+	lockDir := tempDir + "/.b1codes"
+	_ = os.MkdirAll(lockDir, 0755)
+	deadLockData, _ := json.Marshal(LockInfo{
+		SessionID: "old-crashed-session",
+		PID:       99999999,
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	})
+	_ = os.WriteFile(lockDir+"/session.lock", deadLockData, 0644)
+
+	// Start on new task in the same project directory should succeed despite the old active session in lock
+	res, err := srv.Start(ctx, "task-new", tempDir, true)
+	if err != nil {
+		t.Fatalf("expected Start to succeed ignoring stale lock from dead PID, got err: %v", err)
+	}
+	if res.Session.TaskID != "task-new" {
+		t.Errorf("expected session taskID to be 'task-new', got %s", res.Session.TaskID)
+	}
+}
+
 
 
 

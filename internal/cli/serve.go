@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	syncPkg "sync"
 	"syscall"
 
 	"github.com/b1codes/taskflow/internal/clickup"
@@ -41,18 +42,26 @@ var serveCmd = &cobra.Command{
 		}
 		worker := sync.NewWorker(st, cuClient, &cfg.Sync)
 
+		var wg syncPkg.WaitGroup
+		wg.Add(2)
 		errChan := make(chan error, 2)
 		go func() {
+			defer wg.Done()
 			errChan <- srv.Run(ctx)
 		}()
 		go func() {
+			defer wg.Done()
 			errChan <- worker.Run(ctx)
 		}()
 
 		select {
 		case err := <-errChan:
+			stop()
+			wg.Wait()
 			return err
 		case <-ctx.Done():
+			stop()
+			wg.Wait()
 			return nil
 		}
 	},

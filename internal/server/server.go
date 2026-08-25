@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/b1codes/taskflow/internal/adapters"
@@ -47,7 +48,8 @@ func New(st store.Store, cfg *config.Config) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	return server.ServeStdio(s.mcpServer)
+	stdioServer := server.NewStdioServer(s.mcpServer)
+	return stdioServer.Listen(ctx, os.Stdin, os.Stdout)
 }
 
 func (s *Server) registerTools() {
