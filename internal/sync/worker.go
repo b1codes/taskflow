@@ -32,6 +32,9 @@ func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *
 }
 
 func (w *Worker) Run(ctx context.Context) error {
+	// Reset any stale in-flight ops on worker startup
+	_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -40,6 +43,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			// Periodically reset any stale in-flight ops
+			_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
+
 			processed, err := w.processBatch(ctx, 10)
 			if err != nil {
 				// Continue loop even on batch processing errors
@@ -57,6 +63,8 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) DrainOnce(ctx context.Context) (int, error) {
+	_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
+
 	pending, err := w.store.DequeuePending(ctx, 100)
 	if err != nil {
 		return 0, fmt.Errorf("failed to dequeue pending items: %w", err)
@@ -134,7 +142,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 
 	var payload SyncPayload
 	if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
-		_ = w.store.MarkFailed(ctx, op.ID, fmt.Sprintf("invalid payload: %v", err))
+		_ = w.store.MarkFailed(context.Background(), op.ID, fmt.Sprintf("invalid payload: %v", err))
 		return err
 	}
 
@@ -156,7 +164,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	}
 
 	if opErr != nil {
-		_ = w.store.MarkFailed(ctx, op.ID, opErr.Error())
+		_ = w.store.MarkFailed(context.Background(), op.ID, opErr.Error())
 		return opErr
 	}
 

@@ -540,3 +540,122 @@ func TestMemoryStore_MultipleConnections(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestResetStaleInFlight_ReapsStale(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-reap",
+		Payload:    `{"comment_text":"reap test"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now().Add(-20 * time.Minute),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	// Mark in-flight with timestamp 10 minutes ago
+	if err := st.MarkInFlight(ctx, opID); err != nil {
+		t.Fatalf("MarkInFlight failed: %v", err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	_, err = st.db.ExecContext(ctx, "UPDATE sync_queue SET last_attempted_at = ? WHERE id = ?", staleTime, opID)
+	if err != nil {
+		t.Fatalf("UPDATE last_attempted_at failed: %v", err)
+	}
+
+	// Verify it is not in pending
+	pending, err := st.DequeuePending(ctx, 10)
+	if err != nil {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected 0 pending items, got %d", len(pending))
+	}
+
+	// Run reaper with 5-minute threshold
+	rows, err := st.ResetStaleInFlight(ctx, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ResetStaleInFlight failed: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("expected 1 row reset, got %d", rows)
+	}
+
+	// Verify op is back in pending
+	reaped, err := st.DequeuePending(ctx, 10)
+	if err != nil {
+		t.Fatalf("DequeuePending after reaper failed: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0].ID != opID {
+		t.Errorf("expected reaped op %d in pending, got %v", opID, reaped)
+	}
+}
+
+func TestResetStaleInFlight_PreservesActiveInFlight(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-active",
+		Payload:    `{"comment_text":"active in flight test"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	// Mark in-flight now (within the 5-minute window)
+	if err := st.MarkInFlight(ctx, opID); err != nil {
+		t.Fatalf("MarkInFlight failed: %v", err)
+	}
+
+	// Run reaper with 5-minute threshold
+	rows, err := st.ResetStaleInFlight(ctx, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ResetStaleInFlight failed: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("expected 0 rows reset for active in-flight op, got %d", rows)
+	}
+
+	// Verify op is still not in pending
+	pending, err := st.DequeuePending(ctx, 10)
+	if err != nil {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending items, got %d", len(pending))
+	}
+}
+

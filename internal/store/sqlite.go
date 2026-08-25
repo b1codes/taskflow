@@ -45,7 +45,12 @@ func New(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
 
-	return &SQLiteStore{db: db}, nil
+	st := &SQLiteStore{db: db}
+
+	// Reset any stale in-flight ops left behind by prior crashes or unexpected shutdowns
+	_, _ = st.ResetStaleInFlight(context.Background(), 5*time.Minute)
+
+	return st, nil
 }
 
 // memDBSeq ensures each store.New(":memory:") gets a unique named
@@ -632,6 +637,16 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 		ops = append(ops, &op)
 	}
 	return ops, nil
+}
+
+func (s *SQLiteStore) ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error) {
+	threshold := time.Now().Add(-olderThan)
+	query := `UPDATE sync_queue SET status = 'PENDING' WHERE status = 'IN_FLIGHT' AND (last_attempted_at IS NULL OR last_attempted_at < ?)`
+	res, err := s.db.ExecContext(ctx, query, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("failed to reset stale in-flight items: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 func (s *SQLiteStore) GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error) {

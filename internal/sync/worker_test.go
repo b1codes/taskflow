@@ -248,3 +248,86 @@ func TestWorker_Run_ExceedingMaxRetriesStops(t *testing.T) {
 	}
 }
 
+func TestWorker_Reaper_RecoversStrandedInFlight(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-reap-worker",
+		TaskID:      "task-reap-worker",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "stranded in flight"})
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-reap-worker",
+		Payload:    string(payloadBytes),
+		MaxRetries: 5,
+		CreatedAt:  time.Now().Add(-20 * time.Minute),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	// Simulate crash during processing: op was marked in flight
+	if err := st.MarkInFlight(ctx, opID); err != nil {
+		t.Fatalf("MarkInFlight failed: %v", err)
+	}
+
+	// Reset with 0 duration to simulate staleness
+	resetRows, err := st.ResetStaleInFlight(ctx, 0)
+	if err != nil {
+		t.Fatalf("ResetStaleInFlight failed: %v", err)
+	}
+	if resetRows != 1 {
+		t.Fatalf("expected 1 row reset, got %d", resetRows)
+	}
+
+	var commentsPosted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		commentsPosted.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  5,
+		RateLimitMS: 1,
+	}
+
+	worker := NewWorker(st, client, syncCfg)
+	count, err := worker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 processed op, got %d", count)
+	}
+	if commentsPosted.Load() != 1 {
+		t.Errorf("expected 1 comment posted, got %d", commentsPosted.Load())
+	}
+}
+
+
+
