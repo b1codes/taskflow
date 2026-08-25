@@ -46,8 +46,12 @@ func TestEnsureDirIn(t *testing.T) {
 	}
 
 	configPath := filepath.Join(tempDir, "config.toml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		t.Errorf("config.toml was not created")
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("config.toml was not created: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("expected config.toml permissions 0600, got %#o", perm)
 	}
 
 	cfg, err := LoadFrom(configPath)

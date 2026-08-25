@@ -74,13 +74,13 @@ func EnsureDir() error {
 		return fmt.Errorf("failed to get user home directory: %w", err)
 	}
 	taskflowDir := filepath.Join(home, ".taskflow")
-	if err := os.MkdirAll(taskflowDir, 0755); err != nil {
+	if err := os.MkdirAll(taskflowDir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", taskflowDir, err)
 	}
 
 	configPath := filepath.Join(taskflowDir, "config.toml")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := os.WriteFile(configPath, []byte(DefaultConfigContent), 0644); err != nil {
+		if err := os.WriteFile(configPath, []byte(DefaultConfigContent), 0600); err != nil {
 			return fmt.Errorf("failed to write default config: %w", err)
 		}
 	}
@@ -89,13 +89,13 @@ func EnsureDir() error {
 
 // EnsureDirIn allows specifying a custom directory (useful for tests)
 func EnsureDirIn(dir string) error {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 	configPath := filepath.Join(dir, "config.toml")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		customDefault := strings.Replace(DefaultConfigContent, `path = "~/.taskflow/sessions.db"`, fmt.Sprintf(`path = "%s/sessions.db"`, dir), 1)
-		if err := os.WriteFile(configPath, []byte(customDefault), 0644); err != nil {
+		if err := os.WriteFile(configPath, []byte(customDefault), 0600); err != nil {
 			return fmt.Errorf("failed to write custom default config: %w", err)
 		}
 	}
@@ -126,7 +126,11 @@ func LoadFrom(configPath string) (*Config, error) {
 		},
 	}
 
-	if _, err := os.Stat(configPath); err == nil {
+	if fi, err := os.Stat(configPath); err == nil {
+		// Warn if the config file containing credentials is group/world-accessible
+		if fi.Mode().Perm()&0077 != 0 {
+			fmt.Fprintf(os.Stderr, "Warning: config file %s is readable by other users (mode %#o). Recommend: chmod 0600 %s\n", configPath, fi.Mode().Perm(), configPath)
+		}
 		if _, err := toml.DecodeFile(configPath, cfg); err != nil {
 			return nil, fmt.Errorf("failed to decode config TOML: %w", err)
 		}

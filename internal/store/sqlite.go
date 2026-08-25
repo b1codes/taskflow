@@ -22,7 +22,7 @@ type SQLiteStore struct {
 func New(dbPath string) (*SQLiteStore, error) {
 	if dbPath != ":memory:" {
 		dir := filepath.Dir(dbPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("failed to create database directory %s: %w", dir, err)
 		}
 	}
