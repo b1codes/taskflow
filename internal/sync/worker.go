@@ -94,6 +94,18 @@ func (w *Worker) processBatch(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 
+	if len(ops) < limit {
+		retryable, err := w.store.ListRetryable(ctx)
+		if err != nil {
+			return 0, err
+		}
+		remaining := limit - len(ops)
+		if len(retryable) > remaining {
+			retryable = retryable[:remaining]
+		}
+		ops = append(ops, retryable...)
+	}
+
 	count := 0
 	for _, op := range ops {
 		select {
