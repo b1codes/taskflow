@@ -21,9 +21,9 @@ Running the built binary:
 ```bash
 ./taskflow init                # scan ClickUp workspace, populate local cache
 ./taskflow start <task_id> <project_path>
-./taskflow checkpoint <session_id> "summary" --files a.go,b.go
+./taskflow checkpoint <session_id> --summary "summary" --files a.go,b.go
 ./taskflow decision <session_id> --topic "..." --decision "..." --rationale "..."
-./taskflow snag <session_id> "error text" --category build
+./taskflow snag <session_id> --error "error text" --category build
 ./taskflow stop <session_id> --summary "..." --status completed
 ./taskflow list --status active,paused
 ./taskflow serve                # run as MCP server over stdio

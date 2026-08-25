@@ -39,7 +39,7 @@ Taskflow is a developer productivity tool and context engine that connects your 
 
 ### Save progress (checkpoint)
 ```bash
-./taskflow checkpoint <session_id> "Refactored user router" --files router.go,main.go
+./taskflow checkpoint <session_id> --summary "Refactored user router" --files router.go,main.go
 ```
 
 ### Log design decisions & dialogue rationales
@@ -49,7 +49,7 @@ Taskflow is a developer productivity tool and context engine that connects your 
 
 ### Log snags and blockers
 ```bash
-./taskflow snag <session_id> "go build failed: undefined compiler type" --category build
+./taskflow snag <session_id> --error "go build failed: undefined compiler type" --category build
 ```
 
 ### List sessions
