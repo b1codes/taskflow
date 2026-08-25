@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -109,14 +110,32 @@ CREATE INDEX IF NOT EXISTS idx_snags_session_id ON snags(session_id);
 }
 
 func runMigrations(db *sql.DB) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get database connection for migrations: %w", err)
+	}
+	defer conn.Close()
+
+	// Acquire immediate transaction to guard migrations across concurrent processes
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("failed to begin immediate migration transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
 	// Create schema_version table if not exists, and get current version.
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);`)
+	_, err = conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);`)
 	if err != nil {
 		return fmt.Errorf("failed to create schema_version table: %w", err)
 	}
 
 	var currentVersion int
-	err = db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&currentVersion)
+	err = conn.QueryRowContext(ctx, `SELECT version FROM schema_version LIMIT 1`).Scan(&currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			currentVersion = 0
@@ -127,31 +146,28 @@ func runMigrations(db *sql.DB) error {
 
 	for _, m := range migrations {
 		if m.version > currentVersion {
-			tx, err := db.Begin()
-			if err != nil {
-				return fmt.Errorf("failed to start migration transaction: %w", err)
-			}
-			defer tx.Rollback()
-
-			if _, err := tx.Exec(m.sql); err != nil {
+			if _, err := conn.ExecContext(ctx, m.sql); err != nil {
 				return fmt.Errorf("failed to execute migration %d: %w", m.version, err)
 			}
 
 			if currentVersion == 0 {
-				_, err = tx.Exec(`INSERT INTO schema_version (version) VALUES (?)`, m.version)
+				_, err = conn.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, m.version)
 			} else {
-				_, err = tx.Exec(`UPDATE schema_version SET version = ?`, m.version)
+				_, err = conn.ExecContext(ctx, `UPDATE schema_version SET version = ?`, m.version)
 			}
 			if err != nil {
 				return fmt.Errorf("failed to update schema version: %w", err)
 			}
 
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("failed to commit migration transaction: %w", err)
-			}
 			currentVersion = m.version
 		}
 	}
 
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("failed to commit migration transaction: %w", err)
+	}
+	committed = true
+
 	return nil
 }
+

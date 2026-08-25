@@ -919,6 +919,66 @@ func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
 	}
 }
 
+// TestSQLiteStore_ConcurrentMigrations opens multiple store handles simultaneously on a fresh DB file,
+// simulating concurrent process starts (e.g. taskflow serve + CLI commands) to ensure migrations
+// run safely without race conditions or lock contention failures.
+func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "concurrent_migrations.db")
+
+	const numOpeners = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, numOpeners)
+	stores := make([]*SQLiteStore, numOpeners)
+
+	for i := 0; i < numOpeners; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			st, err := New(dbPath)
+			if err != nil {
+				errs <- err
+				return
+			}
+			stores[idx] = st
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent store.New failed: %v", err)
+		}
+	}
+
+	for _, st := range stores {
+		if st != nil {
+			st.Close()
+		}
+	}
+
+	// Verify final schema state
+	verifyStore, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open verify store: %v", err)
+	}
+	defer verifyStore.Close()
+
+	version, tableCount, err := verifyStore.GetSchemaInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetSchemaInfo failed: %v", err)
+	}
+	if version != 3 {
+		t.Errorf("expected version 3, got %d", version)
+	}
+	if tableCount < 7 {
+		t.Errorf("expected at least 7 tables, got %d", tableCount)
+	}
+}
+
+
 
 
 

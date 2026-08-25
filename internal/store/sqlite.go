@@ -80,9 +80,9 @@ func buildDSN(dbPath string) string {
 		// gets its own name to keep parallel tests isolated.
 		// journal_mode=WAL is not applicable to in-memory databases.
 		id := memDBSeq.Add(1)
-		return fmt.Sprintf("file:memdb_%d?mode=memory&cache=shared&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", id)
+		return fmt.Sprintf("file:memdb_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", id)
 	}
-	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", dbPath)
+	return fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dbPath)
 }
 
 func (s *SQLiteStore) Close() error {
