@@ -1,6 +1,7 @@
 package gitctx
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,16 +18,16 @@ func TestGitContext_Capture(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	// Run capture on non-git dir -> should return nil, nil
+	// 1. Run capture on non-git dir -> should return ErrNotAGitRepository
 	ctx, err := Capture(tempDir)
-	if err != nil {
-		t.Fatalf("Capture on non-git dir failed: %v", err)
+	if err == nil || !errors.Is(err, ErrNotAGitRepository) {
+		t.Fatalf("expected ErrNotAGitRepository for non-git dir, got err: %v, ctx: %+v", err, ctx)
 	}
 	if ctx != nil {
 		t.Errorf("expected Capture to return nil context for non-git dir, got: %+v", ctx)
 	}
 
-	// Initialize git repo in tempDir
+	// 2. Initialize git repo in tempDir
 	if err := exec.Command("git", "-C", tempDir, "init").Run(); err != nil {
 		t.Skip("skipping git test: git command failed to run git init")
 	}
@@ -67,6 +68,69 @@ func TestGitContext_Capture(t *testing.T) {
 	}
 	if len(gctx.DirtyFiles) != 1 || gctx.DirtyFiles[0] != "file2.txt" {
 		t.Errorf("expected dirty files to contain file2.txt, got %v", gctx.DirtyFiles)
+	}
+}
+
+func TestGitContext_UncommittedRepo(t *testing.T) {
+	tempDir := t.TempDir()
+
+	if err := exec.Command("git", "-C", tempDir, "init").Run(); err != nil {
+		t.Skip("skipping git test: git init failed")
+	}
+	_ = exec.Command("git", "-C", tempDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "commit.gpgsign", "false").Run()
+
+	// Fresh repo with no commits yet, but 1 dirty file
+	file1 := filepath.Join(tempDir, "new_file.txt")
+	_ = os.WriteFile(file1, []byte("hello uncommitted"), 0644)
+
+	gctx, err := Capture(tempDir)
+	if err != nil {
+		t.Fatalf("Capture failed on uncommitted repo: %v", err)
+	}
+	if gctx == nil {
+		t.Fatal("expected non-nil git context")
+	}
+	if gctx.Branch == "" {
+		t.Errorf("expected branch name to be detected (e.g. main/master/HEAD), got empty")
+	}
+	if gctx.SHA != "" {
+		t.Errorf("expected empty SHA on uncommitted repo, got %s", gctx.SHA)
+	}
+	if len(gctx.DirtyFiles) != 1 || gctx.DirtyFiles[0] != "new_file.txt" {
+		t.Errorf("expected dirty files to contain new_file.txt, got %v", gctx.DirtyFiles)
+	}
+}
+
+func TestGitContext_RenamedAndSpecialChars(t *testing.T) {
+	tempDir := t.TempDir()
+
+	if err := exec.Command("git", "-C", tempDir, "init").Run(); err != nil {
+		t.Skip("skipping git test: git init failed")
+	}
+	_ = exec.Command("git", "-C", tempDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "commit.gpgsign", "false").Run()
+
+	// Initial commit
+	file1 := filepath.Join(tempDir, "file with spaces.txt")
+	_ = os.WriteFile(file1, []byte("initial"), 0644)
+	_ = exec.Command("git", "-C", tempDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", tempDir, "commit", "-m", "init").Run()
+
+	// Rename file
+	_ = exec.Command("git", "-C", tempDir, "mv", "file with spaces.txt", "renamed file.txt").Run()
+
+	gctx, err := Capture(tempDir)
+	if err != nil {
+		t.Fatalf("Capture failed on renamed file: %v", err)
+	}
+	if gctx == nil {
+		t.Fatal("expected non-nil git context")
+	}
+	if len(gctx.DirtyFiles) != 1 || gctx.DirtyFiles[0] != "renamed file.txt" {
+		t.Errorf("expected dirty files to contain 'renamed file.txt', got %v", gctx.DirtyFiles)
 	}
 }
 
@@ -116,4 +180,3 @@ func TestGitContext_LockFileIgnoredAndNotReportedDirty(t *testing.T) {
 		t.Errorf("expected 0 dirty files, got: %v", gctx.DirtyFiles)
 	}
 }
-

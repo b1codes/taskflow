@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/b1codes/taskflow/internal/clickup"
+	"github.com/b1codes/taskflow/internal/session"
 )
 
 func TestGitCapturer_Capture(t *testing.T) {
@@ -18,10 +20,10 @@ func TestGitCapturer_Capture(t *testing.T) {
 
 	tempDir := t.TempDir()
 
-	// 1. Non-git dir -> returns nil, nil
+	// 1. Non-git dir -> returns nil, ErrNotAGitRepository
 	ctx, err := g.Capture(tempDir)
-	if err != nil {
-		t.Fatalf("Capture on non-git dir failed: %v", err)
+	if err == nil || !errors.Is(err, session.ErrNotAGitRepository) {
+		t.Fatalf("expected ErrNotAGitRepository on non-git dir, got err: %v", err)
 	}
 	if ctx != nil {
 		t.Errorf("expected nil context for non-git dir, got %+v", ctx)

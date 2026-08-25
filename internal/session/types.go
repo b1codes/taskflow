@@ -1,6 +1,11 @@
 package session
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var ErrNotAGitRepository = errors.New("not a git repository")
 
 type Session struct {
 	ID          string    `json:"id"`

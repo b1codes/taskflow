@@ -236,7 +236,11 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	var gitCtx *GitContext
 	if autoGit && s.git != nil {
 		gitCtx, err = s.git.Capture(projectPath)
-		if err == nil && gitCtx != nil {
+		if err != nil {
+			if !errors.Is(err, ErrNotAGitRepository) {
+				fmt.Fprintf(os.Stderr, "[session] git capture warning in %s: %v\n", projectPath, err)
+			}
+		} else if gitCtx != nil {
 			sess.GitBranch = gitCtx.Branch
 			_ = s.store.UpdateSessionGitBranch(ctx, sess.ID, gitCtx.Branch)
 		}
@@ -284,7 +288,11 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 func (s *Service) createCheckpoint(ctx context.Context, sess *Session, summary string, files []string, autoGit bool) (*Checkpoint, error) {
 	var gitCtx *GitContext
 	if autoGit && s.git != nil {
-		gitCtx, _ = s.git.Capture(sess.ProjectPath)
+		var err error
+		gitCtx, err = s.git.Capture(sess.ProjectPath)
+		if err != nil && !errors.Is(err, ErrNotAGitRepository) {
+			fmt.Fprintf(os.Stderr, "[session] git checkpoint capture warning in %s: %v\n", sess.ProjectPath, err)
+		}
 	}
 
 	cp := &Checkpoint{
