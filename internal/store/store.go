@@ -35,8 +35,10 @@ type Store interface {
 	MarkInFlight(ctx context.Context, id int64) error
 	MarkDone(ctx context.Context, id int64) error
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
+	RequeueRateLimited(ctx context.Context, id int64, errMsg string) error
 	ListRetryable(ctx context.Context) ([]*session.SyncOp, error)
 	ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error)
+	SetRetryBackoffBase(d time.Duration)
 
 	GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error)
 

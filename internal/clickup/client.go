@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -71,7 +72,19 @@ func (c *Client) do(ctx context.Context, method, path string, bodyVal interface{
 	case http.StatusNotFound:
 		return ErrNotFound
 	case http.StatusTooManyRequests:
-		return ErrRateLimited
+		retryAfterStr := resp.Header.Get("Retry-After")
+		var delay time.Duration
+		if retryAfterStr != "" {
+			if secs, err := strconv.Atoi(retryAfterStr); err == nil {
+				delay = time.Duration(secs) * time.Second
+			} else if t, err := http.ParseTime(retryAfterStr); err == nil {
+				delay = time.Until(t)
+			}
+		}
+		if delay < 0 {
+			delay = 0
+		}
+		return &RateLimitError{RetryAfter: delay}
 	default:
 		if resp.StatusCode >= 500 {
 			return ErrServerError

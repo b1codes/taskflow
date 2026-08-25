@@ -98,6 +98,7 @@ func TestWorker_Run_RetriesFailedOps(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+	st.SetRetryBackoffBase(10 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -186,6 +187,7 @@ func TestWorker_Run_ExceedingMaxRetriesStops(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+	st.SetRetryBackoffBase(10 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -504,6 +506,94 @@ func TestWorker_LogsFailureToStderr(t *testing.T) {
 		t.Errorf("expected stderr to contain task ID 'task-log-test', got: %q", stderrOutput)
 	}
 }
+
+func TestWorker_RateLimit429_DoesNotConsumeRetry(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	parentSess := &session.Session{
+		ID:          "sess-429-worker",
+		TaskID:      "task-429-worker",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "test 429 op"})
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-429-worker",
+		Payload:    string(payloadBytes),
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		att := attempts.Add(1)
+		if att == 1 {
+			// First attempt returns 429 Too Many Requests with Retry-After header
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		// Subsequent attempts succeed
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  5,
+		RateLimitMS: 1,
+	}
+
+	worker := NewWorker(st, client, syncCfg)
+
+	// Pass 1: returns 429
+	count, _ := worker.DrainOnce(ctx)
+	if count != 0 {
+		t.Errorf("expected 0 processed on 429, got %d", count)
+	}
+
+	// Verify that the op was requeued as PENDING with retries STILL AT 0 (retry not consumed)
+	pending, err := st.DequeuePending(ctx, 10)
+	if err != nil {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending item after 429 requeue, got %d", len(pending))
+	}
+	if pending[0].Retries != 0 {
+		t.Errorf("expected retries to remain 0 after 429 rate limit, got %d", pending[0].Retries)
+	}
+
+	// Re-enqueue op for pass 2 (since DequeuePending fetched it)
+	// Now let worker drain it to completion
+	pass2Worker := NewWorker(st, client, syncCfg)
+	count, err = pass2Worker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce pass 2 failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 processed item on pass 2, got %d", count)
+	}
+}
+
 
 
 

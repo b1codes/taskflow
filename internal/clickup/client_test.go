@@ -2,6 +2,7 @@ package clickup
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -59,7 +60,7 @@ func TestClickUpClient_Errors(t *testing.T) {
 
 		client := New("my-key").WithBaseURL(server.URL)
 		_, err := client.GetTask(context.Background(), "abc123")
-		if err != tt.expected {
+		if !errors.Is(err, tt.expected) {
 			t.Errorf("expected error %v for status %d, got %v", tt.expected, tt.status, err)
 		}
 		server.Close()

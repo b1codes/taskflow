@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -183,6 +184,20 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	if opErr != nil {
 		fmt.Fprintf(os.Stderr, "[sync] op %d failed (op: %s, task: %s, retry: %d/%d): %v\n",
 			op.ID, op.Operation, op.TaskID, op.Retries+1, op.MaxRetries, opErr)
+
+		var rateLimitErr *clickup.RateLimitError
+		if errors.As(opErr, &rateLimitErr) || errors.Is(opErr, clickup.ErrRateLimited) {
+			// A 429 response does NOT consume a retry.
+			_ = w.store.RequeueRateLimited(context.Background(), op.ID, opErr.Error())
+			if rateLimitErr != nil && rateLimitErr.RetryAfter > 0 {
+				select {
+				case <-ctx.Done():
+				case <-time.After(rateLimitErr.RetryAfter):
+				}
+			}
+			return opErr
+		}
+
 		_ = w.store.MarkFailed(context.Background(), op.ID, opErr.Error())
 		return opErr
 	}

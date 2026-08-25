@@ -16,7 +16,19 @@ import (
 )
 
 type SQLiteStore struct {
-	db *sql.DB
+	db          *sql.DB
+	backoffBase time.Duration
+}
+
+func (s *SQLiteStore) SetRetryBackoffBase(d time.Duration) {
+	s.backoffBase = d
+}
+
+func (s *SQLiteStore) getBackoffBase() time.Duration {
+	if s.backoffBase <= 0 {
+		return 30 * time.Second
+	}
+	return s.backoffBase
 }
 
 func New(dbPath string) (*SQLiteStore, error) {
@@ -620,6 +632,7 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 	defer rows.Close()
 
 	var ops []*session.SyncOp
+	now := time.Now()
 	for rows.Next() {
 		var op session.SyncOp
 		var lastAttemptedAtSql sql.NullTime
@@ -634,9 +647,27 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 		if errorMsgSql.Valid {
 			op.ErrorMsg = errorMsgSql.String
 		}
+
+		// Exponential backoff gate: (retries * retries * backoffBase)
+		if op.LastAttemptedAt != nil && op.Retries > 0 {
+			backoff := time.Duration(op.Retries*op.Retries) * s.getBackoffBase()
+			if now.Sub(*op.LastAttemptedAt) < backoff {
+				continue // Backoff window has not elapsed yet
+			}
+		}
+
 		ops = append(ops, &op)
 	}
 	return ops, nil
+}
+
+func (s *SQLiteStore) RequeueRateLimited(ctx context.Context, id int64, errMsg string) error {
+	query := `UPDATE sync_queue SET status = 'PENDING', error_msg = ?, last_attempted_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, errMsg, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to requeue rate limited sync item: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error) {

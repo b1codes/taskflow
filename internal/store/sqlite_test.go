@@ -659,3 +659,111 @@ func TestResetStaleInFlight_PreservesActiveInFlight(t *testing.T) {
 	}
 }
 
+func TestListRetryable_BackoffGate(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-backoff",
+		Payload:    `{"comment_text":"backoff test"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	// Mark op as failed -> retries becomes 1
+	if err := st.MarkFailed(ctx, opID, "network error"); err != nil {
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+
+	// 1. Immediately after failure, backoff gate (30s for retry 1) should prevent listing
+	st.SetRetryBackoffBase(30 * time.Second)
+	retryable, err := st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable failed: %v", err)
+	}
+	if len(retryable) != 0 {
+		t.Errorf("expected 0 retryables within backoff window, got %d", len(retryable))
+	}
+
+	// 2. Backdate last_attempted_at by 35 seconds (past the 30s window)
+	staleTime := time.Now().Add(-35 * time.Second)
+	_, err = st.db.ExecContext(ctx, "UPDATE sync_queue SET last_attempted_at = ? WHERE id = ?", staleTime, opID)
+	if err != nil {
+		t.Fatalf("UPDATE last_attempted_at failed: %v", err)
+	}
+
+	// Now ListRetryable should return the op
+	retryable, err = st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable after backoff window failed: %v", err)
+	}
+	if len(retryable) != 1 || retryable[0].ID != opID {
+		t.Errorf("expected op %d to be listed after backoff elapsed, got %v", opID, retryable)
+	}
+}
+
+func TestRequeueRateLimited(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-429",
+		Payload:    `{"comment_text":"429 test"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	if err := st.MarkInFlight(ctx, opID); err != nil {
+		t.Fatalf("MarkInFlight failed: %v", err)
+	}
+
+	// Requeue due to 429 rate limit
+	if err := st.RequeueRateLimited(ctx, opID, "rate limit 429"); err != nil {
+		t.Fatalf("RequeueRateLimited failed: %v", err)
+	}
+
+	// Verify status is back to PENDING and retries is still 0
+	requeued, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(requeued) != 1 {
+		t.Fatalf("DequeuePending after requeue failed: %v", err)
+	}
+	if requeued[0].Retries != 0 {
+		t.Errorf("expected retries to remain 0 after 429 requeue, got %d", requeued[0].Retries)
+	}
+}
+
+
