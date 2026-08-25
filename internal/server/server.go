@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -48,8 +49,12 @@ func New(st store.Store, cfg *config.Config) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	return s.RunReader(ctx, os.Stdin, os.Stdout)
+}
+
+func (s *Server) RunReader(ctx context.Context, in io.Reader, out io.Writer) error {
 	stdioServer := server.NewStdioServer(s.mcpServer)
-	return stdioServer.Listen(ctx, os.Stdin, os.Stdout)
+	return stdioServer.Listen(ctx, in, out)
 }
 
 func (s *Server) registerTools() {

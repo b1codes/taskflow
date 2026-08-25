@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/config"
 	"github.com/b1codes/taskflow/internal/session"
@@ -115,3 +119,37 @@ func TestMCPServer_Handlers(t *testing.T) {
 		t.Fatalf("handleStop returned error: %s", stopRes.Content[0].(mcp.TextContent).Text)
 	}
 }
+
+func TestServer_RunReader_ContextCancellation(t *testing.T) {
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	srv := New(st, &config.Config{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	inReader, inWriter := io.Pipe()
+	defer inWriter.Close()
+	var outBuf bytes.Buffer
+
+	doneChan := make(chan error, 1)
+	go func() {
+		doneChan <- srv.RunReader(ctx, inReader, &outBuf)
+	}()
+
+	// Cancel context to trigger shutdown
+	cancel()
+
+	select {
+	case err := <-doneChan:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("RunReader returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunReader did not terminate upon context cancellation")
+	}
+}
+
