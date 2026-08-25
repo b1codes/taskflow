@@ -27,6 +27,15 @@ func TestSessionLock(t *testing.T) {
 		t.Fatalf("WriteLock failed: %v", err)
 	}
 
+	// Verify .gitignore was created with *
+	gitignoreData, err := os.ReadFile(tempDir + "/.b1codes/.gitignore")
+	if err != nil {
+		t.Fatalf("expected .b1codes/.gitignore to exist: %v", err)
+	}
+	if string(gitignoreData) != "*\n" {
+		t.Errorf("expected .gitignore content '*\\n', got %q", string(gitignoreData))
+	}
+
 	// Read again
 	id, err = ReadLock(tempDir)
 	if err != nil {

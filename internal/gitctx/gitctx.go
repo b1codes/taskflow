@@ -41,6 +41,9 @@ func Capture(projectPath string) (*session.GitContext, error) {
 			if len(line) > 3 {
 				path := line[3:]
 				path = strings.Trim(path, "\"")
+				if strings.HasPrefix(path, ".b1codes") || strings.HasPrefix(path, ".b1codes/") {
+					continue
+				}
 				dirtyFiles = append(dirtyFiles, path)
 			}
 		}

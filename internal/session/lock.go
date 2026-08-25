@@ -11,6 +11,11 @@ func WriteLock(projectPath, sessionID string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	gitignoreFile := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(gitignoreFile); os.IsNotExist(err) {
+		_ = os.WriteFile(gitignoreFile, []byte("*\n"), 0644)
+	}
+
 	lockFile := filepath.Join(dir, "session.lock")
 	return os.WriteFile(lockFile, []byte(sessionID), 0644)
 }

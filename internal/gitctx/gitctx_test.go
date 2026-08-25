@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/b1codes/taskflow/internal/session"
 )
 
 func TestGitContext_Capture(t *testing.T) {
@@ -67,3 +69,51 @@ func TestGitContext_Capture(t *testing.T) {
 		t.Errorf("expected dirty files to contain file2.txt, got %v", gctx.DirtyFiles)
 	}
 }
+
+func TestGitContext_LockFileIgnoredAndNotReportedDirty(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "taskflow-git-lock-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := exec.Command("git", "-C", tempDir, "init").Run(); err != nil {
+		t.Skip("skipping git test: git command failed to run git init")
+	}
+
+	_ = exec.Command("git", "-C", tempDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", tempDir, "config", "commit.gpgsign", "false").Run()
+
+	// Initial clean commit
+	file1 := filepath.Join(tempDir, "file1.txt")
+	if err := os.WriteFile(file1, []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	_ = exec.Command("git", "-C", tempDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", tempDir, "commit", "-m", "initial").Run()
+
+	// Create session lock (which creates .b1codes/session.lock and .b1codes/.gitignore)
+	if err := session.WriteLock(tempDir, "sess-lock-test"); err != nil {
+		t.Fatalf("WriteLock failed: %v", err)
+	}
+
+	// Verify git status --porcelain is completely clean
+	out, err := exec.Command("git", "-C", tempDir, "status", "--porcelain").Output()
+	if err != nil {
+		t.Fatalf("git status failed: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected clean git status after WriteLock, got:\n%s", string(out))
+	}
+
+	// Verify Capture returns 0 dirty files
+	gctx, err := Capture(tempDir)
+	if err != nil {
+		t.Fatalf("Capture failed: %v", err)
+	}
+	if len(gctx.DirtyFiles) != 0 {
+		t.Errorf("expected 0 dirty files, got: %v", gctx.DirtyFiles)
+	}
+}
+
