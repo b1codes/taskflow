@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -33,7 +32,7 @@ var checkpointCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := session.NewService(st, &gitCapturerImpl{}, nil)
+		srv := newSessionService(st, cfg)
 
 		cp, err := srv.Checkpoint(cmd.Context(), sessionID, checkpointSummary, checkpointFiles, cfg.Git.AutoContext)
 		if err != nil {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/b1codes/taskflow/internal/adapters"
 	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/config"
 	"github.com/b1codes/taskflow/internal/session"
@@ -24,39 +25,6 @@ func (g *gitCapturerMock) Capture(projectPath string) (*session.GitContext, erro
 		SHA:        "abcdef123456",
 		DirtyFiles: []string{"main.go"},
 	}, nil
-}
-
-type clickupAdapter struct {
-	client *clickup.Client
-}
-
-func (a *clickupAdapter) GetTask(ctx context.Context, taskID string) (*session.ClickUpTaskInfo, error) {
-	t, err := a.client.GetTask(ctx, taskID)
-	if err != nil {
-		return nil, err
-	}
-	return &session.ClickUpTaskInfo{
-		ID:          t.ID,
-		Name:        t.Name,
-		Description: t.Description,
-		ListID:      t.List.ID,
-	}, nil
-}
-
-func (a *clickupAdapter) GetListStatuses(ctx context.Context, listID string) ([]session.ClickUpStatusInfo, error) {
-	details, err := a.client.GetListDetails(ctx, listID)
-	if err != nil {
-		return nil, err
-	}
-	var res []session.ClickUpStatusInfo
-	for _, s := range details.Statuses {
-		res = append(res, session.ClickUpStatusInfo{
-			Status:     s.Status,
-			Type:       s.Type,
-			OrderIndex: s.OrderIndex,
-		})
-	}
-	return res, nil
 }
 
 func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
@@ -107,7 +75,7 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 	defer clickupServer.Close()
 
 	client := clickup.New("test-key").WithBaseURL(clickupServer.URL)
-	adapter := &clickupAdapter{client: client}
+	adapter := adapters.NewClickUpAdapter(client)
 
 	tempDir, err := os.MkdirTemp("", "taskflow-integration-*")
 	if err != nil {
@@ -237,7 +205,7 @@ func TestSyncWorker_AutoDrain(t *testing.T) {
 	defer clickupServer.Close()
 
 	client := clickup.New("test-key").WithBaseURL(clickupServer.URL)
-	adapter := &clickupAdapter{client: client}
+	adapter := adapters.NewClickUpAdapter(client)
 
 	tempDir, err := os.MkdirTemp("", "taskflow-autosync-*")
 	if err != nil {

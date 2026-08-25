@@ -6,59 +6,20 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/b1codes/taskflow/internal/adapters"
 	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/config"
-	"github.com/b1codes/taskflow/internal/gitctx"
 	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-type gitCapturerImpl struct{}
-
-func (g *gitCapturerImpl) Capture(projectPath string) (*session.GitContext, error) {
-	return gitctx.Capture(projectPath)
-}
-
 type Server struct {
 	mcpServer *server.MCPServer
 	service   *session.Service
 	store     store.Store
 	config    *config.Config
-}
-
-type clickupAdapter struct {
-	client *clickup.Client
-}
-
-func (a *clickupAdapter) GetTask(ctx context.Context, taskID string) (*session.ClickUpTaskInfo, error) {
-	t, err := a.client.GetTask(ctx, taskID)
-	if err != nil {
-		return nil, err
-	}
-	return &session.ClickUpTaskInfo{
-		ID:          t.ID,
-		Name:        t.Name,
-		Description: t.Description,
-		ListID:      t.List.ID,
-	}, nil
-}
-
-func (a *clickupAdapter) GetListStatuses(ctx context.Context, listID string) ([]session.ClickUpStatusInfo, error) {
-	details, err := a.client.GetListDetails(ctx, listID)
-	if err != nil {
-		return nil, err
-	}
-	var res []session.ClickUpStatusInfo
-	for _, s := range details.Statuses {
-		res = append(res, session.ClickUpStatusInfo{
-			Status:     s.Status,
-			Type:       s.Type,
-			OrderIndex: s.OrderIndex,
-		})
-	}
-	return res, nil
 }
 
 func New(st store.Store, cfg *config.Config) *Server {
@@ -70,12 +31,12 @@ func New(st store.Store, cfg *config.Config) *Server {
 
 	var cuClient session.ClickUpClient
 	if cfg.ClickUp.APIKey != "" {
-		cuClient = &clickupAdapter{client: clickup.New(cfg.ClickUp.APIKey)}
+		cuClient = adapters.NewClickUpAdapter(clickup.New(cfg.ClickUp.APIKey))
 	}
 
 	srv := &Server{
 		mcpServer: s,
-		service:   session.NewService(st, &gitCapturerImpl{}, cuClient),
+		service:   session.NewService(st, adapters.NewGitCapturer(), cuClient),
 		store:     st,
 		config:    cfg,
 	}

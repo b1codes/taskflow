@@ -5,17 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/b1codes/taskflow/internal/gitctx"
-	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 )
-
-type gitCapturerImpl struct{}
-
-func (g *gitCapturerImpl) Capture(projectPath string) (*session.GitContext, error) {
-	return gitctx.Capture(projectPath)
-}
 
 var startCmd = &cobra.Command{
 	Use:   "start [task_id] [project_path]",
@@ -36,7 +28,7 @@ var startCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := session.NewService(st, &gitCapturerImpl{}, nil)
+		srv := newSessionService(st, cfg)
 
 		res, err := srv.Start(cmd.Context(), taskID, projectPath, cfg.Git.AutoContext)
 		if err != nil {

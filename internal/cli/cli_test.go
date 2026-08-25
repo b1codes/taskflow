@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +14,8 @@ import (
 
 	"github.com/b1codes/taskflow/internal/config"
 	"github.com/b1codes/taskflow/internal/session"
-	"github.com/spf13/pflag"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func setupTestEnv(t *testing.T) string {
@@ -332,3 +334,37 @@ func TestCLI_Serve_GracefulShutdown(t *testing.T) {
 		t.Logf("serve returned: %v", err)
 	}
 }
+
+func TestCLI_Start_WithClickUpAPIKey(t *testing.T) {
+	tempHome := setupTestEnv(t)
+	projDir := filepath.Join(tempHome, "myproject_cu")
+	_ = os.MkdirAll(projDir, 0755)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/task/task-cu-999" {
+			_, _ = w.Write([]byte(`{
+				"id": "task-cu-999",
+				"name": "ClickUp Real Task Name",
+				"description": "Real Description",
+				"status": {"status": "open", "type": "open"},
+				"list": {"id": "list-999", "name": "List"}
+			}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	t.Setenv("CLICKUP_API_KEY", "mock-key")
+	t.Setenv("CLICKUP_BASE_URL", server.URL)
+
+	out, err := runCLI(t, []string{"start", "task-cu-999", projDir})
+	if err != nil {
+		t.Fatalf("start failed: %v, output: %s", err, out)
+	}
+	if !strings.Contains(out, "ClickUp Real Task Name") {
+		t.Errorf("expected 'ClickUp Real Task Name' in output, got: %s", out)
+	}
+}
+

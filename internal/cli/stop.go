@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -32,7 +31,7 @@ var stopCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := session.NewService(st, &gitCapturerImpl{}, nil)
+		srv := newSessionService(st, cfg)
 
 		targetStatus := strings.ToUpper(stopStatus)
 		if targetStatus == "" {

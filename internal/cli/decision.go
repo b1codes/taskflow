@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -36,7 +35,7 @@ var decisionCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := session.NewService(st, &gitCapturerImpl{}, nil)
+		srv := newSessionService(st, cfg)
 
 		res, err := srv.LogDecision(cmd.Context(), sessionID, decisionTopic, decisionText, decisionRationale, decisionStatus, decisionFiles)
 		if err != nil {

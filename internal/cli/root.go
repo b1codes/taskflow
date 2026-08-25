@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/b1codes/taskflow/internal/adapters"
+	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/config"
+	"github.com/b1codes/taskflow/internal/session"
+	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -58,3 +62,12 @@ func ConfigFromContext(ctx context.Context) *config.Config {
 func JSONOutput() bool {
 	return jsonOut
 }
+
+func newSessionService(st store.Store, cfg *config.Config) *session.Service {
+	var cuClient session.ClickUpClient
+	if cfg != nil && cfg.ClickUp.APIKey != "" {
+		cuClient = adapters.NewClickUpAdapter(clickup.New(cfg.ClickUp.APIKey))
+	}
+	return session.NewService(st, adapters.NewGitCapturer(), cuClient)
+}
+

@@ -31,7 +31,7 @@ var listCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := session.NewService(st, &gitCapturerImpl{}, nil)
+		srv := newSessionService(st, cfg)
 
 		var statuses []session.Status
 		if listStatus != "" {

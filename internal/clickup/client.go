@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -18,12 +19,16 @@ type Client struct {
 }
 
 func New(apiKey string) *Client {
+	baseURL := "https://api.clickup.com/api/v2"
+	if envURL := os.Getenv("CLICKUP_BASE_URL"); envURL != "" {
+		baseURL = envURL
+	}
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 		apiKey:  apiKey,
-		baseURL: "https://api.clickup.com/api/v2",
+		baseURL: baseURL,
 	}
 }
 
