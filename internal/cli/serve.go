@@ -6,8 +6,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/server"
 	"github.com/b1codes/taskflow/internal/store"
+	"github.com/b1codes/taskflow/internal/sync"
 	"github.com/spf13/cobra"
 )
 
@@ -32,9 +34,19 @@ var serveCmd = &cobra.Command{
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		errChan := make(chan error, 1)
+		// Start sync worker to drain enqueued ops to ClickUp in the background.
+		var cuClient *clickup.Client
+		if cfg.ClickUp.APIKey != "" {
+			cuClient = clickup.New(cfg.ClickUp.APIKey)
+		}
+		worker := sync.NewWorker(st, cuClient, &cfg.Sync)
+
+		errChan := make(chan error, 2)
 		go func() {
 			errChan <- srv.Run(ctx)
+		}()
+		go func() {
+			errChan <- worker.Run(ctx)
 		}()
 
 		select {

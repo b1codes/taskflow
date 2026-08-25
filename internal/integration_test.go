@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/config"
@@ -181,5 +183,114 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 	}
 	if updateStatusCalled < 2 {
 		t.Errorf("expected at least 2 UpdateTaskStatus calls, got %d", updateStatusCalled)
+	}
+}
+
+// TestSyncWorker_AutoDrain verifies that Worker.Run (the ticker-driven
+// background loop started by `taskflow serve`) automatically drains enqueued
+// sync ops to ClickUp without requiring a manual DrainOnce call.
+func TestSyncWorker_AutoDrain(t *testing.T) {
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	var commentPosted atomic.Int32
+	var statusUpdated atomic.Int32
+	clickupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" && r.URL.Path == "/task/task-auto" {
+			_, _ = w.Write([]byte(`{
+				"id": "task-auto",
+				"name": "Auto Sync Task",
+				"text_content": "Description",
+				"status": {"status": "in progress", "type": "active"},
+				"list": {"id": "list-1", "name": "List Name"}
+			}`))
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/list/list-1" {
+			_, _ = w.Write([]byte(`{
+				"id": "list-1",
+				"name": "List Name",
+				"statuses": [
+					{"status": "Open", "type": "open", "orderindex": 0},
+					{"status": "In Progress", "type": "active", "orderindex": 1},
+					{"status": "Closed", "type": "closed", "orderindex": 2}
+				]
+			}`))
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/task/task-auto/comment" {
+			commentPosted.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		if r.Method == "PUT" && r.URL.Path == "/task/task-auto" {
+			statusUpdated.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer clickupServer.Close()
+
+	client := clickup.New("test-key").WithBaseURL(clickupServer.URL)
+	adapter := &clickupAdapter{client: client}
+
+	tempDir, err := os.MkdirTemp("", "taskflow-autosync-*")
+	if err != nil {
+		t.Fatalf("failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	service := session.NewService(st, &gitCapturerMock{}, adapter)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Start the sync worker in the background — this is what `taskflow serve`
+	// now does alongside the MCP server.
+	syncCfg := &config.SyncConfig{
+		MaxRetries:  5,
+		RateLimitMS: 1,
+	}
+	worker := sync.NewWorker(st, client, syncCfg)
+	go func() {
+		_ = worker.Run(ctx)
+	}()
+
+	// Enqueue via service: start a session and create a checkpoint.
+	// These calls enqueue sync ops (UPDATE_STATUS, POST_COMMENT) into sync_queue.
+	startRes, err := service.Start(ctx, "task-auto", tempDir, false)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	sessionID := startRes.Session.ID
+
+	_, err = service.Checkpoint(ctx, sessionID, "auto-synced checkpoint", nil, false)
+	if err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	// Wait for the worker to automatically drain the enqueued ops.
+	// The worker polls every 2s, so we give it up to 5s.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for sync worker to auto-drain; commentPosted=%d, statusUpdated=%d",
+				commentPosted.Load(), statusUpdated.Load())
+		case <-ticker.C:
+			// Start enqueues UPDATE_STATUS, Checkpoint enqueues POST_COMMENT.
+			// We need at least 1 comment posted to prove auto-drain works.
+			if commentPosted.Load() >= 1 {
+				return
+			}
+		}
 	}
 }
