@@ -96,7 +96,7 @@ Add Taskflow to your global Antigravity MCP configuration (`~/.gemini/config/mcp
 {
   "mcpServers": {
     "taskflow": {
-      "command": "/Users/brandonlamer-connolly/go/bin/taskflow",
+      "command": "/Users/brandonlamer-connolly/devkits/go/bin/taskflow",
       "args": ["serve"],
       "env": {
         "CLICKUP_API_KEY": "pk_your_clickup_api_key"
