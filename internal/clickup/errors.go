@@ -11,7 +11,7 @@ var (
 	ErrRateLimited      = errors.New("ClickUp API rate limit exceeded")
 	ErrNotFound         = errors.New("ClickUp resource not found")
 	ErrServerError      = errors.New("ClickUp server error")
-	ErrNoMatchingStatus = errors.New("no matching status found for target status type")
+	ErrNoMatchingStatus = errors.New("no matching status found on list")
 )
 
 type RateLimitError struct {

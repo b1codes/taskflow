@@ -36,6 +36,13 @@ Taskflow stores its configuration at `~/.taskflow/config.toml` (auto-created wit
 [clickup]
 api_key = "pk_your_clickup_api_key"
 
+# Optional — see "Status mapping" below
+[clickup.status_map]
+# start = "in progress"
+# review = "in review"
+# complete = "complete"
+# archive = "cancelled"
+
 [git]
 auto_context = true
 
@@ -53,6 +60,19 @@ path = "~/.taskflow/sessions.db"
 > ```bash
 > export CLICKUP_API_KEY="pk_your_clickup_api_key"
 > ```
+
+#### Status mapping
+
+Taskflow moves your ClickUp task through lifecycle *roles*, not hardcoded status names, so it works with any list's statuses:
+
+| Role | When | Default status on the task's list |
+|---|---|---|
+| `start` | Session started, resumed, or paused | First `custom` status (e.g. "in progress"), else first `open` |
+| `complete` | Session stopped as completed | First `done` status (e.g. "complete"), else first `closed` |
+| `archive` | Active/paused session archived (abandoned) | First `closed` status (e.g. "cancelled") |
+| `review` | Reserved for completeness checks | A `custom` status whose name contains "review"; otherwise unchanged |
+
+Archiving an already-completed session leaves the task's status alone. To pin a role to a specific status, set it under `[clickup.status_map]` (matched case-insensitively; a name missing from the list falls back to the default).
 
 ### 3. Initialize Workspace & Cache
 

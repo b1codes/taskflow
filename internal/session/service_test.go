@@ -14,6 +14,7 @@ type mockStore struct {
 	checkpoints map[string][]*Checkpoint
 	snags       map[string][]*Snag
 	decisions   map[string][]*Decision
+	syncOps     []SyncOp
 }
 
 func newMockStore() *mockStore {
@@ -181,7 +182,27 @@ func (m *mockStore) CountPendingByTaskID(ctx context.Context, taskID string) (in
 }
 
 func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
+	m.syncOps = append(m.syncOps, op)
 	return nil
+}
+
+// statusRoles returns the role of every queued UPDATE_STATUS op, in order.
+func (m *mockStore) statusRoles(t *testing.T) []string {
+	t.Helper()
+	var roles []string
+	for _, op := range m.syncOps {
+		if op.Operation != "UPDATE_STATUS" {
+			continue
+		}
+		var payload struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
+			t.Fatalf("invalid UPDATE_STATUS payload %q: %v", op.Payload, err)
+		}
+		roles = append(roles, payload.Role)
+	}
+	return roles
 }
 
 type mockGit struct {
@@ -212,7 +233,7 @@ func (mc *mockClickUp) GetTask(ctx context.Context, taskID string) (*ClickUpTask
 func (mc *mockClickUp) GetListStatuses(ctx context.Context, listID string) ([]ClickUpStatusInfo, error) {
 	return []ClickUpStatusInfo{
 		{Status: "Open", Type: "open", OrderIndex: 0},
-		{Status: "In Progress", Type: "active", OrderIndex: 1},
+		{Status: "In Progress", Type: "custom", OrderIndex: 1},
 		{Status: "Closed", Type: "closed", OrderIndex: 2},
 	}, nil
 }
@@ -573,6 +594,59 @@ func TestService_Start_StaleLockFromDeadProcessIgnored(t *testing.T) {
 	}
 }
 
+func TestService_StatusRoles(t *testing.T) {
+	ctx := context.Background()
 
+	t.Run("start, pause, complete, then archive", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
 
+		res, err := srv.Start(ctx, "task-roles", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"PAUSED", "COMPLETED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
 
+		// Archiving the completed session must not queue a status change, or the
+		// finished task would move to the list's closed ("cancelled") status.
+		want := []string{"start", "start", "complete"}
+		if got := store.statusRoles(t); !equalStrings(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("abandoning an active session archives it", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-abandon", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
+		}
+
+		want := []string{"start", "archive"}
+		if got := store.statusRoles(t); !equalStrings(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

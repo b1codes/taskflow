@@ -595,7 +595,7 @@ New `clickup.Client` methods: `GetTaskChecklists`, `CreateChecklist`, `CreateChe
 
 ## 10. Data Model Changes
 
-All changes are a new migration entry in `internal/store/migrations.go` (version 4). Existing entries are never edited.
+All changes are a new migration entry in `internal/store/migrations.go` (version 5; version 4 was taken by the Phase 0 status-cache fix). Existing entries are never edited.
 
 ### `sessions` (altered)
 

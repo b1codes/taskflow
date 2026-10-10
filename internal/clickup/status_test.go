@@ -12,221 +12,269 @@ import (
 	"github.com/b1codes/taskflow/internal/store"
 )
 
-func TestResolveStatus(t *testing.T) {
-	t.Parallel()
+// developmentTaskListStatuses mirrors a real ClickUp list (checked against
+// the API on 2026-10-10). ClickUp status types are only open/custom/done/closed.
+const developmentTaskListStatuses = `[
+	{"status": "to do", "type": "open", "orderindex": 0},
+	{"status": "in progress", "type": "custom", "orderindex": 1},
+	{"status": "in review", "type": "custom", "orderindex": 2},
+	{"status": "testing/qa", "type": "custom", "orderindex": 3},
+	{"status": "complete", "type": "done", "orderindex": 4},
+	{"status": "cancelled", "type": "closed", "orderindex": 5}
+]`
 
+// newStatusServer serves a single task on a single list with the given
+// statuses JSON, counting task and list fetches.
+func newStatusServer(t *testing.T, taskID, listID, statusesJSON string, getTaskCalls, getListCalls *atomic.Int32) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/task/" + taskID:
+			if getTaskCalls != nil {
+				getTaskCalls.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"id": "` + taskID + `", "name": "Test Task", "list": {"id": "` + listID + `"}}`))
+		case "/list/" + listID:
+			if getListCalls != nil {
+				getListCalls.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"id": "` + listID + `", "statuses": ` + statusesJSON + `}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newMemStore(t *testing.T) store.Store {
+	t.Helper()
 	st, err := store.New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
+	return st
+}
 
-	ctx := context.Background()
+func TestResolveStatusForRole_Defaults(t *testing.T) {
+	t.Parallel()
 
-	var getTaskCalls atomic.Int32
-	var getListCalls atomic.Int32
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/task/task-123" {
-			getTaskCalls.Add(1)
-			_, _ = w.Write([]byte(`{
-				"id": "task-123",
-				"name": "Test Task",
-				"status": {"status": "in progress", "type": "active"},
-				"list": {"id": "list-abc", "name": "Sprint 1"}
-			}`))
-			return
-		}
-		if r.URL.Path == "/list/list-abc" {
-			getListCalls.Add(1)
-			_, _ = w.Write([]byte(`{
-				"id": "list-abc",
-				"name": "Sprint 1",
-				"statuses": [
-					{"status": "open", "type": "open", "orderindex": 0},
-					{"status": "in progress", "type": "active", "orderindex": 1},
-					{"status": "done", "type": "closed", "orderindex": 2}
-				]
-			}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	client := New("api-key").WithBaseURL(server.URL)
-
-	// 1. Initial resolution with empty cache (triggers refresh from API for both task and list)
-	statusName, err := ResolveStatus(ctx, st, client, "task-123", "closed")
-	if err != nil {
-		t.Fatalf("ResolveStatus failed: %v", err)
-	}
-	if statusName != "done" {
-		t.Errorf("expected status 'done' for type 'closed', got %q", statusName)
-	}
-	if getTaskCalls.Load() != 1 {
-		t.Errorf("expected 1 getTask call, got %d", getTaskCalls.Load())
-	}
-	if getListCalls.Load() != 1 {
-		t.Errorf("expected 1 getList call, got %d", getListCalls.Load())
+	tests := []struct {
+		name     string
+		statuses string
+		role     StatusRole
+		want     string
+		wantErr  error
+	}{
+		{"start picks first custom", developmentTaskListStatuses, RoleStart, "in progress", nil},
+		{"review picks custom named review", developmentTaskListStatuses, RoleReview, "in review", nil},
+		{"complete picks done, not closed", developmentTaskListStatuses, RoleComplete, "complete", nil},
+		{"archive picks closed", developmentTaskListStatuses, RoleArchive, "cancelled", nil},
+		{
+			name:     "start falls back to open without custom statuses",
+			statuses: `[{"status": "Open", "type": "open", "orderindex": 0}, {"status": "Closed", "type": "closed", "orderindex": 1}]`,
+			role:     RoleStart,
+			want:     "Open",
+		},
+		{
+			name:     "complete falls back to closed without done",
+			statuses: `[{"status": "Open", "type": "open", "orderindex": 0}, {"status": "Closed", "type": "closed", "orderindex": 1}]`,
+			role:     RoleComplete,
+			want:     "Closed",
+		},
+		{
+			name:     "review skips when no status mentions review",
+			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "doing", "type": "custom", "orderindex": 1}]`,
+			role:     RoleReview,
+			wantErr:  ErrSkipStatusChange,
+		},
+		{
+			name:     "archive without closed status has no match",
+			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "complete", "type": "done", "orderindex": 1}]`,
+			role:     RoleArchive,
+			wantErr:  ErrNoMatchingStatus,
+		},
+		{
+			name:     "start respects orderindex, not response order",
+			statuses: `[{"status": "qa", "type": "custom", "orderindex": 2}, {"status": "building", "type": "custom", "orderindex": 1}]`,
+			role:     RoleStart,
+			want:     "building",
+		},
 	}
 
-	// 2. Subsequent resolution (cache hit for both task -> list mapping and statuses)
-	statusActive, err := ResolveStatus(ctx, st, client, "task-123", "active")
-	if err != nil {
-		t.Fatalf("ResolveStatus cache hit failed: %v", err)
-	}
-	if statusActive != "in progress" {
-		t.Errorf("expected status 'in progress' for type 'active', got %q", statusActive)
-	}
-	// Verify neither task nor list API was called again
-	if getTaskCalls.Load() != 1 {
-		t.Errorf("expected still 1 getTask call, got %d", getTaskCalls.Load())
-	}
-	if getListCalls.Load() != 1 {
-		t.Errorf("expected still 1 getList call, got %d", getListCalls.Load())
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := newStatusServer(t, "task-1", "list-1", tt.statuses, nil, nil)
+			client := New("api-key").WithBaseURL(server.URL)
 
-	// 3. Unknown target type returns ErrNoMatchingStatus
-	_, err = ResolveStatus(ctx, st, client, "task-123", "nonexistent_type")
-	if err == nil {
-		t.Fatalf("expected error for nonexistent_type, got nil")
-	}
-	if !errors.Is(err, ErrNoMatchingStatus) {
-		t.Errorf("expected ErrNoMatchingStatus, got: %v", err)
+			got, err := ResolveStatusForRole(context.Background(), newMemStore(t), client, "task-1", tt.role, nil)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("expected error %v, got %q, %v", tt.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveStatusForRole failed: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %q, got %q", tt.want, got)
+			}
+		})
 	}
 }
 
-func TestResolveStatus_StaleCache(t *testing.T) {
+func TestResolveStatusForRole_Overrides(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer st.Close()
-
+	server := newStatusServer(t, "task-1", "list-1", developmentTaskListStatuses, nil, nil)
+	client := New("api-key").WithBaseURL(server.URL)
+	st := newMemStore(t)
 	ctx := context.Background()
 
-	// Seed stale cache entry
-	_ = st.UpsertCacheEntry(ctx, &store.CacheEntry{
-		EntityType: "status",
-		EntityID:   "stale-status",
-		ParentID:   "list-stale",
-		Name:       "stale-status",
-		StatusType: "closed",
-		FetchedAt:  time.Now().Add(-48 * time.Hour), // 48 hours old (> 24h TTL)
-	})
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/task/task-stale" {
-			_, _ = w.Write([]byte(`{
-				"id": "task-stale",
-				"name": "Stale Task",
-				"status": {"status": "in progress", "type": "active"},
-				"list": {"id": "list-stale", "name": "Stale List"}
-			}`))
-			return
-		}
-		if r.URL.Path == "/list/list-stale" {
-			_, _ = w.Write([]byte(`{
-				"id": "list-stale",
-				"name": "Stale List",
-				"statuses": [
-					{"status": "refreshed-closed", "type": "closed", "orderindex": 0}
-				]
-			}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	client := New("api-key").WithBaseURL(server.URL)
-
-	statusName, err := ResolveStatus(ctx, st, client, "task-stale", "closed")
-	if err != nil {
-		t.Fatalf("ResolveStatus stale failed: %v", err)
+	overrides := map[StatusRole]string{
+		RoleStart:  "Testing/QA", // case-insensitive match, returns list's casing
+		RoleReview: "awaiting sign-off",
 	}
-	if statusName != "refreshed-closed" {
-		t.Errorf("expected refreshed status 'refreshed-closed', got %q", statusName)
+
+	got, err := ResolveStatusForRole(ctx, st, client, "task-1", RoleStart, overrides)
+	if err != nil {
+		t.Fatalf("ResolveStatusForRole(start) failed: %v", err)
+	}
+	if got != "testing/qa" {
+		t.Errorf("expected override 'testing/qa', got %q", got)
+	}
+
+	// Override missing from the list falls back to the default.
+	got, err = ResolveStatusForRole(ctx, st, client, "task-1", RoleReview, overrides)
+	if err != nil {
+		t.Fatalf("ResolveStatusForRole(review) failed: %v", err)
+	}
+	if got != "in review" {
+		t.Errorf("expected default 'in review' after missing override, got %q", got)
 	}
 }
 
-func TestResolveStatus_StaleTaskCache(t *testing.T) {
+func TestResolveStatusForRole_UnknownRole(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
+	_, err := ResolveStatusForRole(context.Background(), nil, New("api-key"), "task-1", StatusRole("active"), nil)
+	if !errors.Is(err, ErrUnknownStatusRole) {
+		t.Fatalf("expected ErrUnknownStatusRole, got %v", err)
 	}
-	defer st.Close()
+}
 
+func TestLegacyStatusRole(t *testing.T) {
+	t.Parallel()
+
+	for statusType, want := range map[string]StatusRole{"active": RoleStart, "closed": RoleComplete} {
+		got, err := LegacyStatusRole(statusType)
+		if err != nil || got != want {
+			t.Errorf("LegacyStatusRole(%q) = %q, %v; want %q", statusType, got, err, want)
+		}
+	}
+	if _, err := LegacyStatusRole("open"); !errors.Is(err, ErrUnknownStatusRole) {
+		t.Errorf("expected ErrUnknownStatusRole for unmapped legacy type, got %v", err)
+	}
+}
+
+func TestResolveStatusForRole_UsesCache(t *testing.T) {
+	t.Parallel()
+
+	var getTaskCalls, getListCalls atomic.Int32
+	server := newStatusServer(t, "task-123", "list-abc", developmentTaskListStatuses, &getTaskCalls, &getListCalls)
+	client := New("api-key").WithBaseURL(server.URL)
+	st := newMemStore(t)
 	ctx := context.Background()
 
-	// Seed stale task cache entry
+	// 1. Empty cache: fetches task and list.
+	if got, err := ResolveStatusForRole(ctx, st, client, "task-123", RoleComplete, nil); err != nil || got != "complete" {
+		t.Fatalf("expected 'complete', got %q, %v", got, err)
+	}
+	// 2. Cache hit: no further API calls.
+	if got, err := ResolveStatusForRole(ctx, st, client, "task-123", RoleStart, nil); err != nil || got != "in progress" {
+		t.Fatalf("expected 'in progress', got %q, %v", got, err)
+	}
+	if getTaskCalls.Load() != 1 || getListCalls.Load() != 1 {
+		t.Errorf("expected 1 task and 1 list fetch, got %d and %d", getTaskCalls.Load(), getListCalls.Load())
+	}
+}
+
+func TestResolveStatusForRole_StaleStatusCache(t *testing.T) {
+	t.Parallel()
+
+	st := newMemStore(t)
+	ctx := context.Background()
+
 	_ = st.UpsertCacheEntry(ctx, &store.CacheEntry{
 		EntityType: "task",
-		EntityID:   "task-stale-task",
+		EntityID:   "task-stale",
+		ParentID:   "list-stale",
+		FetchedAt:  time.Now(),
+	})
+	_ = st.UpsertCacheEntry(ctx, &store.CacheEntry{
+		EntityType: "status",
+		EntityID:   statusCacheID("list-stale", "stale-status"),
+		ParentID:   "list-stale",
+		Name:       "stale-status",
+		StatusType: "done",
+		FetchedAt:  time.Now().Add(-48 * time.Hour), // older than the 24h TTL
+	})
+
+	server := newStatusServer(t, "task-stale", "list-stale",
+		`[{"status": "refreshed-complete", "type": "done", "orderindex": 0}]`, nil, nil)
+	client := New("api-key").WithBaseURL(server.URL)
+
+	got, err := ResolveStatusForRole(ctx, st, client, "task-stale", RoleComplete, nil)
+	if err != nil {
+		t.Fatalf("ResolveStatusForRole failed: %v", err)
+	}
+	if got != "refreshed-complete" {
+		t.Errorf("expected refreshed status 'refreshed-complete', got %q", got)
+	}
+}
+
+func TestResolveStatusForRole_StaleTaskCache(t *testing.T) {
+	t.Parallel()
+
+	st := newMemStore(t)
+	ctx := context.Background()
+
+	_ = st.UpsertCacheEntry(ctx, &store.CacheEntry{
+		EntityType: "task",
+		EntityID:   "task-moved",
 		ParentID:   "old-list",
-		Name:       "Old Task Name",
-		FetchedAt:  time.Now().Add(-48 * time.Hour), // 48 hours old (> 24h TTL)
+		FetchedAt:  time.Now().Add(-48 * time.Hour),
 	})
 
 	var getTaskCalls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/task/task-stale-task" {
-			getTaskCalls.Add(1)
-			_, _ = w.Write([]byte(`{
-				"id": "task-stale-task",
-				"name": "Refreshed Task",
-				"status": {"status": "in progress", "type": "active"},
-				"list": {"id": "new-list", "name": "New List"}
-			}`))
-			return
-		}
-		if r.URL.Path == "/list/new-list" {
-			_, _ = w.Write([]byte(`{
-				"id": "new-list",
-				"name": "New List",
-				"statuses": [
-					{"status": "Completed", "type": "closed", "orderindex": 0}
-				]
-			}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
+	server := newStatusServer(t, "task-moved", "new-list",
+		`[{"status": "Completed", "type": "done", "orderindex": 0}]`, &getTaskCalls, nil)
 	client := New("api-key").WithBaseURL(server.URL)
 
-	statusName, err := ResolveStatus(ctx, st, client, "task-stale-task", "closed")
+	got, err := ResolveStatusForRole(ctx, st, client, "task-moved", RoleComplete, nil)
 	if err != nil {
-		t.Fatalf("ResolveStatus failed: %v", err)
+		t.Fatalf("ResolveStatusForRole failed: %v", err)
 	}
-	if statusName != "Completed" {
-		t.Errorf("expected status 'Completed', got %q", statusName)
+	if got != "Completed" {
+		t.Errorf("expected 'Completed' from the task's new list, got %q", got)
 	}
 	if getTaskCalls.Load() != 1 {
 		t.Errorf("expected task to be refetched on stale cache, calls: %d", getTaskCalls.Load())
 	}
 }
 
-// TestResolveStatus_SharedStatusNamesAcrossLists guards against status cache
-// rows for one list being overwritten by another list that shares status names.
-func TestResolveStatus_SharedStatusNamesAcrossLists(t *testing.T) {
+// TestResolveStatusForRole_SharedStatusNamesAcrossLists guards against status
+// cache rows for one list being overwritten by another list that shares
+// status names, which previously left a list resolving "complete" to its
+// closed ("cancelled") status.
+func TestResolveStatusForRole_SharedStatusNamesAcrossLists(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer st.Close()
-
+	st := newMemStore(t)
 	ctx := context.Background()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -256,18 +304,18 @@ func TestResolveStatus_SharedStatusNamesAcrossLists(t *testing.T) {
 	client := New("api-key").WithBaseURL(server.URL)
 
 	for _, taskID := range []string{"task-a", "task-b"} {
-		if _, err := ResolveStatus(ctx, st, client, taskID, "done"); err != nil {
-			t.Fatalf("ResolveStatus(%s) failed: %v", taskID, err)
+		if _, err := ResolveStatusForRole(ctx, st, client, taskID, RoleComplete, nil); err != nil {
+			t.Fatalf("ResolveStatusForRole(%s) failed: %v", taskID, err)
 		}
 	}
 
 	// list-a's cached statuses must survive list-b's refresh.
-	statusName, err := ResolveStatus(ctx, st, client, "task-a", "done")
+	got, err := ResolveStatusForRole(ctx, st, client, "task-a", RoleComplete, nil)
 	if err != nil {
-		t.Fatalf("ResolveStatus after other list refresh failed: %v", err)
+		t.Fatalf("ResolveStatusForRole after other list refresh failed: %v", err)
 	}
-	if statusName != "complete" {
-		t.Errorf("expected 'complete' for list-a, got %q", statusName)
+	if got != "complete" {
+		t.Errorf("expected 'complete' for list-a, got %q", got)
 	}
 
 	cached, err := st.GetListStatuses(ctx, "list-a")

@@ -15,14 +15,19 @@ import (
 )
 
 type Worker struct {
-	store   store.Store
-	clickup *clickup.Client
-	config  *config.SyncConfig
+	store     store.Store
+	clickup   *clickup.Client
+	config    *config.SyncConfig
+	statusMap map[clickup.StatusRole]string
 }
 
 type SyncPayload struct {
 	CommentText string `json:"comment_text,omitempty"`
-	StatusType  string `json:"status_type,omitempty"`
+	// Role is the lifecycle role (start, review, complete, archive) for UPDATE_STATUS.
+	Role string `json:"role,omitempty"`
+	// StatusType is the pre-role UPDATE_STATUS payload; still read so ops
+	// queued by an older taskflow version resolve after upgrading.
+	StatusType string `json:"status_type,omitempty"`
 }
 
 func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *Worker {
@@ -31,6 +36,16 @@ func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *
 		clickup: client,
 		config:  cfg,
 	}
+}
+
+// WithStatusMap sets per-role ClickUp status name overrides, keyed by role
+// name (see config.StatusMapConfig.ByRole).
+func (w *Worker) WithStatusMap(roles map[string]string) *Worker {
+	w.statusMap = make(map[clickup.StatusRole]string, len(roles))
+	for role, name := range roles {
+		w.statusMap[clickup.StatusRole(role)] = name
+	}
+	return w
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -169,12 +184,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	case "POST_COMMENT", "POST_SNAG", "POST_DECISION":
 		opErr = w.clickup.PostComment(ctx, op.TaskID, payload.CommentText)
 	case "UPDATE_STATUS":
-		statusName, err := clickup.ResolveStatus(ctx, w.store, w.clickup, op.TaskID, payload.StatusType)
-		if err != nil {
-			opErr = err
-		} else {
-			opErr = w.clickup.UpdateTaskStatus(ctx, op.TaskID, statusName)
-		}
+		opErr = w.updateStatus(ctx, op.TaskID, payload)
 	default:
 		opErr = fmt.Errorf("unknown operation: %s", op.Operation)
 	}
@@ -201,4 +211,27 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	}
 
 	return w.store.MarkDone(ctx, op.ID)
+}
+
+func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPayload) error {
+	var role clickup.StatusRole
+	var err error
+	if payload.Role != "" {
+		role, err = clickup.ParseStatusRole(payload.Role)
+	} else {
+		role, err = clickup.LegacyStatusRole(payload.StatusType)
+	}
+	if err != nil {
+		return err
+	}
+
+	statusName, err := clickup.ResolveStatusForRole(ctx, w.store, w.clickup, taskID, role, w.statusMap)
+	if errors.Is(err, clickup.ErrSkipStatusChange) {
+		fmt.Fprintf(os.Stderr, "[sync] leaving task %s status unchanged: %v\n", taskID, err)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return w.clickup.UpdateTaskStatus(ctx, taskID, statusName)
 }

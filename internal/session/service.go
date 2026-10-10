@@ -138,6 +138,34 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 	}
 }
 
+// enqueueStatus queues a ClickUp status change for a lifecycle role (start,
+// review, complete, archive). The sync worker maps the role onto a status of
+// the task's list, so no status names or types are decided here.
+func (s *Service) enqueueStatus(ctx context.Context, taskID, role string) {
+	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
+		Role string `json:"role"`
+	}{Role: role})
+}
+
+// stopStatusRole returns the ClickUp status role for a Stop transition, or ""
+// when the task's ClickUp status should be left alone.
+func stopStatusRole(from, to Status) string {
+	switch to {
+	case StatusActive, StatusPaused:
+		return "start"
+	case StatusCompleted:
+		return "complete"
+	case StatusArchived:
+		// Archiving an already-completed session only tidies local history;
+		// it must not move a finished task to the list's closed status.
+		if from == StatusCompleted {
+			return ""
+		}
+		return "archive"
+	}
+	return ""
+}
+
 func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit bool) (*StartResult, error) {
 	// 1. Advisory lock check
 	lockInfo, err := ReadLockInfo(projectPath)
@@ -251,9 +279,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		fmt.Fprintf(os.Stderr, "[session] warning: failed to write session lock in %s: %v\n", projectPath, err)
 	}
 
-	s.enqueueSync(ctx, sess.TaskID, "UPDATE_STATUS", struct {
-		StatusType string `json:"status_type"`
-	}{StatusType: "active"})
+	s.enqueueStatus(ctx, sess.TaskID, "start")
 
 	// 6. Build contract
 	contract, err := s.BuildAgenticContract(ctx, sess, gitCtx, isResumed)
@@ -528,6 +554,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		}
 	}
 
+	fromStatus := sess.Status
 	if err := s.store.UpdateSessionStatus(ctx, sessionID, tStatus); err != nil {
 		return fmt.Errorf("failed to update session status: %w", err)
 	}
@@ -537,13 +564,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	// 1. Enqueue status update
-	statusType := "closed"
-	if tStatus == StatusPaused {
-		statusType = "active"
+	if role := stopStatusRole(fromStatus, tStatus); role != "" {
+		s.enqueueStatus(ctx, sess.TaskID, role)
 	}
-	s.enqueueSync(ctx, sess.TaskID, "UPDATE_STATUS", struct {
-		StatusType string `json:"status_type"`
-	}{StatusType: statusType})
 
 	// 2. Enqueue session summary comment
 	dbCheckpoints, _ := s.store.ListCheckpoints(ctx, sessionID, 0)

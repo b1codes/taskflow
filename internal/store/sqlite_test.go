@@ -982,11 +982,6 @@ func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
 	}
 }
 
-
-
-
-
-
 // TestSQLiteStore_Migration4_DropsNameKeyedStatusCache verifies that upgrading
 // from v3 removes status cache rows keyed by bare status name (which collided
 // across lists) while leaving other cache entities intact.

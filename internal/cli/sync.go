@@ -32,7 +32,7 @@ var syncCmd = &cobra.Command{
 			fmt.Println("Warning: CLICKUP_API_KEY is not set. Sync operations will remain queued until an API key is configured.")
 		}
 
-		worker := sync.NewWorker(st, cuClient, &cfg.Sync)
+		worker := sync.NewWorker(st, cuClient, &cfg.Sync).WithStatusMap(cfg.ClickUp.StatusMap.ByRole())
 
 		fmt.Println("Starting sync queue drain...")
 		count, err := worker.DrainOnce(cmd.Context())

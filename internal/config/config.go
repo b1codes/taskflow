@@ -10,7 +10,33 @@ import (
 )
 
 type ClickUpConfig struct {
-	APIKey string `toml:"api_key"`
+	APIKey    string          `toml:"api_key"`
+	StatusMap StatusMapConfig `toml:"status_map"`
+}
+
+// StatusMapConfig optionally pins session lifecycle roles to ClickUp status
+// names. Empty fields use type-based defaults (see clickup.ResolveStatusForRole).
+type StatusMapConfig struct {
+	Start    string `toml:"start"`
+	Review   string `toml:"review"`
+	Complete string `toml:"complete"`
+	Archive  string `toml:"archive"`
+}
+
+// ByRole returns the configured overrides keyed by role name, omitting unset roles.
+func (m StatusMapConfig) ByRole() map[string]string {
+	roles := map[string]string{}
+	for role, name := range map[string]string{
+		"start":    m.Start,
+		"review":   m.Review,
+		"complete": m.Complete,
+		"archive":  m.Archive,
+	} {
+		if name != "" {
+			roles[role] = name
+		}
+	}
+	return roles
 }
 
 type GitConfig struct {
@@ -37,6 +63,16 @@ type Config struct {
 // DefaultConfigContent is the default configuration content.
 const DefaultConfigContent = `[clickup]
 api_key = ""
+
+# Optional: pin session lifecycle events to status names on your lists.
+# Unset roles use defaults: start = first "custom" status, review = a custom
+# status named "*review*", complete = first "done" (else "closed"),
+# archive = first "closed".
+[clickup.status_map]
+# start = "in progress"
+# review = "in review"
+# complete = "complete"
+# archive = "cancelled"
 
 [git]
 auto_context = true

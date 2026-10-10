@@ -63,3 +63,27 @@ func TestEnsureDirIn(t *testing.T) {
 		t.Errorf("expected DBPath to be %s, got %s", expectedDBPath, cfg.DBPath())
 	}
 }
+
+func TestLoadStatusMap(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[clickup]
+api_key = "k"
+
+[clickup.status_map]
+start = "in progress"
+complete = "complete"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom failed: %v", err)
+	}
+
+	roles := cfg.ClickUp.StatusMap.ByRole()
+	if len(roles) != 2 || roles["start"] != "in progress" || roles["complete"] != "complete" {
+		t.Errorf("expected only start and complete overrides, got %v", roles)
+	}
+}

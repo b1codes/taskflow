@@ -379,4 +379,3 @@ func TestCLI_Start_WithClickUpAPIKey(t *testing.T) {
 		t.Errorf("expected 'ClickUp Real Task Name' in output, got: %s", out)
 	}
 }
-
