@@ -50,7 +50,8 @@ api_key = ""
 # Optional: pin session lifecycle events to status names on your lists.
 # Unset roles use defaults: start = the "custom" status named like
 # "in progress", complete = first "done" (else "closed"), archive = first
-# "closed". Taskflow never moves a task back from a status someone else chose.
+# "closed" named like "cancelled" (else unchanged). Reopening a finished task
+# uses start. Taskflow never moves a task back from a status someone else chose.
 [clickup.status_map]
 # start = "in progress"
 # complete = "complete"

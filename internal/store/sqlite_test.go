@@ -1091,3 +1091,51 @@ func TestSQLiteStore_Migration4_DropsNameKeyedStatusCache(t *testing.T) {
 		t.Errorf("expected task cache row to survive, found %d", taskRows)
 	}
 }
+
+func TestReplaceListStatuses(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	status := func(listID, name, typ string, order int) *CacheEntry {
+		return &CacheEntry{EntityType: "status", EntityID: listID + "/" + name, ParentID: listID, Name: name, StatusType: typ, OrderIndex: order, FetchedAt: time.Now()}
+	}
+
+	if err := st.ReplaceListStatuses(ctx, "list-1", []*CacheEntry{status("list-1", "to do", "open", 0), status("list-1", "complete", "closed", 1)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+	if err := st.ReplaceListStatuses(ctx, "list-2", []*CacheEntry{status("list-2", "to do", "open", 0)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+
+	// Renaming "complete" drops the old row; list-2 is untouched.
+	if err := st.ReplaceListStatuses(ctx, "list-1", []*CacheEntry{status("list-1", "to do", "open", 0), status("list-1", "shipped", "closed", 1)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+	got, err := st.GetListStatuses(ctx, "list-1")
+	if err != nil {
+		t.Fatalf("GetListStatuses failed: %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "to do" || got[1].Name != "shipped" {
+		t.Fatalf("expected [to do, shipped], got %+v", got)
+	}
+	if other, _ := st.GetListStatuses(ctx, "list-2"); len(other) != 1 {
+		t.Fatalf("expected list-2 to keep its 1 status, got %d", len(other))
+	}
+
+	// A failed replace must leave the previous set intact.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := st.ReplaceListStatuses(cancelled, "list-1", []*CacheEntry{status("list-1", "only", "open", 0)}); err == nil {
+		t.Fatal("expected an error with a cancelled context")
+	}
+	got, _ = st.GetListStatuses(ctx, "list-1")
+	if len(got) != 2 {
+		t.Fatalf("expected the previous 2 statuses after a failed replace, got %d", len(got))
+	}
+}

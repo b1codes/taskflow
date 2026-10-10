@@ -24,7 +24,10 @@ type Server struct {
 	config    *config.Config
 }
 
-func New(st store.Store, cfg *config.Config) *Server {
+// New builds the MCP server. client may be nil (no ClickUp sync); serve passes
+// the same paced client it gives the sync worker, so both share one
+// rate-limit budget.
+func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
 	s := server.NewMCPServer(
 		"taskflow",
 		"1.0.0",
@@ -32,8 +35,8 @@ func New(st store.Store, cfg *config.Config) *Server {
 	)
 
 	var cuClient session.ClickUpClient
-	if cfg.ClickUp.APIKey != "" {
-		cuClient = adapters.NewClickUpAdapter(clickup.New(cfg.ClickUp.APIKey))
+	if client != nil {
+		cuClient = adapters.NewClickUpAdapter(client)
 	}
 
 	srv := &Server{

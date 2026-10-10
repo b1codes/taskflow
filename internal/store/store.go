@@ -30,6 +30,9 @@ type Store interface {
 	IsCacheStale(ctx context.Context, entityType, entityID string, ttl time.Duration) (bool, error)
 	ClearCache(ctx context.Context) error
 	DeleteCacheEntries(ctx context.Context, entityType, parentID string) error
+	// ReplaceListStatuses atomically replaces every cached status of listID
+	// with entries, so readers never see a partial status set.
+	ReplaceListStatuses(ctx context.Context, listID string, entries []*CacheEntry) error
 
 	// Sync Queue
 	DequeuePending(ctx context.Context, limit int) ([]*session.SyncOp, error)

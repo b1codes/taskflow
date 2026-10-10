@@ -112,11 +112,12 @@ func (w *Worker) DrainOnce(ctx context.Context) (int, error) {
 		case <-ctx.Done():
 			return count, ctx.Err()
 		default:
+			// Pacing between ClickUp requests is handled by the client
+			// (WithMinInterval), since one op can make several API calls.
 			err := w.processOp(ctx, op)
 			if err == nil {
 				count++
 			}
-			time.Sleep(time.Duration(w.config.RateLimitMS) * time.Millisecond)
 		}
 	}
 
@@ -151,11 +152,12 @@ func (w *Worker) processBatch(ctx context.Context, limit int) (int, error) {
 		case <-ctx.Done():
 			return count, ctx.Err()
 		default:
+			// Pacing between ClickUp requests is handled by the client
+			// (WithMinInterval), since one op can make several API calls.
 			err := w.processOp(ctx, op)
 			if err == nil {
 				count++
 			}
-			time.Sleep(time.Duration(w.config.RateLimitMS) * time.Millisecond)
 		}
 	}
 
@@ -224,7 +226,10 @@ var errUnknownOperation = errors.New("unknown operation")
 func isPermanent(err error) bool {
 	return errors.Is(err, errUnknownOperation) ||
 		errors.Is(err, clickup.ErrUnknownStatusRole) ||
-		errors.Is(err, clickup.ErrNoMatchingStatus)
+		errors.Is(err, clickup.ErrNoMatchingStatus) ||
+		// ApplyStatusRole already refreshes the status cache and retries once
+		// on a 400, so one that reaches the worker won't succeed on retry.
+		errors.Is(err, clickup.ErrBadRequest)
 }
 
 func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPayload) error {
@@ -239,13 +244,10 @@ func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPa
 		return err
 	}
 
-	statusName, err := clickup.ResolveStatusForRole(ctx, w.store, w.clickup, taskID, role, w.statusMap)
+	err = clickup.ApplyStatusRole(ctx, w.store, w.clickup, taskID, role, w.statusMap)
 	if errors.Is(err, clickup.ErrSkipStatusChange) {
 		fmt.Fprintf(os.Stderr, "[sync] leaving task %s status unchanged: %v\n", taskID, err)
 		return nil
 	}
-	if err != nil {
-		return err
-	}
-	return w.clickup.UpdateTaskStatus(ctx, taskID, statusName)
+	return err
 }

@@ -12,6 +12,8 @@ var (
 	ErrNotFound         = errors.New("ClickUp resource not found")
 	ErrServerError      = errors.New("ClickUp server error")
 	ErrNoMatchingStatus = errors.New("no matching status found on list")
+	// ErrBadRequest is a 400 response, e.g. a status name the list no longer has.
+	ErrBadRequest = errors.New("ClickUp rejected the request")
 )
 
 type RateLimitError struct {

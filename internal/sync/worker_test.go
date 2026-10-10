@@ -826,3 +826,64 @@ func TestWorker_UpdateStatus_PermanentFailures(t *testing.T) {
 		})
 	}
 }
+
+// TestWorker_BadRequest_FailsPermanently checks that a 400 from ClickUp fails
+// the op at once: the request itself is rejected, so retrying can't help.
+func TestWorker_BadRequest_FailsPermanently(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	sess := &session.Session{
+		ID:          "sess-bad-request",
+		TaskID:      "task-bad-request",
+		ProjectPath: "/tmp",
+		Status:      session.StatusActive,
+		StartedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := st.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "rejected"})
+	op := session.SyncOp{
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-bad-request",
+		Payload:    string(payloadBytes),
+		MaxRetries: 3,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"err": "invalid comment"}`))
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
+
+	if count, _ := worker.DrainOnce(ctx); count != 0 {
+		t.Errorf("expected 0 ops successfully processed, got %d", count)
+	}
+
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
+		t.Fatalf("expected no retryable ops, got %d (err: %v)", len(ops), err)
+	}
+
+	_, _ = worker.DrainOnce(ctx)
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("expected exactly 1 attempt, got %d", got)
+	}
+}

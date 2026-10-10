@@ -139,11 +139,11 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 }
 
 // enqueueStatus queues a ClickUp status change for a lifecycle role (start,
-// complete, archive). The sync worker maps the role onto a status of
+// reopen, complete, archive). The sync worker maps the role onto a status of
 // the task's list, so no status names or types are decided here.
-func (s *Service) enqueueStatus(ctx context.Context, taskID, role string) {
+func (s *Service) enqueueStatus(ctx context.Context, taskID string, role StatusRole) {
 	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
-		Role string `json:"role"`
+		Role StatusRole `json:"role"`
 	}{Role: role})
 }
 
@@ -151,8 +151,8 @@ func (s *Service) enqueueStatus(ctx context.Context, taskID, role string) {
 // when the task's ClickUp status should be left alone. No-op transitions
 // (from == to) and pausing never change the task's status: pausing leaves the
 // task wherever it is in ClickUp (including any manual move a teammate made
-// during the session), and only Service.Start sends "start".
-func stopStatusRole(from, to Status) string {
+// during the session), and only Service.Start sends RoleStart/RoleReopen.
+func stopStatusRole(from, to Status) StatusRole {
 	if from == to {
 		return ""
 	}
@@ -160,14 +160,14 @@ func stopStatusRole(from, to Status) string {
 	case StatusActive, StatusPaused:
 		return ""
 	case StatusCompleted:
-		return "complete"
+		return RoleComplete
 	case StatusArchived:
 		// Archiving an already-completed session only tidies local history;
 		// it must not move a finished task to the list's closed status.
 		if from == StatusCompleted {
 			return ""
 		}
-		return "archive"
+		return RoleArchive
 	}
 	return ""
 }
@@ -209,6 +209,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	var sessionID string
 	var isResumed bool
 	var sess *Session
+	// Starting work on a task whose last session finished is a reopen: unlike
+	// start, it may move the task out of a done/closed ClickUp status.
+	role := RoleStart
 
 	if existing != nil {
 		if existing.Status == StatusActive {
@@ -235,6 +238,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 			}
 		} else {
 			// Completed or Archived -> new session
+			role = RoleReopen
 			sessionID = uuid.New().String()
 			sess = &Session{
 				ID:          sessionID,
@@ -285,7 +289,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		fmt.Fprintf(os.Stderr, "[session] warning: failed to write session lock in %s: %v\n", projectPath, err)
 	}
 
-	s.enqueueStatus(ctx, sess.TaskID, "start")
+	s.enqueueStatus(ctx, sess.TaskID, role)
 
 	// 6. Build contract
 	contract, err := s.BuildAgenticContract(ctx, sess, gitCtx, isResumed)

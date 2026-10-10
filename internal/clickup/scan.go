@@ -89,7 +89,7 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 				result.StatusesCount += len(details.Statuses)
 				delay()
 
-				if err := cacheListStatuses(ctx, st, l.ID, details.Statuses); err != nil {
+				if err := cacheListStatuses(ctx, st, l.ID, statusEntries(l.ID, details.Statuses)); err != nil {
 					return nil, err
 				}
 			}
@@ -139,7 +139,7 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 					result.StatusesCount += len(details.Statuses)
 					delay()
 
-					if err := cacheListStatuses(ctx, st, l.ID, details.Statuses); err != nil {
+					if err := cacheListStatuses(ctx, st, l.ID, statusEntries(l.ID, details.Statuses)); err != nil {
 						return nil, err
 					}
 				}

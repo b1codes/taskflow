@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 )
@@ -187,15 +188,15 @@ func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
 }
 
 // statusRoles returns the role of every queued UPDATE_STATUS op, in order.
-func (m *mockStore) statusRoles(t *testing.T) []string {
+func (m *mockStore) statusRoles(t *testing.T) []StatusRole {
 	t.Helper()
-	var roles []string
+	var roles []StatusRole
 	for _, op := range m.syncOps {
 		if op.Operation != "UPDATE_STATUS" {
 			continue
 		}
 		var payload struct {
-			Role string `json:"role"`
+			Role StatusRole `json:"role"`
 		}
 		if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
 			t.Fatalf("invalid UPDATE_STATUS payload %q: %v", op.Payload, err)
@@ -616,8 +617,8 @@ func TestService_StatusRoles(t *testing.T) {
 		// finished task would move to the list's closed ("cancelled") status.
 		// Pausing must not queue a status change either, so a manual ClickUp
 		// move made during the session (e.g. to "in review") is preserved.
-		want := []string{"start", "complete"}
-		if got := store.statusRoles(t); !equalStrings(got, want) {
+		want := []StatusRole{RoleStart, RoleComplete}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
@@ -637,8 +638,8 @@ func TestService_StatusRoles(t *testing.T) {
 			}
 		}
 
-		want := []string{"start", "complete"}
-		if got := store.statusRoles(t); !equalStrings(got, want) {
+		want := []StatusRole{RoleStart, RoleComplete}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
@@ -658,8 +659,8 @@ func TestService_StatusRoles(t *testing.T) {
 			}
 		}
 
-		want := []string{"start", "archive"}
-		if got := store.statusRoles(t); !equalStrings(got, want) {
+		want := []StatusRole{RoleStart, RoleArchive}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
@@ -684,9 +685,9 @@ func TestService_StatusRoles(t *testing.T) {
 			t.Errorf("expected resume to reuse session %s, got %s", res.Session.ID, resumed.Session.ID)
 		}
 
-		// The pause queues nothing; the resume's Start still queues "start".
-		want := []string{"start", "start"}
-		if got := store.statusRoles(t); !equalStrings(got, want) {
+		// The pause queues nothing; the resume's Start still queues RoleStart.
+		want := []StatusRole{RoleStart, RoleStart}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
@@ -703,21 +704,96 @@ func TestService_StatusRoles(t *testing.T) {
 			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
 		}
 
-		want := []string{"start", "archive"}
-		if got := store.statusRoles(t); !equalStrings(got, want) {
+		want := []StatusRole{RoleStart, RoleArchive}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
-}
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	t.Run("new task queues start with the exact payload", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		if _, err := srv.Start(ctx, "task-new", t.TempDir(), false); err != nil {
+			t.Fatalf("Start failed: %v", err)
 		}
-	}
-	return true
+
+		// The sync worker decodes this payload, so its wire format must not drift.
+		if len(store.syncOps) != 1 {
+			t.Fatalf("expected 1 queued op, got %d", len(store.syncOps))
+		}
+		if op := store.syncOps[0]; op.Operation != "UPDATE_STATUS" || op.Payload != `{"role":"start"}` {
+			t.Errorf("expected UPDATE_STATUS {\"role\":\"start\"}, got %s %s", op.Operation, op.Payload)
+		}
+	})
+
+	t.Run("resuming an active session queues start", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		for range 2 {
+			if _, err := srv.Start(ctx, "task-active", dir, false); err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+		}
+
+		want := []StatusRole{RoleStart, RoleStart}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("starting after a completed session queues reopen", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-reopen", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+			t.Fatalf("Stop(COMPLETED) failed: %v", err)
+		}
+		reopened, err := srv.Start(ctx, "task-reopen", dir, false)
+		if err != nil {
+			t.Fatalf("reopen Start failed: %v", err)
+		}
+		if reopened.Session.ID == res.Session.ID {
+			t.Errorf("expected a new session after completion, got reused %s", res.Session.ID)
+		}
+
+		// Only reopen may move the task back out of the done status that the
+		// completed session's "complete" put it in.
+		want := []StatusRole{RoleStart, RoleComplete, RoleReopen}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+		if last := store.syncOps[len(store.syncOps)-1]; last.Payload != `{"role":"reopen"}` {
+			t.Errorf("expected reopen payload {\"role\":\"reopen\"}, got %s", last.Payload)
+		}
+	})
+
+	t.Run("starting after an abandoned session queues reopen", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-reabandoned", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
+		}
+		if _, err := srv.Start(ctx, "task-reabandoned", dir, false); err != nil {
+			t.Fatalf("reopen Start failed: %v", err)
+		}
+
+		want := []StatusRole{RoleStart, RoleArchive, RoleReopen}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
 }

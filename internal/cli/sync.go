@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/store"
@@ -27,7 +28,8 @@ var syncCmd = &cobra.Command{
 
 		var cuClient *clickup.Client
 		if cfg.ClickUp.APIKey != "" {
-			cuClient = clickup.New(cfg.ClickUp.APIKey)
+			cuClient = clickup.New(cfg.ClickUp.APIKey).
+				WithMinInterval(time.Duration(cfg.Sync.RateLimitMS) * time.Millisecond)
 		} else {
 			fmt.Println("Warning: CLICKUP_API_KEY is not set. Sync operations will remain queued until an API key is configured.")
 		}
