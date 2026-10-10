@@ -48,13 +48,20 @@ func ParseStatusRole(s string) (StatusRole, error) {
 }
 
 // LegacyStatusRole maps the pre-role UPDATE_STATUS payload ("status_type"),
-// which may still be queued from an older taskflow version, onto a role.
-func LegacyStatusRole(statusType string) (StatusRole, error) {
+// which may still be queued from an older taskflow version, onto a role. The
+// old Stop sent "closed" both when a session was completed and when it was
+// archived, so completed tells them apart: it reports whether the task's
+// latest session is COMPLETED. Anything else maps to archive, which only ever
+// targets a cancel-like status, so abandoned work is never reported as done.
+func LegacyStatusRole(statusType string, completed bool) (StatusRole, error) {
 	switch statusType {
 	case "active":
 		return RoleStart, nil
 	case "closed":
-		return RoleComplete, nil
+		if completed {
+			return RoleComplete, nil
+		}
+		return RoleArchive, nil
 	}
 	return "", fmt.Errorf("%w: legacy status type %q", ErrUnknownStatusRole, statusType)
 }
@@ -91,13 +98,6 @@ func statusEntries(listID string, statuses []ListStatus) []*store.CacheEntry {
 	return entries
 }
 
-// cacheListStatuses replaces the cached statuses of listID in one
-// transaction, so statuses renamed or removed in ClickUp don't linger in the
-// cache and a failed refresh never leaves a partial set that looks fresh.
-func cacheListStatuses(ctx context.Context, st store.Store, listID string, entries []*store.CacheEntry) error {
-	return st.ReplaceListStatuses(ctx, listID, entries)
-}
-
 // ResolveStatusForRole returns the name of the status on the task's list that
 // the role moves the task to. The task is fetched live so the role is checked
 // against its current status: taskflow never moves a task back past a status
@@ -121,15 +121,20 @@ func ResolveStatusForRole(ctx context.Context, st store.Store, client *Client, t
 // ClickUp answers 400 when asked for a status the list doesn't have, which
 // usually means the status was renamed or removed after it was cached. So when
 // the statuses came from the cache, a 400 refreshes them, re-resolves, and
-// retries the update once. A 400 against statuses fetched in this call won't
-// be fixed by fetching them again, so it is returned as is.
+// retries the update once. A 400 against statuses fetched in this call, or one
+// the refreshed statuses resolve to the same name, won't be fixed by fetching
+// them again. A 400 that ends the update wraps ErrStatusRejected.
 func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID string, role StatusRole, overrides map[StatusRole]string) error {
 	task, err := client.GetTask(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to get task: %w", err)
 	}
 	update := func(name string) error {
-		if err := client.UpdateTaskStatus(ctx, taskID, name); err != nil {
+		err := client.UpdateTaskStatus(ctx, taskID, name)
+		switch {
+		case errors.Is(err, ErrBadRequest):
+			return fmt.Errorf("failed to move task %s to %q: %w: %w", taskID, name, ErrStatusRejected, err)
+		case err != nil:
 			return fmt.Errorf("failed to move task %s to %q: %w", taskID, name, err)
 		}
 		return nil
@@ -146,11 +151,16 @@ func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID
 
 	// The rejected update left the task where it was, so the task fetched
 	// above still holds its current status.
-	name, _, err = resolveStatusForTask(ctx, st, client, task, role, overrides, true)
+	rejected := err
+	retryName, _, err := resolveStatusForTask(ctx, st, client, task, role, overrides, true)
 	if err != nil {
 		return err
 	}
-	return update(name)
+	if strings.EqualFold(retryName, name) {
+		// The cached name was current, so the 400 wasn't about it.
+		return rejected
+	}
+	return update(retryName)
 }
 
 // resolveStatusForTask is ResolveStatusForRole for an already fetched task, so
@@ -182,15 +192,19 @@ func resolveStatusForTask(ctx context.Context, st store.Store, client *Client, t
 		// An override names a status someone configured on purpose, so a
 		// miss against the cache is worth one refetch before falling back:
 		// the status may be newer than the cache. Once a fresh list has
-		// confirmed the miss (and warned), later ops don't refetch for it.
+		// confirmed the miss, later ops skip the refetch for a while (see
+		// overrideRecheckAfter).
 		if name == "" && !fresh && !overrideKnownMissing(listID, key, want) {
 			if statuses, fresh, err = listStatuses(ctx, st, client, listID, true); err != nil {
 				return "", false, err
 			}
 			name = findStatus(statuses, want)
 		}
-		if name == "" {
-			warnOverrideMissing(listID, key, want)
+		switch {
+		case name == "" && fresh:
+			noteOverrideMissing(listID, key, want)
+		case name != "":
+			forgetOverrideMissing(listID, key, want)
 		}
 	}
 	if name == "" {
@@ -229,31 +243,43 @@ func overrideForRole(overrides map[StatusRole]string, role StatusRole) (StatusRo
 	return RoleStart, overrides[RoleStart]
 }
 
-// warnedOverrides records the missing-override warnings already printed. The
-// sync worker resolves a role on every status update, so a stale status_map
-// entry would otherwise repeat the same warning for every task on the list.
-var warnedOverrides sync.Map
+// overrideRecheckAfter is how long a status_map override confirmed missing
+// from a freshly fetched list is trusted to stay missing. The sync worker
+// resolves a role on every status update, so without it a stale status_map
+// entry would refetch the list (and warn) for every task on the list; with
+// it, a long-running serve still picks up the status once someone adds it.
+const overrideRecheckAfter = 10 * time.Minute
 
-func overrideWarnKey(listID string, key StatusRole, want string) string {
+// missingOverrides maps each (list, role, name) override confirmed missing to
+// when a fresh list last confirmed it.
+var missingOverrides sync.Map
+
+func overrideMissKey(listID string, key StatusRole, want string) string {
 	return listID + "\x00" + string(key) + "\x00" + want
 }
 
-// overrideKnownMissing reports whether this process already found the
-// override missing from a freshly fetched list (see warnOverrideMissing).
+// overrideKnownMissing reports whether a fresh list confirmed the override
+// missing within overrideRecheckAfter.
 func overrideKnownMissing(listID string, key StatusRole, want string) bool {
-	_, seen := warnedOverrides.Load(overrideWarnKey(listID, key, want))
-	return seen
+	confirmedAt, ok := missingOverrides.Load(overrideMissKey(listID, key, want))
+	return ok && time.Since(confirmedAt.(time.Time)) < overrideRecheckAfter
 }
 
-// warnOverrideMissing warns, once per process for each (list, role, name),
-// that status_map pins key to a status the list doesn't have. Reports whether
-// it printed.
-func warnOverrideMissing(listID string, key StatusRole, want string) bool {
-	if _, seen := warnedOverrides.LoadOrStore(overrideWarnKey(listID, key, want), struct{}{}); seen {
+// noteOverrideMissing records that a freshly fetched list lacks the status
+// status_map pins key to, and warns the first time it is found missing.
+// Reports whether it warned.
+func noteOverrideMissing(listID string, key StatusRole, want string) bool {
+	if _, seen := missingOverrides.Swap(overrideMissKey(listID, key, want), time.Now()); seen {
 		return false
 	}
 	fmt.Fprintf(os.Stderr, "[clickup] status_map.%s = %q not found in list %s; using default\n", key, want, listID)
 	return true
+}
+
+// forgetOverrideMissing clears a recorded miss once the override resolves, so
+// a later miss warns again.
+func forgetOverrideMissing(listID string, key StatusRole, want string) {
+	missingOverrides.Delete(overrideMissKey(listID, key, want))
 }
 
 // checkRoleApplies reports whether a role may move a task out of its current
@@ -426,7 +452,10 @@ func listStatuses(ctx context.Context, st store.Store, client *Client, listID st
 	}
 	statuses = statusEntries(listID, details.Statuses)
 	if st != nil {
-		if err := cacheListStatuses(ctx, st, listID, statuses); err != nil {
+		// One transaction, so statuses renamed or removed in ClickUp don't
+		// linger and a failed refresh never leaves a partial set that looks
+		// fresh.
+		if err := st.ReplaceListStatuses(ctx, listID, statuses); err != nil {
 			return nil, false, err
 		}
 	}

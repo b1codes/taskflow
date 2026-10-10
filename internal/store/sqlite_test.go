@@ -1046,10 +1046,11 @@ func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
 	}
 }
 
-// TestSQLiteStore_Migration4_DropsNameKeyedStatusCache verifies that upgrading
+// TestSQLiteStore_Migrations4And5_DropStaleCacheRows verifies that upgrading
 // from v3 removes status cache rows keyed by bare status name (which collided
-// across lists) while leaving other cache entities intact.
-func TestSQLiteStore_Migration4_DropsNameKeyedStatusCache(t *testing.T) {
+// across lists, migration 4) and the unused task → list rows (migration 5),
+// while leaving other cache entities intact.
+func TestSQLiteStore_Migrations4And5_DropStaleCacheRows(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("sqlite", buildDSN(":memory:"))
 	if err != nil {
@@ -1069,7 +1070,8 @@ func TestSQLiteStore_Migration4_DropsNameKeyedStatusCache(t *testing.T) {
 	}
 	if _, err := db.Exec(`INSERT INTO clickup_cache (entity_type, entity_id, parent_id, name, status_type, fetched_at) VALUES
 		('status', 'complete', 'list-a', 'complete', 'done', CURRENT_TIMESTAMP),
-		('task', 'task-1', 'list-a', 'Task 1', NULL, CURRENT_TIMESTAMP)`); err != nil {
+		('task', 'task-1', 'list-a', 'Task 1', NULL, CURRENT_TIMESTAMP),
+		('list', 'list-a', 'folder-a', 'List A', NULL, CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatalf("failed to seed cache: %v", err)
 	}
 
@@ -1087,8 +1089,15 @@ func TestSQLiteStore_Migration4_DropsNameKeyedStatusCache(t *testing.T) {
 	if statusRows != 0 {
 		t.Errorf("expected name-keyed status rows to be dropped, found %d", statusRows)
 	}
-	if taskRows != 1 {
-		t.Errorf("expected task cache row to survive, found %d", taskRows)
+	if taskRows != 0 {
+		t.Errorf("expected task cache rows to be dropped, found %d", taskRows)
+	}
+	var listRows int
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'list'`).Scan(&listRows); err != nil {
+		t.Fatalf("failed to count list rows: %v", err)
+	}
+	if listRows != 1 {
+		t.Errorf("expected the list cache row to survive, found %d", listRows)
 	}
 }
 

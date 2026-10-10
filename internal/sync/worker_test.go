@@ -683,15 +683,21 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 		name      string
 		payload   SyncPayload
 		statusMap config.StatusMapConfig
-		want      string
+		// sessionStatus is the task's latest local session status; empty
+		// leaves it ACTIVE.
+		sessionStatus session.Status
+		want          string
 	}{
-		{"start", SyncPayload{Role: "start"}, config.StatusMapConfig{}, "in progress"},
-		{"complete", SyncPayload{Role: "complete"}, config.StatusMapConfig{}, "complete"},
-		{"archive", SyncPayload{Role: "archive"}, config.StatusMapConfig{}, "cancelled"},
-		{"legacy active payload maps to start", SyncPayload{StatusType: "active"}, config.StatusMapConfig{}, "in progress"},
-		// Previously resolved to the list's closed status, i.e. "cancelled".
-		{"legacy closed payload maps to complete", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, "complete"},
-		{"status_map override", SyncPayload{Role: "start"}, config.StatusMapConfig{Start: "testing/qa"}, "testing/qa"},
+		{"start", SyncPayload{Role: "start"}, config.StatusMapConfig{}, "", "in progress"},
+		{"complete", SyncPayload{Role: "complete"}, config.StatusMapConfig{}, "", "complete"},
+		{"archive", SyncPayload{Role: "archive"}, config.StatusMapConfig{}, "", "cancelled"},
+		{"legacy active payload maps to start", SyncPayload{StatusType: "active"}, config.StatusMapConfig{}, "", "in progress"},
+		// The old Stop sent "closed" for both completing and archiving; the
+		// task's latest session tells which.
+		{"legacy closed payload from a completed session maps to complete", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, session.StatusCompleted, "complete"},
+		{"legacy closed payload from an archived session maps to archive", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, session.StatusArchived, "cancelled"},
+		{"status_map override", SyncPayload{Role: "start"}, config.StatusMapConfig{Start: "testing/qa"}, "", "testing/qa"},
+		{"status_map reopen override", SyncPayload{Role: "reopen"}, config.StatusMapConfig{Start: "in progress", Reopen: "testing/qa"}, "", "testing/qa"},
 	}
 
 	for i, tt := range tests {
@@ -705,6 +711,11 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 
 			taskID := fmt.Sprintf("task-role-%d", i)
 			enqueueStatusOp(t, st, taskID, tt.payload, 5)
+			if tt.sessionStatus != "" {
+				if err := st.UpdateSessionStatus(context.Background(), "sess-"+taskID, tt.sessionStatus); err != nil {
+					t.Fatalf("UpdateSessionStatus failed: %v", err)
+				}
+			}
 			server, updates := newStatusUpdateServer(t, taskID, openTaskStatus, workerTestStatuses, nil)
 
 			client := clickup.New("my-key").WithBaseURL(server.URL)
@@ -885,5 +896,41 @@ func TestWorker_BadRequest_FailsPermanently(t *testing.T) {
 	_, _ = worker.DrainOnce(ctx)
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("expected exactly 1 attempt, got %d", got)
+	}
+}
+
+// TestWorker_LookupBadRequest_IsRetried checks that a 400 from a lookup made
+// while applying a status role (here, fetching the task) consumes a retry
+// instead of failing the op: only a 400 to the op's own write is permanent.
+func TestWorker_LookupBadRequest_IsRetried(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	enqueueStatusOp(t, st, "task-lookup-400", SyncPayload{Role: "start"}, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"err": "transient"}`))
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
+	if count, _ := worker.DrainOnce(ctx); count != 0 {
+		t.Errorf("expected 0 ops successfully processed, got %d", count)
+	}
+
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	ops, err := st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable failed: %v", err)
+	}
+	if len(ops) != 1 || ops[0].Retries != 1 {
+		t.Fatalf("expected the op to be retryable after one attempt, got %+v", ops)
 	}
 }

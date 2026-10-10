@@ -17,7 +17,10 @@ type ClickUpConfig struct {
 // StatusMapConfig optionally pins session lifecycle roles to ClickUp status
 // names. Empty fields use type-based defaults (see clickup.ResolveStatusForRole).
 type StatusMapConfig struct {
-	Start    string `toml:"start"`
+	Start string `toml:"start"`
+	// Reopen is used when a session starts on a task that is finished in
+	// ClickUp; empty falls back to Start.
+	Reopen   string `toml:"reopen"`
 	Complete string `toml:"complete"`
 	Archive  string `toml:"archive"`
 }
@@ -51,9 +54,11 @@ api_key = ""
 # Unset roles use defaults: start = the "custom" status named like
 # "in progress", complete = first "done" (else "closed"), archive = first
 # "closed" named like "cancelled" (else unchanged). Reopening a finished task
-# uses start. Taskflow never moves a task back from a status someone else chose.
+# uses reopen, else start. Taskflow never moves a task back from a status
+# someone else chose.
 [clickup.status_map]
 # start = "in progress"
+# reopen = "in progress"
 # complete = "complete"
 # archive = "cancelled"
 

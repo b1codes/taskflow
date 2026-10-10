@@ -20,8 +20,9 @@ type Client struct {
 
 	// minInterval is the minimum gap between the starts of consecutive
 	// requests; zero disables pacing. nextSlot is the earliest time the next
-	// request may start, guarded by paceMu since one client can be shared
-	// across goroutines (e.g. the MCP server and the sync worker).
+	// request may start, pushed out by pacing and by a 429's Retry-After. It
+	// is guarded by paceMu since one client can be shared across goroutines
+	// (e.g. the MCP server and the sync worker).
 	minInterval time.Duration
 	paceMu      sync.Mutex
 	nextSlot    time.Time
@@ -57,11 +58,10 @@ func (c *Client) WithMinInterval(d time.Duration) *Client {
 
 // waitForSlot reserves the next request slot and blocks until it arrives or
 // ctx is done. The slot is reserved under the lock and the sleep happens
-// outside it, so concurrent callers queue up one interval apart.
+// outside it, so concurrent callers queue up one interval apart. A caller
+// whose ctx ends while it waits hands its slot back if no one has queued
+// behind it, so cancelled requests don't delay the requests that follow.
 func (c *Client) waitForSlot(ctx context.Context) error {
-	if c.minInterval <= 0 {
-		return nil
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -72,7 +72,8 @@ func (c *Client) waitForSlot(ctx context.Context) error {
 	if slot.Before(now) {
 		slot = now
 	}
-	c.nextSlot = slot.Add(c.minInterval)
+	reserved := slot.Add(c.minInterval)
+	c.nextSlot = reserved
 	c.paceMu.Unlock()
 
 	delay := time.Until(slot)
@@ -83,9 +84,24 @@ func (c *Client) waitForSlot(ctx context.Context) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		c.paceMu.Lock()
+		if c.nextSlot.Equal(reserved) {
+			c.nextSlot = slot
+		}
+		c.paceMu.Unlock()
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// holdUntil keeps every request on this client from starting before t, e.g.
+// after a 429 whose Retry-After applies to the whole API key.
+func (c *Client) holdUntil(t time.Time) {
+	c.paceMu.Lock()
+	defer c.paceMu.Unlock()
+	if t.After(c.nextSlot) {
+		c.nextSlot = t
 	}
 }
 
@@ -147,6 +163,7 @@ func (c *Client) do(ctx context.Context, method, path string, bodyVal interface{
 		if delay < 0 {
 			delay = 0
 		}
+		c.holdUntil(time.Now().Add(delay))
 		return &RateLimitError{RetryAfter: delay}
 	default:
 		if resp.StatusCode >= 500 {

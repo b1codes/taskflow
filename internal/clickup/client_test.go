@@ -146,6 +146,10 @@ func TestClickUpClient_WithMinInterval_CancelDuringWait(t *testing.T) {
 		t.Fatalf("first GetTask failed: %v", err)
 	}
 
+	client.paceMu.Lock()
+	freeAt := client.nextSlot
+	client.paceMu.Unlock()
+
 	// The second request must wait ~5s for its slot; cancelling should end
 	// the wait promptly without sending it.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -160,5 +164,42 @@ func TestClickUpClient_WithMinInterval_CancelDuringWait(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Errorf("expected the cancelled request not to be sent, server saw %d requests", got)
+	}
+	// Nobody queued behind it, so its slot is handed back.
+	client.paceMu.Lock()
+	defer client.paceMu.Unlock()
+	if !client.nextSlot.Equal(freeAt) {
+		t.Errorf("expected the cancelled slot to be released (next slot %v), got %v", freeAt, client.nextSlot)
+	}
+}
+
+// TestClickUpClient_RateLimitHoldsAllRequests checks that a 429's Retry-After
+// holds back the next request on the same client, whoever sends it: the MCP
+// tools and the sync worker share one client and one rate limit.
+func TestClickUpClient_RateLimitHoldsAllRequests(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id": "abc123"}`))
+	}))
+	defer server.Close()
+
+	client := New("my-key").WithBaseURL(server.URL) // no pacing
+	var rateLimitErr *RateLimitError
+	if _, err := client.GetTask(context.Background(), "abc123"); !errors.As(err, &rateLimitErr) {
+		t.Fatalf("expected a RateLimitError, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := client.GetTask(ctx, "abc123"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected the next request to wait out Retry-After, got %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("expected no request during the Retry-After window, server saw %d", got)
 	}
 }

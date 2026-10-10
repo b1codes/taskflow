@@ -17,6 +17,9 @@ type ClickUpTaskInfo struct {
 	Name        string
 	Description string
 	ListID      string
+	// StatusType is the type of the task's current status: open, custom,
+	// done, or closed.
+	StatusType string
 }
 
 type ClickUpStatusInfo struct {
@@ -192,6 +195,12 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	// 2. ClickUp validation
 	taskName := "Local Task"
 	taskDesc := ""
+	// Starting work on a finished task is a reopen: unlike start, it may move
+	// the task out of a done/closed ClickUp status. Whether it is finished is
+	// read from ClickUp, since this DB may not know the task's history (a new
+	// machine, or a task someone else closed); without a client, a finished
+	// local session for the task stands in for it.
+	role := RoleStart
 	if s.clickup != nil {
 		taskInfo, err := s.clickup.GetTask(ctx, taskID)
 		if err != nil {
@@ -199,6 +208,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		}
 		taskName = taskInfo.Name
 		taskDesc = taskInfo.Description
+		if taskInfo.StatusType == "done" || taskInfo.StatusType == "closed" {
+			role = RoleReopen
+		}
 	}
 
 	// 3. Check for existing session
@@ -209,9 +221,6 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	var sessionID string
 	var isResumed bool
 	var sess *Session
-	// Starting work on a task whose last session finished is a reopen: unlike
-	// start, it may move the task out of a done/closed ClickUp status.
-	role := RoleStart
 
 	if existing != nil {
 		if existing.Status == StatusActive {
@@ -238,7 +247,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 			}
 		} else {
 			// Completed or Archived -> new session
-			role = RoleReopen
+			if s.clickup == nil {
+				role = RoleReopen
+			}
 			sessionID = uuid.New().String()
 			sess = &Session{
 				ID:          sessionID,

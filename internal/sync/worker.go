@@ -42,6 +42,7 @@ func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *
 func (w *Worker) WithStatusMap(m config.StatusMapConfig) *Worker {
 	w.statusMap = map[clickup.StatusRole]string{
 		clickup.RoleStart:    m.Start,
+		clickup.RoleReopen:   m.Reopen,
 		clickup.RoleComplete: m.Complete,
 		clickup.RoleArchive:  m.Archive,
 	}
@@ -185,6 +186,9 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	switch op.Operation {
 	case "POST_COMMENT", "POST_SNAG", "POST_DECISION":
 		opErr = w.clickup.PostComment(ctx, op.TaskID, payload.CommentText)
+		if errors.Is(opErr, clickup.ErrBadRequest) {
+			opErr = fmt.Errorf("%w: %w", errCommentRejected, opErr)
+		}
 	case "UPDATE_STATUS":
 		opErr = w.updateStatus(ctx, op.TaskID, payload)
 	default:
@@ -195,16 +199,10 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 		fmt.Fprintf(os.Stderr, "[sync] op %d failed (op: %s, task: %s, retry: %d/%d): %v\n",
 			op.ID, op.Operation, op.TaskID, op.Retries+1, op.MaxRetries, opErr)
 
-		var rateLimitErr *clickup.RateLimitError
-		if errors.As(opErr, &rateLimitErr) || errors.Is(opErr, clickup.ErrRateLimited) {
-			// A 429 response does NOT consume a retry.
+		if errors.Is(opErr, clickup.ErrRateLimited) {
+			// A 429 response does NOT consume a retry. The client holds back
+			// every request sharing it until Retry-After has passed.
 			_ = w.store.RequeueRateLimited(context.Background(), op.ID, opErr.Error())
-			if rateLimitErr != nil && rateLimitErr.RetryAfter > 0 {
-				select {
-				case <-ctx.Done():
-				case <-time.After(rateLimitErr.RetryAfter):
-				}
-			}
 			return opErr
 		}
 
@@ -219,17 +217,24 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	return w.store.MarkDone(ctx, op.ID)
 }
 
-var errUnknownOperation = errors.New("unknown operation")
+var (
+	errUnknownOperation = errors.New("unknown operation")
+	// errCommentRejected is a 400 to posting the op's comment: the same
+	// comment would be rejected again.
+	errCommentRejected = errors.New("comment rejected")
+)
 
 // isPermanent reports whether an op error will recur on every retry, so the op
-// should fail immediately instead of consuming max_retries attempts.
+// should fail immediately instead of consuming max_retries attempts. Only a
+// 400 to the op's own write counts: a 400 from a lookup along the way (e.g.
+// fetching the task to resolve a status role) is retried like any other error.
 func isPermanent(err error) bool {
 	return errors.Is(err, errUnknownOperation) ||
 		errors.Is(err, clickup.ErrUnknownStatusRole) ||
 		errors.Is(err, clickup.ErrNoMatchingStatus) ||
-		// ApplyStatusRole already refreshes the status cache and retries once
-		// on a 400, so one that reaches the worker won't succeed on retry.
-		errors.Is(err, clickup.ErrBadRequest)
+		errors.Is(err, errCommentRejected) ||
+		// ApplyStatusRole already refreshed the status cache and retried.
+		errors.Is(err, clickup.ErrStatusRejected)
 }
 
 func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPayload) error {
@@ -238,7 +243,7 @@ func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPa
 	if payload.Role != "" {
 		role, err = clickup.ParseStatusRole(payload.Role)
 	} else {
-		role, err = clickup.LegacyStatusRole(payload.StatusType)
+		role, err = clickup.LegacyStatusRole(payload.StatusType, w.latestSessionCompleted(ctx, taskID))
 	}
 	if err != nil {
 		return err
@@ -250,4 +255,12 @@ func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPa
 		return nil
 	}
 	return err
+}
+
+// latestSessionCompleted reports whether the task's most recent local session
+// is COMPLETED, which tells a legacy "closed" status op queued by Stop (see
+// clickup.LegacyStatusRole) from one queued by archiving.
+func (w *Worker) latestSessionCompleted(ctx context.Context, taskID string) bool {
+	sess, err := w.store.GetSessionByTaskID(ctx, taskID)
+	return err == nil && sess != nil && sess.Status == session.StatusCompleted
 }

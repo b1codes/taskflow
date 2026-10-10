@@ -14,6 +14,10 @@ var (
 	ErrNoMatchingStatus = errors.New("no matching status found on list")
 	// ErrBadRequest is a 400 response, e.g. a status name the list no longer has.
 	ErrBadRequest = errors.New("ClickUp rejected the request")
+	// ErrStatusRejected wraps the ErrBadRequest of a status update that
+	// ApplyStatusRole couldn't fix by refreshing the list's statuses, so a
+	// retry would be rejected the same way.
+	ErrStatusRejected = errors.New("ClickUp rejected the status update")
 )
 
 type RateLimitError struct {

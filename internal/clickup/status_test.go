@@ -357,13 +357,24 @@ func TestResolveStatusForRole_UnknownRole(t *testing.T) {
 func TestLegacyStatusRole(t *testing.T) {
 	t.Parallel()
 
-	for statusType, want := range map[string]StatusRole{"active": RoleStart, "closed": RoleComplete} {
-		got, err := LegacyStatusRole(statusType)
-		if err != nil || got != want {
-			t.Errorf("LegacyStatusRole(%q) = %q, %v; want %q", statusType, got, err, want)
+	tests := []struct {
+		statusType string
+		completed  bool
+		want       StatusRole
+	}{
+		{"active", false, RoleStart},
+		{"closed", true, RoleComplete},
+		// The old Stop also sent "closed" when archiving; never report that
+		// as done.
+		{"closed", false, RoleArchive},
+	}
+	for _, tt := range tests {
+		got, err := LegacyStatusRole(tt.statusType, tt.completed)
+		if err != nil || got != tt.want {
+			t.Errorf("LegacyStatusRole(%q, %v) = %q, %v; want %q", tt.statusType, tt.completed, got, err, tt.want)
 		}
 	}
-	if _, err := LegacyStatusRole("open"); !errors.Is(err, ErrUnknownStatusRole) {
+	if _, err := LegacyStatusRole("open", false); !errors.Is(err, ErrUnknownStatusRole) {
 		t.Errorf("expected ErrUnknownStatusRole for unmapped legacy type, got %v", err)
 	}
 }
@@ -587,7 +598,7 @@ func seedStatusCache(t *testing.T, st store.Store, listID, statusesJSON string) 
 	if err := json.Unmarshal([]byte(statusesJSON), &statuses); err != nil {
 		t.Fatalf("bad statuses JSON: %v", err)
 	}
-	if err := cacheListStatuses(context.Background(), st, listID, statusEntries(listID, statuses)); err != nil {
+	if err := st.ReplaceListStatuses(context.Background(), listID, statusEntries(listID, statuses)); err != nil {
 		t.Fatalf("failed to seed status cache: %v", err)
 	}
 }
@@ -663,7 +674,7 @@ func TestResolveStatusForRole_OverrideRefreshesCache(t *testing.T) {
 	// A missing override refreshes once, then falls back to the default.
 	// The name is unique to this test: the known-missing set is process-wide.
 	missing := map[StatusRole]string{RoleStart: "missing " + t.Name()}
-	forgetOverrideMissing(t, "list-1", RoleStart, missing[RoleStart])
+	cleanupOverrideMissing(t, "list-1", RoleStart, missing[RoleStart])
 	getListCalls.Store(0)
 	got, err = ResolveStatusForRole(ctx, st, client, "task-1", RoleStart, missing)
 	if err != nil {
@@ -684,16 +695,27 @@ func TestResolveStatusForRole_OverrideRefreshesCache(t *testing.T) {
 	if getListCalls.Load() != 0 {
 		t.Errorf("expected no list fetch for a known-missing override, got %d", getListCalls.Load())
 	}
+
+	// After overrideRecheckAfter, the miss is checked against ClickUp again,
+	// so a status added to the list in the meantime is picked up.
+	missingOverrides.Store(overrideMissKey("list-1", RoleStart, missing[RoleStart]), time.Now().Add(-overrideRecheckAfter))
+	getListCalls.Store(0)
+	if _, err = ResolveStatusForRole(ctx, st, client, "task-1", RoleStart, missing); err != nil {
+		t.Fatalf("ResolveStatusForRole after recheck window failed: %v", err)
+	}
+	if getListCalls.Load() != 1 {
+		t.Errorf("expected 1 list fetch once the known miss expired, got %d", getListCalls.Load())
+	}
 }
 
-// forgetOverrideMissing removes the override from the process-wide
+// cleanupOverrideMissing removes the override from the process-wide
 // known-missing set when the test ends, so `go test -count=N` reruns start
 // clean.
-func forgetOverrideMissing(t *testing.T, listID string, key StatusRole, want string) {
-	t.Cleanup(func() { warnedOverrides.Delete(overrideWarnKey(listID, key, want)) })
+func cleanupOverrideMissing(t *testing.T, listID string, key StatusRole, want string) {
+	t.Cleanup(func() { forgetOverrideMissing(listID, key, want) })
 }
 
-func TestWarnOverrideMissing_OncePerListRoleAndName(t *testing.T) {
+func TestNoteOverrideMissing_WarnsOncePerListRoleAndName(t *testing.T) {
 	t.Parallel()
 
 	list := t.Name() // unique to this test; the dedupe set is process-wide
@@ -710,9 +732,9 @@ func TestWarnOverrideMissing_OncePerListRoleAndName(t *testing.T) {
 		{list + "-other", RoleStart, "doing", true},
 	}
 	for i, s := range steps {
-		forgetOverrideMissing(t, s.listID, s.role, s.name)
-		if got := warnOverrideMissing(s.listID, s.role, s.name); got != s.want {
-			t.Errorf("step %d: warnOverrideMissing(%q, %q, %q) = %v, want %v", i, s.listID, s.role, s.name, got, s.want)
+		cleanupOverrideMissing(t, s.listID, s.role, s.name)
+		if got := noteOverrideMissing(s.listID, s.role, s.name); got != s.want {
+			t.Errorf("step %d: noteOverrideMissing(%q, %q, %q) = %v, want %v", i, s.listID, s.role, s.name, got, s.want)
 		}
 	}
 }
@@ -815,7 +837,7 @@ func TestApplyStatusRole(t *testing.T) {
 			role:          RoleStart,
 			rejectUpdates: true,
 			wantUpdates:   []string{"doing", "in progress"},
-			wantErr:       ErrBadRequest,
+			wantErr:       ErrStatusRejected,
 			wantListCalls: 1,
 		},
 		{
@@ -824,7 +846,17 @@ func TestApplyStatusRole(t *testing.T) {
 			role:          RoleStart,
 			rejectUpdates: true,
 			wantUpdates:   []string{"in progress"},
-			wantErr:       ErrBadRequest,
+			wantErr:       ErrStatusRejected,
+			wantListCalls: 1,
+		},
+		{
+			name:          "doesn't retry when the refreshed statuses resolve to the same name",
+			cached:        developmentTaskListStatuses,
+			current:       openTaskStatus,
+			role:          RoleStart,
+			rejectUpdates: true,
+			wantUpdates:   []string{"in progress"},
+			wantErr:       ErrStatusRejected,
 			wantListCalls: 1,
 		},
 		{
