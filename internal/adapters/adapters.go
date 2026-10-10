@@ -45,6 +45,7 @@ func (a *ClickUpAdapter) GetTask(ctx context.Context, taskID string) (*session.C
 		Name:        t.Name,
 		Description: t.Description,
 		ListID:      t.List.ID,
+		StatusType:  t.Status.Type,
 	}, nil
 }
 

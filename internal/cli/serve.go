@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	syncPkg "sync"
 	"syscall"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
 	"github.com/b1codes/taskflow/internal/server"
@@ -30,17 +31,20 @@ var serveCmd = &cobra.Command{
 		}
 		defer st.Close()
 
-		srv := server.New(st, cfg)
+		// One paced client for the MCP tools and the sync worker, so their
+		// requests share a single rate-limit budget.
+		var cuClient *clickup.Client
+		if cfg.ClickUp.APIKey != "" {
+			cuClient = clickup.New(cfg.ClickUp.APIKey).
+				WithMinInterval(time.Duration(cfg.Sync.RateLimitMS) * time.Millisecond)
+		}
+		srv := server.New(st, cfg, cuClient)
 
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
 		// Start sync worker to drain enqueued ops to ClickUp in the background.
-		var cuClient *clickup.Client
-		if cfg.ClickUp.APIKey != "" {
-			cuClient = clickup.New(cfg.ClickUp.APIKey)
-		}
-		worker := sync.NewWorker(st, cuClient, &cfg.Sync)
+		worker := sync.NewWorker(st, cuClient, &cfg.Sync).WithStatusMap(cfg.ClickUp.StatusMap)
 
 		var wg syncPkg.WaitGroup
 		wg.Add(2)

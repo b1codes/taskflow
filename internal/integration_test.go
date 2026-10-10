@@ -2,6 +2,7 @@ package internal_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,6 +36,11 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 	defer st.Close()
 
 	var getTaskCalled, postCommentCalled, updateStatusCalled int
+	var statusesSet []string
+	// The task's live status, updated by each PUT so the worker sees the task
+	// move through the lifecycle as it would in ClickUp.
+	statusTypes := map[string]string{"Open": "open", "In Progress": "custom", "Complete": "done", "Closed": "closed"}
+	currentStatus := "Open"
 	clickupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && r.URL.Path == "/task/task-123" {
@@ -43,7 +49,7 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 				"id": "task-123",
 				"name": "ClickUp Task Title",
 				"text_content": "Description",
-				"status": {"status": "in progress", "type": "active"},
+				"status": {"status": "` + currentStatus + `", "type": "` + statusTypes[currentStatus] + `"},
 				"list": {"id": "list-1", "name": "List Name"}
 			}`))
 			return
@@ -54,8 +60,9 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 				"name": "List Name",
 				"statuses": [
 					{"status": "Open", "type": "open", "orderindex": 0},
-					{"status": "In Progress", "type": "active", "orderindex": 1},
-					{"status": "Closed", "type": "closed", "orderindex": 2}
+					{"status": "In Progress", "type": "custom", "orderindex": 1},
+					{"status": "Complete", "type": "done", "orderindex": 2},
+					{"status": "Closed", "type": "closed", "orderindex": 3}
 				]
 			}`))
 			return
@@ -67,6 +74,12 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 		}
 		if r.Method == "PUT" && r.URL.Path == "/task/task-123" {
 			updateStatusCalled++
+			var body struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			statusesSet = append(statusesSet, body.Status)
+			currentStatus = body.Status
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -152,6 +165,11 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 	if updateStatusCalled < 2 {
 		t.Errorf("expected at least 2 UpdateTaskStatus calls, got %d", updateStatusCalled)
 	}
+	// Start moves the open task to its in-progress status; completing moves it
+	// to the done status, never the closed one.
+	if len(statusesSet) != 2 || statusesSet[0] != "In Progress" || statusesSet[1] != "Complete" {
+		t.Errorf("expected statuses [In Progress Complete], got %v", statusesSet)
+	}
 }
 
 // TestSyncWorker_AutoDrain verifies that Worker.Run (the ticker-driven
@@ -173,7 +191,7 @@ func TestSyncWorker_AutoDrain(t *testing.T) {
 				"id": "task-auto",
 				"name": "Auto Sync Task",
 				"text_content": "Description",
-				"status": {"status": "in progress", "type": "active"},
+				"status": {"status": "Open", "type": "open"},
 				"list": {"id": "list-1", "name": "List Name"}
 			}`))
 			return
@@ -184,8 +202,9 @@ func TestSyncWorker_AutoDrain(t *testing.T) {
 				"name": "List Name",
 				"statuses": [
 					{"status": "Open", "type": "open", "orderindex": 0},
-					{"status": "In Progress", "type": "active", "orderindex": 1},
-					{"status": "Closed", "type": "closed", "orderindex": 2}
+					{"status": "In Progress", "type": "custom", "orderindex": 1},
+					{"status": "Complete", "type": "done", "orderindex": 2},
+					{"status": "Closed", "type": "closed", "orderindex": 3}
 				]
 			}`))
 			return

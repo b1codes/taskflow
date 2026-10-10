@@ -1,10 +1,12 @@
 package session
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 )
@@ -14,6 +16,7 @@ type mockStore struct {
 	checkpoints map[string][]*Checkpoint
 	snags       map[string][]*Snag
 	decisions   map[string][]*Decision
+	syncOps     []SyncOp
 }
 
 func newMockStore() *mockStore {
@@ -181,7 +184,27 @@ func (m *mockStore) CountPendingByTaskID(ctx context.Context, taskID string) (in
 }
 
 func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
+	m.syncOps = append(m.syncOps, op)
 	return nil
+}
+
+// statusRoles returns the role of every queued UPDATE_STATUS op, in order.
+func (m *mockStore) statusRoles(t *testing.T) []StatusRole {
+	t.Helper()
+	var roles []StatusRole
+	for _, op := range m.syncOps {
+		if op.Operation != "UPDATE_STATUS" {
+			continue
+		}
+		var payload struct {
+			Role StatusRole `json:"role"`
+		}
+		if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
+			t.Fatalf("invalid UPDATE_STATUS payload %q: %v", op.Payload, err)
+		}
+		roles = append(roles, payload.Role)
+	}
+	return roles
 }
 
 type mockGit struct {
@@ -194,6 +217,9 @@ func (mg *mockGit) Capture(projectPath string) (*GitContext, error) {
 
 type mockClickUp struct {
 	taskName string
+	// statusType is the type of the task's current ClickUp status; empty
+	// means "open".
+	statusType string
 }
 
 func (mc *mockClickUp) GetTask(ctx context.Context, taskID string) (*ClickUpTaskInfo, error) {
@@ -206,13 +232,14 @@ func (mc *mockClickUp) GetTask(ctx context.Context, taskID string) (*ClickUpTask
 		Name:        name,
 		Description: "Mock Description",
 		ListID:      "list-123",
+		StatusType:  cmp.Or(mc.statusType, "open"),
 	}, nil
 }
 
 func (mc *mockClickUp) GetListStatuses(ctx context.Context, listID string) ([]ClickUpStatusInfo, error) {
 	return []ClickUpStatusInfo{
 		{Status: "Open", Type: "open", OrderIndex: 0},
-		{Status: "In Progress", Type: "active", OrderIndex: 1},
+		{Status: "In Progress", Type: "custom", OrderIndex: 1},
 		{Status: "Closed", Type: "closed", OrderIndex: 2},
 	}, nil
 }
@@ -573,6 +600,245 @@ func TestService_Start_StaleLockFromDeadProcessIgnored(t *testing.T) {
 	}
 }
 
+func TestService_StatusRoles(t *testing.T) {
+	ctx := context.Background()
 
+	t.Run("start, pause, complete, then archive", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
 
+		res, err := srv.Start(ctx, "task-roles", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"PAUSED", "COMPLETED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
 
+		// Archiving the completed session must not queue a status change, or the
+		// finished task would move to the list's closed ("cancelled") status.
+		// Pausing must not queue a status change either, so a manual ClickUp
+		// move made during the session (e.g. to "in review") is preserved.
+		want := []StatusRole{RoleStart, RoleComplete}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("re-archiving an archived-after-completed session queues nothing more", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-rearchive", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"COMPLETED", "ARCHIVED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
+
+		want := []StatusRole{RoleStart, RoleComplete}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("re-archiving an abandoned session doesn't re-send archive", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-reabandon", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"ARCHIVED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
+
+		want := []StatusRole{RoleStart, RoleArchive}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("pause then resume", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-resume", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false); err != nil {
+			t.Fatalf("Stop(PAUSED) failed: %v", err)
+		}
+		resumed, err := srv.Start(ctx, "task-resume", dir, false)
+		if err != nil {
+			t.Fatalf("resume Start failed: %v", err)
+		}
+		if resumed.Session.ID != res.Session.ID {
+			t.Errorf("expected resume to reuse session %s, got %s", res.Session.ID, resumed.Session.ID)
+		}
+
+		// The pause queues nothing; the resume's Start still queues RoleStart.
+		want := []StatusRole{RoleStart, RoleStart}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("abandoning an active session archives it", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-abandon", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
+		}
+
+		want := []StatusRole{RoleStart, RoleArchive}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("new task queues start with the exact payload", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		if _, err := srv.Start(ctx, "task-new", t.TempDir(), false); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+
+		// The sync worker decodes this payload, so its wire format must not drift.
+		if len(store.syncOps) != 1 {
+			t.Fatalf("expected 1 queued op, got %d", len(store.syncOps))
+		}
+		if op := store.syncOps[0]; op.Operation != "UPDATE_STATUS" || op.Payload != `{"role":"start"}` {
+			t.Errorf("expected UPDATE_STATUS {\"role\":\"start\"}, got %s %s", op.Operation, op.Payload)
+		}
+	})
+
+	t.Run("resuming an active session queues start", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		for range 2 {
+			if _, err := srv.Start(ctx, "task-active", dir, false); err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+		}
+
+		want := []StatusRole{RoleStart, RoleStart}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("starting after a completed session queues reopen", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-reopen", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+			t.Fatalf("Stop(COMPLETED) failed: %v", err)
+		}
+		reopened, err := srv.Start(ctx, "task-reopen", dir, false)
+		if err != nil {
+			t.Fatalf("reopen Start failed: %v", err)
+		}
+		if reopened.Session.ID == res.Session.ID {
+			t.Errorf("expected a new session after completion, got reused %s", res.Session.ID)
+		}
+
+		// Only reopen may move the task back out of the done status that the
+		// completed session's "complete" put it in.
+		want := []StatusRole{RoleStart, RoleComplete, RoleReopen}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+		if last := store.syncOps[len(store.syncOps)-1]; last.Payload != `{"role":"reopen"}` {
+			t.Errorf("expected reopen payload {\"role\":\"reopen\"}, got %s", last.Payload)
+		}
+	})
+
+	t.Run("starting after an abandoned session queues reopen", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-reabandoned", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
+		}
+		if _, err := srv.Start(ctx, "task-reabandoned", dir, false); err != nil {
+			t.Fatalf("reopen Start failed: %v", err)
+		}
+
+		want := []StatusRole{RoleStart, RoleArchive, RoleReopen}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	// With ClickUp, the task's live status decides, not local history: this
+	// DB may never have seen the session that finished the task.
+	for _, statusType := range []string{"done", "closed"} {
+		t.Run("a task "+statusType+" in ClickUp queues reopen without local history", func(t *testing.T) {
+			store := newMockStore()
+			srv := NewService(store, &mockGit{}, &mockClickUp{statusType: statusType})
+
+			if _, err := srv.Start(ctx, "task-closed-elsewhere", t.TempDir(), false); err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+
+			want := []StatusRole{RoleReopen}
+			if got := store.statusRoles(t); !slices.Equal(got, want) {
+				t.Errorf("expected roles %v, got %v", want, got)
+			}
+		})
+	}
+
+	t.Run("a task reopened in ClickUp queues start after a completed session", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, &mockClickUp{})
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-reopened-elsewhere", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+			t.Fatalf("Stop(COMPLETED) failed: %v", err)
+		}
+		if _, err := srv.Start(ctx, "task-reopened-elsewhere", dir, false); err != nil {
+			t.Fatalf("second Start failed: %v", err)
+		}
+
+		want := []StatusRole{RoleStart, RoleComplete, RoleStart}
+		if got := store.statusRoles(t); !slices.Equal(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+}

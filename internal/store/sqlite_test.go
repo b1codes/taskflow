@@ -721,6 +721,70 @@ func TestListRetryable_BackoffGate(t *testing.T) {
 	}
 }
 
+func TestMarkFailedPermanent(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "UPDATE_STATUS",
+		TaskID:     "task-permanent",
+		Payload:    `{"role":"complete"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	const errMsg = "no status for role complete on list"
+	if err := st.MarkFailedPermanent(ctx, opID, errMsg); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+
+	// Even with a tiny backoff and a backdated attempt, the op must never be retryable.
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	staleTime := time.Now().Add(-1 * time.Hour)
+	if _, err := st.db.ExecContext(ctx, "UPDATE sync_queue SET last_attempted_at = ? WHERE id = ?", staleTime, opID); err != nil {
+		t.Fatalf("UPDATE last_attempted_at failed: %v", err)
+	}
+
+	retryable, err := st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable failed: %v", err)
+	}
+	if len(retryable) != 0 {
+		t.Errorf("expected 0 retryables after permanent failure, got %d", len(retryable))
+	}
+
+	var status, storedMsg string
+	var retries, maxRetries int
+	if err := st.db.QueryRowContext(ctx, "SELECT status, error_msg, retries, max_retries FROM sync_queue WHERE id = ?", opID).Scan(&status, &storedMsg, &retries, &maxRetries); err != nil {
+		t.Fatalf("query sync_queue row failed: %v", err)
+	}
+	if status != "FAILED" {
+		t.Errorf("expected status FAILED, got %q", status)
+	}
+	if storedMsg != errMsg {
+		t.Errorf("expected error_msg %q, got %q", errMsg, storedMsg)
+	}
+	if retries != maxRetries {
+		t.Errorf("expected retries == max_retries (%d), got %d", maxRetries, retries)
+	}
+}
+
 func TestRequeueRateLimited(t *testing.T) {
 	t.Parallel()
 
@@ -874,6 +938,10 @@ func TestSQLiteStore_Indexes(t *testing.T) {
 	}
 }
 
+func latestMigrationVersion() int {
+	return migrations[len(migrations)-1].version
+}
+
 func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("sqlite", buildDSN(":memory:"))
@@ -904,8 +972,8 @@ func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil {
 		t.Fatalf("failed to scan version: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("expected schema version 3 after upgrade, got %d", version)
+	if want := latestMigrationVersion(); version != want {
+		t.Errorf("expected schema version %d after upgrade, got %d", want, version)
 	}
 
 	// Check that indexes from migration 3 are now present
@@ -970,15 +1038,113 @@ func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSchemaInfo failed: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("expected version 3, got %d", version)
+	if want := latestMigrationVersion(); version != want {
+		t.Errorf("expected version %d, got %d", want, version)
 	}
 	if tableCount < 7 {
 		t.Errorf("expected at least 7 tables, got %d", tableCount)
 	}
 }
 
+// TestSQLiteStore_Migrations4And5_DropStaleCacheRows verifies that upgrading
+// from v3 removes status cache rows keyed by bare status name (which collided
+// across lists, migration 4) and the unused task → list rows (migration 5),
+// while leaving other cache entities intact.
+func TestSQLiteStore_Migrations4And5_DropStaleCacheRows(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", buildDSN(":memory:"))
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	defer db.Close()
 
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL); INSERT INTO schema_version (version) VALUES (3);`); err != nil {
+		t.Fatalf("failed to setup schema_version: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version <= 3 {
+			if _, err := db.Exec(m.sql); err != nil {
+				t.Fatalf("migration %d failed: %v", m.version, err)
+			}
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO clickup_cache (entity_type, entity_id, parent_id, name, status_type, fetched_at) VALUES
+		('status', 'complete', 'list-a', 'complete', 'done', CURRENT_TIMESTAMP),
+		('task', 'task-1', 'list-a', 'Task 1', NULL, CURRENT_TIMESTAMP),
+		('list', 'list-a', 'folder-a', 'List A', NULL, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("failed to seed cache: %v", err)
+	}
 
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations failed on upgrade: %v", err)
+	}
 
+	var statusRows, taskRows int
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'status'`).Scan(&statusRows); err != nil {
+		t.Fatalf("failed to count status rows: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'task'`).Scan(&taskRows); err != nil {
+		t.Fatalf("failed to count task rows: %v", err)
+	}
+	if statusRows != 0 {
+		t.Errorf("expected name-keyed status rows to be dropped, found %d", statusRows)
+	}
+	if taskRows != 0 {
+		t.Errorf("expected task cache rows to be dropped, found %d", taskRows)
+	}
+	var listRows int
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'list'`).Scan(&listRows); err != nil {
+		t.Fatalf("failed to count list rows: %v", err)
+	}
+	if listRows != 1 {
+		t.Errorf("expected the list cache row to survive, found %d", listRows)
+	}
+}
 
+func TestReplaceListStatuses(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	status := func(listID, name, typ string, order int) *CacheEntry {
+		return &CacheEntry{EntityType: "status", EntityID: listID + "/" + name, ParentID: listID, Name: name, StatusType: typ, OrderIndex: order, FetchedAt: time.Now()}
+	}
+
+	if err := st.ReplaceListStatuses(ctx, "list-1", []*CacheEntry{status("list-1", "to do", "open", 0), status("list-1", "complete", "closed", 1)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+	if err := st.ReplaceListStatuses(ctx, "list-2", []*CacheEntry{status("list-2", "to do", "open", 0)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+
+	// Renaming "complete" drops the old row; list-2 is untouched.
+	if err := st.ReplaceListStatuses(ctx, "list-1", []*CacheEntry{status("list-1", "to do", "open", 0), status("list-1", "shipped", "closed", 1)}); err != nil {
+		t.Fatalf("ReplaceListStatuses failed: %v", err)
+	}
+	got, err := st.GetListStatuses(ctx, "list-1")
+	if err != nil {
+		t.Fatalf("GetListStatuses failed: %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "to do" || got[1].Name != "shipped" {
+		t.Fatalf("expected [to do, shipped], got %+v", got)
+	}
+	if other, _ := st.GetListStatuses(ctx, "list-2"); len(other) != 1 {
+		t.Fatalf("expected list-2 to keep its 1 status, got %d", len(other))
+	}
+
+	// A failed replace must leave the previous set intact.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := st.ReplaceListStatuses(cancelled, "list-1", []*CacheEntry{status("list-1", "only", "open", 0)}); err == nil {
+		t.Fatal("expected an error with a cancelled context")
+	}
+	got, _ = st.GetListStatuses(ctx, "list-1")
+	if len(got) != 2 {
+		t.Fatalf("expected the previous 2 statuses after a failed replace, got %d", len(got))
+	}
+}

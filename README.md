@@ -36,6 +36,12 @@ Taskflow stores its configuration at `~/.taskflow/config.toml` (auto-created wit
 [clickup]
 api_key = "pk_your_clickup_api_key"
 
+# Optional — see "Status mapping" below
+[clickup.status_map]
+# start = "in progress"
+# complete = "complete"
+# archive = "cancelled"
+
 [git]
 auto_context = true
 
@@ -53,6 +59,19 @@ path = "~/.taskflow/sessions.db"
 > ```bash
 > export CLICKUP_API_KEY="pk_your_clickup_api_key"
 > ```
+
+#### Status mapping
+
+Taskflow moves your ClickUp task through lifecycle *roles*, not hardcoded status names, so it works with any list's statuses:
+
+| Role | When | Default status on the task's list |
+|---|---|---|
+| `start` | Session started or resumed | The `custom` status named like "in progress" (preferred), "doing", or "wip", matched by whole word; else the first `custom` status that isn't pre-work ("ready", "backlog", "to do") or a review, QA, or blocked stage |
+| `reopen` | New session on a task whose last session was completed or archived | Same as `start` |
+| `complete` | Session stopped as completed | First `done` status (e.g. "complete"), else first `closed` |
+| `archive` | Active/paused session archived (abandoned) | First `closed` status named like a cancellation ("cancelled", "won't do", "duplicate"); otherwise unchanged, so abandoned work is never shown as complete |
+
+Taskflow checks the task's live status first and never moves it back from a status someone else chose: `start` only moves a task that is still `open`, so a task that's in review or done stays put, and `complete`/`archive` leave tasks that are already `done` or `closed`. `reopen` may also move a `done`/`closed` task back to work, since you're starting a new session on work you'd finished. Pausing and archiving an already-completed session leave the task's status alone. To pin a role to a specific status, set it under `[clickup.status_map]` (matched case-insensitively; `reopen` uses `start`'s entry; a name missing from the list is re-checked against ClickUp once, then falls back to the default).
 
 ### 3. Initialize Workspace & Cache
 

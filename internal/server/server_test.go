@@ -28,7 +28,7 @@ func TestMCPServer_Handlers(t *testing.T) {
 		},
 	}
 
-	srv := New(st, cfg)
+	srv := New(st, cfg, nil)
 	ctx := context.Background()
 
 	// 1. Test tf_start handler
@@ -127,7 +127,7 @@ func TestServer_RunReader_ContextCancellation(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, &config.Config{})
+	srv := New(st, &config.Config{}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 

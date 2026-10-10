@@ -107,6 +107,22 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_session_id ON checkpoints(session_id)
 CREATE INDEX IF NOT EXISTS idx_snags_session_id ON snags(session_id);
 `,
 	},
+	{
+		version: 4,
+		// Status cache rows are now keyed "<list_id>/<status name>". Rows keyed by
+		// bare name collided across lists; drop them and let the cache repopulate.
+		sql: `
+DELETE FROM clickup_cache WHERE entity_type = 'status';
+`,
+	},
+	{
+		version: 5,
+		// The task → list cache is gone: status roles fetch the task live to
+		// check its current status, which also gives its list.
+		sql: `
+DELETE FROM clickup_cache WHERE entity_type = 'task';
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {
@@ -170,4 +186,3 @@ func runMigrations(db *sql.DB) error {
 
 	return nil
 }
-

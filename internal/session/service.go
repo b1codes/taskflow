@@ -17,6 +17,9 @@ type ClickUpTaskInfo struct {
 	Name        string
 	Description string
 	ListID      string
+	// StatusType is the type of the task's current status: open, custom,
+	// done, or closed.
+	StatusType string
 }
 
 type ClickUpStatusInfo struct {
@@ -138,6 +141,40 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 	}
 }
 
+// enqueueStatus queues a ClickUp status change for a lifecycle role (start,
+// reopen, complete, archive). The sync worker maps the role onto a status of
+// the task's list, so no status names or types are decided here.
+func (s *Service) enqueueStatus(ctx context.Context, taskID string, role StatusRole) {
+	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
+		Role StatusRole `json:"role"`
+	}{Role: role})
+}
+
+// stopStatusRole returns the ClickUp status role for a Stop transition, or ""
+// when the task's ClickUp status should be left alone. No-op transitions
+// (from == to) and pausing never change the task's status: pausing leaves the
+// task wherever it is in ClickUp (including any manual move a teammate made
+// during the session), and only Service.Start sends RoleStart/RoleReopen.
+func stopStatusRole(from, to Status) StatusRole {
+	if from == to {
+		return ""
+	}
+	switch to {
+	case StatusActive, StatusPaused:
+		return ""
+	case StatusCompleted:
+		return RoleComplete
+	case StatusArchived:
+		// Archiving an already-completed session only tidies local history;
+		// it must not move a finished task to the list's closed status.
+		if from == StatusCompleted {
+			return ""
+		}
+		return RoleArchive
+	}
+	return ""
+}
+
 func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit bool) (*StartResult, error) {
 	// 1. Advisory lock check
 	lockInfo, err := ReadLockInfo(projectPath)
@@ -158,6 +195,12 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	// 2. ClickUp validation
 	taskName := "Local Task"
 	taskDesc := ""
+	// Starting work on a finished task is a reopen: unlike start, it may move
+	// the task out of a done/closed ClickUp status. Whether it is finished is
+	// read from ClickUp, since this DB may not know the task's history (a new
+	// machine, or a task someone else closed); without a client, a finished
+	// local session for the task stands in for it.
+	role := RoleStart
 	if s.clickup != nil {
 		taskInfo, err := s.clickup.GetTask(ctx, taskID)
 		if err != nil {
@@ -165,6 +208,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		}
 		taskName = taskInfo.Name
 		taskDesc = taskInfo.Description
+		if taskInfo.StatusType == "done" || taskInfo.StatusType == "closed" {
+			role = RoleReopen
+		}
 	}
 
 	// 3. Check for existing session
@@ -201,6 +247,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 			}
 		} else {
 			// Completed or Archived -> new session
+			if s.clickup == nil {
+				role = RoleReopen
+			}
 			sessionID = uuid.New().String()
 			sess = &Session{
 				ID:          sessionID,
@@ -251,9 +300,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		fmt.Fprintf(os.Stderr, "[session] warning: failed to write session lock in %s: %v\n", projectPath, err)
 	}
 
-	s.enqueueSync(ctx, sess.TaskID, "UPDATE_STATUS", struct {
-		StatusType string `json:"status_type"`
-	}{StatusType: "active"})
+	s.enqueueStatus(ctx, sess.TaskID, role)
 
 	// 6. Build contract
 	contract, err := s.BuildAgenticContract(ctx, sess, gitCtx, isResumed)
@@ -528,6 +575,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		}
 	}
 
+	fromStatus := sess.Status
 	if err := s.store.UpdateSessionStatus(ctx, sessionID, tStatus); err != nil {
 		return fmt.Errorf("failed to update session status: %w", err)
 	}
@@ -537,13 +585,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	// 1. Enqueue status update
-	statusType := "closed"
-	if tStatus == StatusPaused {
-		statusType = "active"
+	if role := stopStatusRole(fromStatus, tStatus); role != "" {
+		s.enqueueStatus(ctx, sess.TaskID, role)
 	}
-	s.enqueueSync(ctx, sess.TaskID, "UPDATE_STATUS", struct {
-		StatusType string `json:"status_type"`
-	}{StatusType: statusType})
 
 	// 2. Enqueue session summary comment
 	dbCheckpoints, _ := s.store.ListCheckpoints(ctx, sessionID, 0)

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	gosync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -594,116 +596,274 @@ func TestWorker_RateLimit429_DoesNotConsumeRetry(t *testing.T) {
 	}
 }
 
-func TestWorker_UpdateStatus_Success(t *testing.T) {
-	t.Parallel()
+// workerTestStatuses mirrors a real ClickUp list. ClickUp status types are
+// only open/custom/done/closed.
+const workerTestStatuses = `[
+	{"status": "to do", "type": "open", "orderindex": 0},
+	{"status": "in progress", "type": "custom", "orderindex": 1},
+	{"status": "in review", "type": "custom", "orderindex": 2},
+	{"status": "testing/qa", "type": "custom", "orderindex": 3},
+	{"status": "complete", "type": "done", "orderindex": 4},
+	{"status": "cancelled", "type": "closed", "orderindex": 5}
+]`
 
-	st, err := store.New(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer st.Close()
-
+// enqueueStatusOp creates the parent session and queues an UPDATE_STATUS op.
+func enqueueStatusOp(t *testing.T, st store.Store, taskID string, payload SyncPayload, maxRetries int) {
+	t.Helper()
 	ctx := context.Background()
-
-	parentSess := &session.Session{
-		ID:          "sess-status-success",
-		TaskID:      "task-status-success",
+	sess := &session.Session{
+		ID:          "sess-" + taskID,
+		TaskID:      taskID,
 		ProjectPath: "/tmp",
 		Status:      session.StatusActive,
 		StartedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
-	if err := st.CreateSession(ctx, parentSess); err != nil {
+	if err := st.CreateSession(ctx, sess); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-
-	payloadBytes, _ := json.Marshal(SyncPayload{StatusType: "closed"})
+	payloadBytes, _ := json.Marshal(payload)
 	op := session.SyncOp{
 		Operation:  "UPDATE_STATUS",
-		TaskID:     "task-status-success",
+		TaskID:     taskID,
 		Payload:    string(payloadBytes),
-		MaxRetries: 5,
+		MaxRetries: maxRetries,
 		CreatedAt:  time.Now(),
 	}
 	if err := st.EnqueueSync(ctx, op); err != nil {
 		t.Fatalf("EnqueueSync failed: %v", err)
 	}
+}
 
-	var statusUpdated atomic.Int32
+// newStatusUpdateServer serves one task, currently in the given status JSON
+// (e.g. {"status": "to do", "type": "open"}), on a list with the given
+// statuses, and records the status name of every PUT /task/{id}. getTaskCalls
+// counts task fetches and may be nil.
+func newStatusUpdateServer(t *testing.T, taskID, taskStatusJSON, statusesJSON string, getTaskCalls *atomic.Int32) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu gosync.Mutex
+	var updates []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method == "GET" && r.URL.Path == "/task/task-status-success" {
-			_, _ = w.Write([]byte(`{
-				"id": "task-status-success",
-				"name": "Status Task",
-				"list": {"id": "list-succ", "name": "Success List"}
-			}`))
-			return
-		}
-		if r.Method == "GET" && r.URL.Path == "/list/list-succ" {
-			_, _ = w.Write([]byte(`{
-				"id": "list-succ",
-				"name": "Success List",
-				"statuses": [
-					{"status": "Open", "type": "open", "orderindex": 0},
-					{"status": "Closed", "type": "closed", "orderindex": 1}
-				]
-			}`))
-			return
-		}
-		if r.Method == "PUT" && r.URL.Path == "/task/task-status-success" {
-			statusUpdated.Add(1)
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/task/"+taskID:
+			if getTaskCalls != nil {
+				getTaskCalls.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"id": "` + taskID + `", "name": "Status Task", "status": ` + taskStatusJSON + `, "list": {"id": "list-` + taskID + `"}}`))
+		case r.Method == "GET" && r.URL.Path == "/list/list-"+taskID:
+			_, _ = w.Write([]byte(`{"id": "list-` + taskID + `", "statuses": ` + statusesJSON + `}`))
+		case r.Method == "PUT" && r.URL.Path == "/task/"+taskID:
+			var body struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			updates = append(updates, body.Status)
+			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
-			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusNotFound)
 	}))
-	defer server.Close()
-
-	client := clickup.New("my-key").WithBaseURL(server.URL)
-	syncCfg := &config.SyncConfig{
-		MaxRetries:  5,
-		RateLimitMS: 1,
-	}
-
-	worker := NewWorker(st, client, syncCfg)
-	count, err := worker.DrainOnce(ctx)
-	if err != nil {
-		t.Fatalf("DrainOnce failed: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("expected 1 op processed, got %d", count)
-	}
-	if statusUpdated.Load() != 1 {
-		t.Errorf("expected status to be updated in ClickUp, got %d calls", statusUpdated.Load())
+	t.Cleanup(server.Close)
+	return server, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), updates...)
 	}
 }
 
-func TestWorker_UpdateStatus_NoMatchingStatus_LogsFailure(t *testing.T) {
+const openTaskStatus = `{"status": "to do", "type": "open"}`
+
+func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		payload   SyncPayload
+		statusMap config.StatusMapConfig
+		// sessionStatus is the task's latest local session status; empty
+		// leaves it ACTIVE.
+		sessionStatus session.Status
+		want          string
+	}{
+		{"start", SyncPayload{Role: "start"}, config.StatusMapConfig{}, "", "in progress"},
+		{"complete", SyncPayload{Role: "complete"}, config.StatusMapConfig{}, "", "complete"},
+		{"archive", SyncPayload{Role: "archive"}, config.StatusMapConfig{}, "", "cancelled"},
+		{"legacy active payload maps to start", SyncPayload{StatusType: "active"}, config.StatusMapConfig{}, "", "in progress"},
+		// The old Stop sent "closed" for both completing and archiving; the
+		// task's latest session tells which.
+		{"legacy closed payload from a completed session maps to complete", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, session.StatusCompleted, "complete"},
+		{"legacy closed payload from an archived session maps to archive", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, session.StatusArchived, "cancelled"},
+		{"status_map override", SyncPayload{Role: "start"}, config.StatusMapConfig{Start: "testing/qa"}, "", "testing/qa"},
+		{"status_map reopen override", SyncPayload{Role: "reopen"}, config.StatusMapConfig{Start: "in progress", Reopen: "testing/qa"}, "", "testing/qa"},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := store.New(":memory:")
+			if err != nil {
+				t.Fatalf("failed to create store: %v", err)
+			}
+			defer st.Close()
+
+			taskID := fmt.Sprintf("task-role-%d", i)
+			enqueueStatusOp(t, st, taskID, tt.payload, 5)
+			if tt.sessionStatus != "" {
+				if err := st.UpdateSessionStatus(context.Background(), "sess-"+taskID, tt.sessionStatus); err != nil {
+					t.Fatalf("UpdateSessionStatus failed: %v", err)
+				}
+			}
+			server, updates := newStatusUpdateServer(t, taskID, openTaskStatus, workerTestStatuses, nil)
+
+			client := clickup.New("my-key").WithBaseURL(server.URL)
+			worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 5, RateLimitMS: 1}).WithStatusMap(tt.statusMap)
+
+			count, err := worker.DrainOnce(context.Background())
+			if err != nil {
+				t.Fatalf("DrainOnce failed: %v", err)
+			}
+			if count != 1 {
+				t.Errorf("expected 1 op processed, got %d", count)
+			}
+			if got := updates(); len(got) != 1 || got[0] != tt.want {
+				t.Errorf("expected one status update to %q, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+// TestWorker_UpdateStatus_TaskPastRole_LeavesTaskUnchanged covers re-archiving
+// a completed session: the task is already done, so archive must not move it
+// to "cancelled", and the skipped op must not be retried.
+func TestWorker_UpdateStatus_TaskPastRole_LeavesTaskUnchanged(t *testing.T) {
+	t.Parallel()
 	st, err := store.New(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
-
 	ctx := context.Background()
 
-	parentSess := &session.Session{
-		ID:          "sess-status-nomatch",
-		TaskID:      "task-status-nomatch",
+	enqueueStatusOp(t, st, "task-done", SyncPayload{Role: "archive"}, 5)
+	server, updates := newStatusUpdateServer(t, "task-done", `{"status": "complete", "type": "done"}`, workerTestStatuses, nil)
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 5, RateLimitMS: 1})
+
+	count, err := worker.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("DrainOnce failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected skipped op to count as processed, got %d", count)
+	}
+	if got := updates(); len(got) != 0 {
+		t.Errorf("expected no status update, got %v", got)
+	}
+
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if ops, _ := st.ListRetryable(ctx); len(ops) != 0 {
+		t.Errorf("expected skipped op not to be retried, got %d retryable ops", len(ops))
+	}
+}
+
+// TestWorker_UpdateStatus_PermanentFailures checks that errors which would
+// recur on every attempt fail the op at once instead of consuming max_retries.
+func TestWorker_UpdateStatus_PermanentFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		payload  SyncPayload
+		statuses string
+	}{
+		{
+			name:     "no matching status",
+			payload:  SyncPayload{Role: "complete"},
+			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "doing", "type": "custom", "orderindex": 1}]`,
+		},
+		{
+			name:     "unknown role",
+			payload:  SyncPayload{Role: "review"},
+			statuses: workerTestStatuses,
+		},
+		{
+			name:     "unmapped legacy status type",
+			payload:  SyncPayload{StatusType: "unsupported_type"},
+			statuses: workerTestStatuses,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := store.New(":memory:")
+			if err != nil {
+				t.Fatalf("failed to create store: %v", err)
+			}
+			defer st.Close()
+			ctx := context.Background()
+
+			taskID := fmt.Sprintf("task-fail-%d", i)
+			enqueueStatusOp(t, st, taskID, tt.payload, 3)
+			var getTaskCalls atomic.Int32
+			server, updates := newStatusUpdateServer(t, taskID, openTaskStatus, tt.statuses, &getTaskCalls)
+
+			client := clickup.New("my-key").WithBaseURL(server.URL)
+			worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
+
+			if count, _ := worker.DrainOnce(ctx); count != 0 {
+				t.Errorf("expected 0 ops successfully processed, got %d", count)
+			}
+			callsAfterFirstDrain := getTaskCalls.Load()
+
+			st.SetRetryBackoffBase(1 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
+			if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
+				t.Fatalf("expected no retryable ops, got %d (err: %v)", len(ops), err)
+			}
+
+			_, _ = worker.DrainOnce(ctx)
+			if got := getTaskCalls.Load(); got != callsAfterFirstDrain {
+				t.Errorf("expected the failed op not to be attempted again, task fetches went %d -> %d", callsAfterFirstDrain, got)
+			}
+			if got := updates(); len(got) != 0 {
+				t.Errorf("expected no status update, got %v", got)
+			}
+		})
+	}
+}
+
+// TestWorker_BadRequest_FailsPermanently checks that a 400 from ClickUp fails
+// the op at once: the request itself is rejected, so retrying can't help.
+func TestWorker_BadRequest_FailsPermanently(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	sess := &session.Session{
+		ID:          "sess-bad-request",
+		TaskID:      "task-bad-request",
 		ProjectPath: "/tmp",
 		Status:      session.StatusActive,
 		StartedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
-	if err := st.CreateSession(ctx, parentSess); err != nil {
+	if err := st.CreateSession(ctx, sess); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-
-	payloadBytes, _ := json.Marshal(SyncPayload{StatusType: "unsupported_type"})
+	payloadBytes, _ := json.Marshal(SyncPayload{CommentText: "rejected"})
 	op := session.SyncOp{
-		Operation:  "UPDATE_STATUS",
-		TaskID:     "task-status-nomatch",
+		Operation:  "POST_COMMENT",
+		TaskID:     "task-bad-request",
 		Payload:    string(payloadBytes),
 		MaxRetries: 3,
 		CreatedAt:  time.Now(),
@@ -712,82 +872,65 @@ func TestWorker_UpdateStatus_NoMatchingStatus_LogsFailure(t *testing.T) {
 		t.Fatalf("EnqueueSync failed: %v", err)
 	}
 
+	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == "GET" && r.URL.Path == "/task/task-status-nomatch" {
-			_, _ = w.Write([]byte(`{
-				"id": "task-status-nomatch",
-				"name": "Status Task",
-				"list": {"id": "list-nomatch", "name": "List"}
-			}`))
-			return
-		}
-		if r.Method == "GET" && r.URL.Path == "/list/list-nomatch" {
-			_, _ = w.Write([]byte(`{
-				"id": "list-nomatch",
-				"name": "List",
-				"statuses": [
-					{"status": "Open", "type": "open", "orderindex": 0},
-					{"status": "Closed", "type": "closed", "orderindex": 1}
-				]
-			}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"err": "invalid comment"}`))
 	}))
 	defer server.Close()
 
 	client := clickup.New("my-key").WithBaseURL(server.URL)
-	syncCfg := &config.SyncConfig{
-		MaxRetries:  3,
-		RateLimitMS: 1,
-	}
+	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, pipeErr := os.Pipe()
-	if pipeErr != nil {
-		t.Fatalf("failed to create pipe: %v", pipeErr)
-	}
-	os.Stderr = w
-
-	worker := NewWorker(st, client, syncCfg)
-	count, _ := worker.DrainOnce(ctx)
-
-	// Restore stderr
-	w.Close()
-	os.Stderr = oldStderr
-
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	stderrOutput := buf.String()
-
-	if count != 0 {
+	if count, _ := worker.DrainOnce(ctx); count != 0 {
 		t.Errorf("expected 0 ops successfully processed, got %d", count)
 	}
 
-	if !strings.Contains(stderrOutput, "failed") || !strings.Contains(stderrOutput, "no matching status found") {
-		t.Errorf("expected stderr to contain failure log with 'no matching status found', got: %q", stderrOutput)
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
+		t.Fatalf("expected no retryable ops, got %d (err: %v)", len(ops), err)
 	}
 
-	// Verify the op was marked FAILED in the store with the error message
+	_, _ = worker.DrainOnce(ctx)
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("expected exactly 1 attempt, got %d", got)
+	}
+}
+
+// TestWorker_LookupBadRequest_IsRetried checks that a 400 from a lookup made
+// while applying a status role (here, fetching the task) consumes a retry
+// instead of failing the op: only a 400 to the op's own write is permanent.
+func TestWorker_LookupBadRequest_IsRetried(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	enqueueStatusOp(t, st, "task-lookup-400", SyncPayload{Role: "start"}, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"err": "transient"}`))
+	}))
+	defer server.Close()
+
+	client := clickup.New("my-key").WithBaseURL(server.URL)
+	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
+	if count, _ := worker.DrainOnce(ctx); count != 0 {
+		t.Errorf("expected 0 ops successfully processed, got %d", count)
+	}
+
 	st.SetRetryBackoffBase(1 * time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 	ops, err := st.ListRetryable(ctx)
 	if err != nil {
 		t.Fatalf("ListRetryable failed: %v", err)
 	}
-	if len(ops) != 1 {
-		t.Fatalf("expected 1 retryable failed op, got %d", len(ops))
-	}
-	if !strings.Contains(ops[0].ErrorMsg, "no matching status found") {
-		t.Errorf("expected op ErrorMsg to describe missing status, got: %q", ops[0].ErrorMsg)
+	if len(ops) != 1 || ops[0].Retries != 1 {
+		t.Fatalf("expected the op to be retryable after one attempt, got %+v", ops)
 	}
 }
-
-
-
-
-
-
-

@@ -543,11 +543,32 @@ func (s *SQLiteStore) ClearCache(ctx context.Context) error {
 	return nil
 }
 
-func (s *SQLiteStore) DeleteCacheEntries(ctx context.Context, entityType, parentID string) error {
-	query := `DELETE FROM clickup_cache WHERE entity_type = ? AND parent_id = ?`
-	_, err := s.db.ExecContext(ctx, query, entityType, parentID)
+func (s *SQLiteStore) ReplaceListStatuses(ctx context.Context, listID string, entries []*CacheEntry) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to delete cache entries: %w", err)
+		return fmt.Errorf("failed to begin status replace: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM clickup_cache WHERE entity_type = 'status' AND parent_id = ?`, listID); err != nil {
+		return fmt.Errorf("failed to clear cached statuses for list %s: %w", listID, err)
+	}
+	query := `INSERT INTO clickup_cache (entity_type, entity_id, parent_id, name, status_type, order_index, extra, fetched_at)
+	VALUES ('status', ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+		parent_id = excluded.parent_id,
+		name = excluded.name,
+		status_type = excluded.status_type,
+		order_index = excluded.order_index,
+		extra = excluded.extra,
+		fetched_at = excluded.fetched_at`
+	for _, e := range entries {
+		if _, err := tx.ExecContext(ctx, query, e.EntityID, listID, e.Name, e.StatusType, e.OrderIndex, e.Extra, e.FetchedAt); err != nil {
+			return fmt.Errorf("failed to cache status %q for list %s: %w", e.Name, listID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit status replace for list %s: %w", listID, err)
 	}
 	return nil
 }
@@ -627,6 +648,15 @@ func (s *SQLiteStore) MarkFailed(ctx context.Context, id int64, errMsg string) e
 	_, err = s.db.ExecContext(ctx, query, status, newRetries, errMsg, time.Now(), id)
 	if err != nil {
 		return fmt.Errorf("failed to mark sync item failed: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) MarkFailedPermanent(ctx context.Context, id int64, errMsg string) error {
+	query := `UPDATE sync_queue SET status = 'FAILED', retries = max_retries, error_msg = ?, last_attempted_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, errMsg, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to mark sync item permanently failed: %w", err)
 	}
 	return nil
 }

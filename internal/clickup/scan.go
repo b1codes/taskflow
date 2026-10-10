@@ -89,19 +89,8 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 				result.StatusesCount += len(details.Statuses)
 				delay()
 
-				for _, stItem := range details.Statuses {
-					err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
-						EntityType: "status",
-						EntityID:   stItem.Status,
-						ParentID:   l.ID,
-						Name:       stItem.Status,
-						StatusType: stItem.Type,
-						OrderIndex: stItem.OrderIndex,
-						FetchedAt:  time.Now(),
-					})
-					if err != nil {
-						return nil, err
-					}
+				if err := st.ReplaceListStatuses(ctx, l.ID, statusEntries(l.ID, details.Statuses)); err != nil {
+					return nil, err
 				}
 			}
 
@@ -150,19 +139,8 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 					result.StatusesCount += len(details.Statuses)
 					delay()
 
-					for _, stItem := range details.Statuses {
-						err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
-							EntityType: "status",
-							EntityID:   stItem.Status,
-							ParentID:   l.ID,
-							Name:       stItem.Status,
-							StatusType: stItem.Type,
-							OrderIndex: stItem.OrderIndex,
-							FetchedAt:  time.Now(),
-						})
-						if err != nil {
-							return nil, err
-						}
+					if err := st.ReplaceListStatuses(ctx, l.ID, statusEntries(l.ID, details.Statuses)); err != nil {
+						return nil, err
 					}
 				}
 			}
