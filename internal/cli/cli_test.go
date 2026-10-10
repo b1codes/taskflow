@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/b1codes/taskflow/internal/config"
 	"github.com/b1codes/taskflow/internal/session"
+	"github.com/b1codes/taskflow/internal/store"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -88,7 +90,7 @@ func runCLI(t *testing.T, args []string) (string, error) {
 }
 
 func TestCLI_Init(t *testing.T) {
-	setupTestEnv(t)
+	tempHome := setupTestEnv(t)
 
 	out, err := runCLI(t, []string{"init"})
 	if err != nil {
@@ -97,8 +99,18 @@ func TestCLI_Init(t *testing.T) {
 	if !strings.Contains(out, "Database initialized at") {
 		t.Errorf("expected 'Database initialized at' in output, got: %s", out)
 	}
-	if !strings.Contains(out, "Schema version: 3") {
-		t.Errorf("expected 'Schema version: 3' in output, got: %s", out)
+
+	st, err := store.New(filepath.Join(tempHome, ".taskflow", "sessions.db"))
+	if err != nil {
+		t.Fatalf("failed to open initialized store: %v", err)
+	}
+	defer st.Close()
+	version, _, err := st.GetSchemaInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetSchemaInfo failed: %v", err)
+	}
+	if want := fmt.Sprintf("Schema version: %d", version); !strings.Contains(out, want) {
+		t.Errorf("expected %q in output, got: %s", want, out)
 	}
 }
 

@@ -8,6 +8,14 @@ import (
 	"github.com/b1codes/taskflow/internal/store"
 )
 
+// statusCacheID scopes a status's cache key to its list. Status names like
+// "to do" or "complete" repeat across lists, and clickup_cache is unique on
+// (entity_type, entity_id), so an unscoped name lets one list's refresh steal
+// another list's rows.
+func statusCacheID(listID, statusName string) string {
+	return listID + "/" + statusName
+}
+
 func ResolveStatus(ctx context.Context, st store.Store, client *Client, taskID string, targetType string) (string, error) {
 	var listID string
 
@@ -72,7 +80,7 @@ func ResolveStatus(ctx context.Context, st store.Store, client *Client, taskID s
 			for _, stItem := range details.Statuses {
 				err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
 					EntityType: "status",
-					EntityID:   stItem.Status,
+					EntityID:   statusCacheID(listID, stItem.Status),
 					ParentID:   listID,
 					Name:       stItem.Status,
 					StatusType: stItem.Type,
@@ -92,7 +100,7 @@ func ResolveStatus(ctx context.Context, st store.Store, client *Client, taskID s
 			for _, stItem := range details.Statuses {
 				statuses = append(statuses, &store.CacheEntry{
 					EntityType: "status",
-					EntityID:   stItem.Status,
+					EntityID:   statusCacheID(listID, stItem.Status),
 					ParentID:   listID,
 					Name:       stItem.Status,
 					StatusType: stItem.Type,

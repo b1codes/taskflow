@@ -874,6 +874,10 @@ func TestSQLiteStore_Indexes(t *testing.T) {
 	}
 }
 
+func latestMigrationVersion() int {
+	return migrations[len(migrations)-1].version
+}
+
 func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("sqlite", buildDSN(":memory:"))
@@ -904,8 +908,8 @@ func TestSQLiteStore_MigrationUpgrade(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil {
 		t.Fatalf("failed to scan version: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("expected schema version 3 after upgrade, got %d", version)
+	if want := latestMigrationVersion(); version != want {
+		t.Errorf("expected schema version %d after upgrade, got %d", want, version)
 	}
 
 	// Check that indexes from migration 3 are now present
@@ -970,8 +974,8 @@ func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSchemaInfo failed: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("expected version 3, got %d", version)
+	if want := latestMigrationVersion(); version != want {
+		t.Errorf("expected version %d, got %d", want, version)
 	}
 	if tableCount < 7 {
 		t.Errorf("expected at least 7 tables, got %d", tableCount)
@@ -982,3 +986,49 @@ func TestSQLiteStore_ConcurrentMigrations(t *testing.T) {
 
 
 
+
+// TestSQLiteStore_Migration4_DropsNameKeyedStatusCache verifies that upgrading
+// from v3 removes status cache rows keyed by bare status name (which collided
+// across lists) while leaving other cache entities intact.
+func TestSQLiteStore_Migration4_DropsNameKeyedStatusCache(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", buildDSN(":memory:"))
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL); INSERT INTO schema_version (version) VALUES (3);`); err != nil {
+		t.Fatalf("failed to setup schema_version: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version <= 3 {
+			if _, err := db.Exec(m.sql); err != nil {
+				t.Fatalf("migration %d failed: %v", m.version, err)
+			}
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO clickup_cache (entity_type, entity_id, parent_id, name, status_type, fetched_at) VALUES
+		('status', 'complete', 'list-a', 'complete', 'done', CURRENT_TIMESTAMP),
+		('task', 'task-1', 'list-a', 'Task 1', NULL, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("failed to seed cache: %v", err)
+	}
+
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations failed on upgrade: %v", err)
+	}
+
+	var statusRows, taskRows int
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'status'`).Scan(&statusRows); err != nil {
+		t.Fatalf("failed to count status rows: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM clickup_cache WHERE entity_type = 'task'`).Scan(&taskRows); err != nil {
+		t.Fatalf("failed to count task rows: %v", err)
+	}
+	if statusRows != 0 {
+		t.Errorf("expected name-keyed status rows to be dropped, found %d", statusRows)
+	}
+	if taskRows != 1 {
+		t.Errorf("expected task cache row to survive, found %d", taskRows)
+	}
+}

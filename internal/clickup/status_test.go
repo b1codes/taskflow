@@ -216,3 +216,65 @@ func TestResolveStatus_StaleTaskCache(t *testing.T) {
 	}
 }
 
+// TestResolveStatus_SharedStatusNamesAcrossLists guards against status cache
+// rows for one list being overwritten by another list that shares status names.
+func TestResolveStatus_SharedStatusNamesAcrossLists(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/task/task-a":
+			_, _ = w.Write([]byte(`{"id": "task-a", "list": {"id": "list-a"}}`))
+		case "/task/task-b":
+			_, _ = w.Write([]byte(`{"id": "task-b", "list": {"id": "list-b"}}`))
+		case "/list/list-a":
+			_, _ = w.Write([]byte(`{"id": "list-a", "statuses": [
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "complete", "type": "done", "orderindex": 1},
+				{"status": "cancelled", "type": "closed", "orderindex": 2}
+			]}`))
+		case "/list/list-b":
+			_, _ = w.Write([]byte(`{"id": "list-b", "statuses": [
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "complete", "type": "done", "orderindex": 1}
+			]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := New("api-key").WithBaseURL(server.URL)
+
+	for _, taskID := range []string{"task-a", "task-b"} {
+		if _, err := ResolveStatus(ctx, st, client, taskID, "done"); err != nil {
+			t.Fatalf("ResolveStatus(%s) failed: %v", taskID, err)
+		}
+	}
+
+	// list-a's cached statuses must survive list-b's refresh.
+	statusName, err := ResolveStatus(ctx, st, client, "task-a", "done")
+	if err != nil {
+		t.Fatalf("ResolveStatus after other list refresh failed: %v", err)
+	}
+	if statusName != "complete" {
+		t.Errorf("expected 'complete' for list-a, got %q", statusName)
+	}
+
+	cached, err := st.GetListStatuses(ctx, "list-a")
+	if err != nil {
+		t.Fatalf("GetListStatuses failed: %v", err)
+	}
+	if len(cached) != 3 {
+		t.Errorf("expected 3 cached statuses for list-a, got %d", len(cached))
+	}
+}

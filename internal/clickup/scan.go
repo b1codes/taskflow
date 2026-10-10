@@ -89,10 +89,13 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 				result.StatusesCount += len(details.Statuses)
 				delay()
 
+				if err := st.DeleteCacheEntries(ctx, "status", l.ID); err != nil {
+					return nil, err
+				}
 				for _, stItem := range details.Statuses {
 					err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
 						EntityType: "status",
-						EntityID:   stItem.Status,
+						EntityID:   statusCacheID(l.ID, stItem.Status),
 						ParentID:   l.ID,
 						Name:       stItem.Status,
 						StatusType: stItem.Type,
@@ -150,10 +153,13 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 					result.StatusesCount += len(details.Statuses)
 					delay()
 
+					if err := st.DeleteCacheEntries(ctx, "status", l.ID); err != nil {
+						return nil, err
+					}
 					for _, stItem := range details.Statuses {
 						err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
 							EntityType: "status",
-							EntityID:   stItem.Status,
+							EntityID:   statusCacheID(l.ID, stItem.Status),
 							ParentID:   l.ID,
 							Name:       stItem.Status,
 							StatusType: stItem.Type,
