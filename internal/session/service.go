@@ -139,7 +139,7 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 }
 
 // enqueueStatus queues a ClickUp status change for a lifecycle role (start,
-// review, complete, archive). The sync worker maps the role onto a status of
+// complete, archive). The sync worker maps the role onto a status of
 // the task's list, so no status names or types are decided here.
 func (s *Service) enqueueStatus(ctx context.Context, taskID, role string) {
 	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
@@ -148,11 +148,17 @@ func (s *Service) enqueueStatus(ctx context.Context, taskID, role string) {
 }
 
 // stopStatusRole returns the ClickUp status role for a Stop transition, or ""
-// when the task's ClickUp status should be left alone.
+// when the task's ClickUp status should be left alone. No-op transitions
+// (from == to) and pausing never change the task's status: pausing leaves the
+// task wherever it is in ClickUp (including any manual move a teammate made
+// during the session), and only Service.Start sends "start".
 func stopStatusRole(from, to Status) string {
+	if from == to {
+		return ""
+	}
 	switch to {
 	case StatusActive, StatusPaused:
-		return "start"
+		return ""
 	case StatusCompleted:
 		return "complete"
 	case StatusArchived:

@@ -635,9 +635,11 @@ func enqueueStatusOp(t *testing.T, st store.Store, taskID string, payload SyncPa
 	}
 }
 
-// newStatusUpdateServer serves one task on a list with the given statuses and
-// records the status name of every PUT /task/{id}.
-func newStatusUpdateServer(t *testing.T, taskID, statusesJSON string) (*httptest.Server, func() []string) {
+// newStatusUpdateServer serves one task, currently in the given status JSON
+// (e.g. {"status": "to do", "type": "open"}), on a list with the given
+// statuses, and records the status name of every PUT /task/{id}. getTaskCalls
+// counts task fetches and may be nil.
+func newStatusUpdateServer(t *testing.T, taskID, taskStatusJSON, statusesJSON string, getTaskCalls *atomic.Int32) (*httptest.Server, func() []string) {
 	t.Helper()
 	var mu gosync.Mutex
 	var updates []string
@@ -645,7 +647,10 @@ func newStatusUpdateServer(t *testing.T, taskID, statusesJSON string) (*httptest
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/task/"+taskID:
-			_, _ = w.Write([]byte(`{"id": "` + taskID + `", "name": "Status Task", "list": {"id": "list-` + taskID + `"}}`))
+			if getTaskCalls != nil {
+				getTaskCalls.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"id": "` + taskID + `", "name": "Status Task", "status": ` + taskStatusJSON + `, "list": {"id": "list-` + taskID + `"}}`))
 		case r.Method == "GET" && r.URL.Path == "/list/list-"+taskID:
 			_, _ = w.Write([]byte(`{"id": "list-` + taskID + `", "statuses": ` + statusesJSON + `}`))
 		case r.Method == "PUT" && r.URL.Path == "/task/"+taskID:
@@ -669,23 +674,24 @@ func newStatusUpdateServer(t *testing.T, taskID, statusesJSON string) (*httptest
 	}
 }
 
+const openTaskStatus = `{"status": "to do", "type": "open"}`
+
 func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
 		payload   SyncPayload
-		statusMap map[string]string
+		statusMap config.StatusMapConfig
 		want      string
 	}{
-		{"start", SyncPayload{Role: "start"}, nil, "in progress"},
-		{"review", SyncPayload{Role: "review"}, nil, "in review"},
-		{"complete", SyncPayload{Role: "complete"}, nil, "complete"},
-		{"archive", SyncPayload{Role: "archive"}, nil, "cancelled"},
-		{"legacy active payload maps to start", SyncPayload{StatusType: "active"}, nil, "in progress"},
+		{"start", SyncPayload{Role: "start"}, config.StatusMapConfig{}, "in progress"},
+		{"complete", SyncPayload{Role: "complete"}, config.StatusMapConfig{}, "complete"},
+		{"archive", SyncPayload{Role: "archive"}, config.StatusMapConfig{}, "cancelled"},
+		{"legacy active payload maps to start", SyncPayload{StatusType: "active"}, config.StatusMapConfig{}, "in progress"},
 		// Previously resolved to the list's closed status, i.e. "cancelled".
-		{"legacy closed payload maps to complete", SyncPayload{StatusType: "closed"}, nil, "complete"},
-		{"status_map override", SyncPayload{Role: "start"}, map[string]string{"start": "testing/qa"}, "testing/qa"},
+		{"legacy closed payload maps to complete", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, "complete"},
+		{"status_map override", SyncPayload{Role: "start"}, config.StatusMapConfig{Start: "testing/qa"}, "testing/qa"},
 	}
 
 	for i, tt := range tests {
@@ -699,7 +705,7 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 
 			taskID := fmt.Sprintf("task-role-%d", i)
 			enqueueStatusOp(t, st, taskID, tt.payload, 5)
-			server, updates := newStatusUpdateServer(t, taskID, workerTestStatuses)
+			server, updates := newStatusUpdateServer(t, taskID, openTaskStatus, workerTestStatuses, nil)
 
 			client := clickup.New("my-key").WithBaseURL(server.URL)
 			worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 5, RateLimitMS: 1}).WithStatusMap(tt.statusMap)
@@ -718,7 +724,10 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 	}
 }
 
-func TestWorker_UpdateStatus_ReviewWithoutReviewStatus_LeavesTaskUnchanged(t *testing.T) {
+// TestWorker_UpdateStatus_TaskPastRole_LeavesTaskUnchanged covers re-archiving
+// a completed session: the task is already done, so archive must not move it
+// to "cancelled", and the skipped op must not be retried.
+func TestWorker_UpdateStatus_TaskPastRole_LeavesTaskUnchanged(t *testing.T) {
 	t.Parallel()
 	st, err := store.New(":memory:")
 	if err != nil {
@@ -727,12 +736,8 @@ func TestWorker_UpdateStatus_ReviewWithoutReviewStatus_LeavesTaskUnchanged(t *te
 	defer st.Close()
 	ctx := context.Background()
 
-	enqueueStatusOp(t, st, "task-no-review", SyncPayload{Role: "review"}, 5)
-	server, updates := newStatusUpdateServer(t, "task-no-review", `[
-		{"status": "to do", "type": "open", "orderindex": 0},
-		{"status": "doing", "type": "custom", "orderindex": 1},
-		{"status": "done", "type": "done", "orderindex": 2}
-	]`)
+	enqueueStatusOp(t, st, "task-done", SyncPayload{Role: "archive"}, 5)
+	server, updates := newStatusUpdateServer(t, "task-done", `{"status": "complete", "type": "done"}`, workerTestStatuses, nil)
 
 	client := clickup.New("my-key").WithBaseURL(server.URL)
 	worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 5, RateLimitMS: 1})
@@ -755,32 +760,30 @@ func TestWorker_UpdateStatus_ReviewWithoutReviewStatus_LeavesTaskUnchanged(t *te
 	}
 }
 
-func TestWorker_UpdateStatus_Failures(t *testing.T) {
+// TestWorker_UpdateStatus_PermanentFailures checks that errors which would
+// recur on every attempt fail the op at once instead of consuming max_retries.
+func TestWorker_UpdateStatus_PermanentFailures(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name     string
 		payload  SyncPayload
 		statuses string
-		wantErr  string
 	}{
 		{
 			name:     "no matching status",
-			payload:  SyncPayload{Role: "archive"},
-			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "complete", "type": "done", "orderindex": 1}]`,
-			wantErr:  "no matching status found",
+			payload:  SyncPayload{Role: "complete"},
+			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "doing", "type": "custom", "orderindex": 1}]`,
 		},
 		{
 			name:     "unknown role",
-			payload:  SyncPayload{Role: "active"},
+			payload:  SyncPayload{Role: "review"},
 			statuses: workerTestStatuses,
-			wantErr:  "unknown status role",
 		},
 		{
 			name:     "unmapped legacy status type",
 			payload:  SyncPayload{StatusType: "unsupported_type"},
 			statuses: workerTestStatuses,
-			wantErr:  "unknown status role",
 		},
 	}
 
@@ -796,30 +799,29 @@ func TestWorker_UpdateStatus_Failures(t *testing.T) {
 
 			taskID := fmt.Sprintf("task-fail-%d", i)
 			enqueueStatusOp(t, st, taskID, tt.payload, 3)
-			server, updates := newStatusUpdateServer(t, taskID, tt.statuses)
+			var getTaskCalls atomic.Int32
+			server, updates := newStatusUpdateServer(t, taskID, openTaskStatus, tt.statuses, &getTaskCalls)
 
 			client := clickup.New("my-key").WithBaseURL(server.URL)
 			worker := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
 
-			count, _ := worker.DrainOnce(ctx)
-			if count != 0 {
+			if count, _ := worker.DrainOnce(ctx); count != 0 {
 				t.Errorf("expected 0 ops successfully processed, got %d", count)
 			}
-			if got := updates(); len(got) != 0 {
-				t.Errorf("expected no status update, got %v", got)
-			}
+			callsAfterFirstDrain := getTaskCalls.Load()
 
 			st.SetRetryBackoffBase(1 * time.Millisecond)
 			time.Sleep(5 * time.Millisecond)
-			ops, err := st.ListRetryable(ctx)
-			if err != nil {
-				t.Fatalf("ListRetryable failed: %v", err)
+			if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
+				t.Fatalf("expected no retryable ops, got %d (err: %v)", len(ops), err)
 			}
-			if len(ops) != 1 {
-				t.Fatalf("expected 1 retryable failed op, got %d", len(ops))
+
+			_, _ = worker.DrainOnce(ctx)
+			if got := getTaskCalls.Load(); got != callsAfterFirstDrain {
+				t.Errorf("expected the failed op not to be attempted again, task fetches went %d -> %d", callsAfterFirstDrain, got)
 			}
-			if !strings.Contains(ops[0].ErrorMsg, tt.wantErr) {
-				t.Errorf("expected op ErrorMsg to contain %q, got: %q", tt.wantErr, ops[0].ErrorMsg)
+			if got := updates(); len(got) != 0 {
+				t.Errorf("expected no status update, got %v", got)
 			}
 		})
 	}

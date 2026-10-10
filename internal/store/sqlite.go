@@ -631,6 +631,15 @@ func (s *SQLiteStore) MarkFailed(ctx context.Context, id int64, errMsg string) e
 	return nil
 }
 
+func (s *SQLiteStore) MarkFailedPermanent(ctx context.Context, id int64, errMsg string) error {
+	query := `UPDATE sync_queue SET status = 'FAILED', retries = max_retries, error_msg = ?, last_attempted_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, errMsg, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to mark sync item permanently failed: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) CountPendingByTaskID(ctx context.Context, taskID string) (int, error) {
 	query := `SELECT COUNT(*) FROM sync_queue WHERE task_id = ? AND status = 'PENDING'`
 	var count int

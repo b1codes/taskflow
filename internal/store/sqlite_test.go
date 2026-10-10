@@ -721,6 +721,70 @@ func TestListRetryable_BackoffGate(t *testing.T) {
 	}
 }
 
+func TestMarkFailedPermanent(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	op := session.SyncOp{
+		Operation:  "UPDATE_STATUS",
+		TaskID:     "task-permanent",
+		Payload:    `{"role":"complete"}`,
+		MaxRetries: 5,
+		CreatedAt:  time.Now(),
+	}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+
+	ops, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("DequeuePending failed: %v", err)
+	}
+	opID := ops[0].ID
+
+	const errMsg = "no status for role complete on list"
+	if err := st.MarkFailedPermanent(ctx, opID, errMsg); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+
+	// Even with a tiny backoff and a backdated attempt, the op must never be retryable.
+	st.SetRetryBackoffBase(1 * time.Millisecond)
+	staleTime := time.Now().Add(-1 * time.Hour)
+	if _, err := st.db.ExecContext(ctx, "UPDATE sync_queue SET last_attempted_at = ? WHERE id = ?", staleTime, opID); err != nil {
+		t.Fatalf("UPDATE last_attempted_at failed: %v", err)
+	}
+
+	retryable, err := st.ListRetryable(ctx)
+	if err != nil {
+		t.Fatalf("ListRetryable failed: %v", err)
+	}
+	if len(retryable) != 0 {
+		t.Errorf("expected 0 retryables after permanent failure, got %d", len(retryable))
+	}
+
+	var status, storedMsg string
+	var retries, maxRetries int
+	if err := st.db.QueryRowContext(ctx, "SELECT status, error_msg, retries, max_retries FROM sync_queue WHERE id = ?", opID).Scan(&status, &storedMsg, &retries, &maxRetries); err != nil {
+		t.Fatalf("query sync_queue row failed: %v", err)
+	}
+	if status != "FAILED" {
+		t.Errorf("expected status FAILED, got %q", status)
+	}
+	if storedMsg != errMsg {
+		t.Errorf("expected error_msg %q, got %q", errMsg, storedMsg)
+	}
+	if retries != maxRetries {
+		t.Errorf("expected retries == max_retries (%d), got %d", maxRetries, retries)
+	}
+}
+
 func TestRequeueRateLimited(t *testing.T) {
 	t.Parallel()
 

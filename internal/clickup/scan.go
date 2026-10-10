@@ -89,22 +89,8 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 				result.StatusesCount += len(details.Statuses)
 				delay()
 
-				if err := st.DeleteCacheEntries(ctx, "status", l.ID); err != nil {
+				if err := cacheListStatuses(ctx, st, l.ID, details.Statuses); err != nil {
 					return nil, err
-				}
-				for _, stItem := range details.Statuses {
-					err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
-						EntityType: "status",
-						EntityID:   statusCacheID(l.ID, stItem.Status),
-						ParentID:   l.ID,
-						Name:       stItem.Status,
-						StatusType: stItem.Type,
-						OrderIndex: stItem.OrderIndex,
-						FetchedAt:  time.Now(),
-					})
-					if err != nil {
-						return nil, err
-					}
 				}
 			}
 
@@ -153,22 +139,8 @@ func ScanWorkspace(ctx context.Context, client *Client, st store.Store) (*ScanRe
 					result.StatusesCount += len(details.Statuses)
 					delay()
 
-					if err := st.DeleteCacheEntries(ctx, "status", l.ID); err != nil {
+					if err := cacheListStatuses(ctx, st, l.ID, details.Statuses); err != nil {
 						return nil, err
-					}
-					for _, stItem := range details.Statuses {
-						err = st.UpsertCacheEntry(ctx, &store.CacheEntry{
-							EntityType: "status",
-							EntityID:   statusCacheID(l.ID, stItem.Status),
-							ParentID:   l.ID,
-							Name:       stItem.Status,
-							StatusType: stItem.Type,
-							OrderIndex: stItem.OrderIndex,
-							FetchedAt:  time.Now(),
-						})
-						if err != nil {
-							return nil, err
-						}
 					}
 				}
 			}

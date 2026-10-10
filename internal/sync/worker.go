@@ -23,7 +23,7 @@ type Worker struct {
 
 type SyncPayload struct {
 	CommentText string `json:"comment_text,omitempty"`
-	// Role is the lifecycle role (start, review, complete, archive) for UPDATE_STATUS.
+	// Role is the lifecycle role (start, complete, archive) for UPDATE_STATUS.
 	Role string `json:"role,omitempty"`
 	// StatusType is the pre-role UPDATE_STATUS payload; still read so ops
 	// queued by an older taskflow version resolve after upgrading.
@@ -38,12 +38,12 @@ func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *
 	}
 }
 
-// WithStatusMap sets per-role ClickUp status name overrides, keyed by role
-// name (see config.StatusMapConfig.ByRole).
-func (w *Worker) WithStatusMap(roles map[string]string) *Worker {
-	w.statusMap = make(map[clickup.StatusRole]string, len(roles))
-	for role, name := range roles {
-		w.statusMap[clickup.StatusRole(role)] = name
+// WithStatusMap sets per-role ClickUp status name overrides from config.
+func (w *Worker) WithStatusMap(m config.StatusMapConfig) *Worker {
+	w.statusMap = map[clickup.StatusRole]string{
+		clickup.RoleStart:    m.Start,
+		clickup.RoleComplete: m.Complete,
+		clickup.RoleArchive:  m.Archive,
 	}
 	return w
 }
@@ -175,7 +175,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	var payload SyncPayload
 	if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
 		fmt.Fprintf(os.Stderr, "[sync] invalid payload for op %d (task %s): %v\n", op.ID, op.TaskID, err)
-		_ = w.store.MarkFailed(context.Background(), op.ID, fmt.Sprintf("invalid payload: %v", err))
+		_ = w.store.MarkFailedPermanent(context.Background(), op.ID, fmt.Sprintf("invalid payload: %v", err))
 		return err
 	}
 
@@ -186,7 +186,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 	case "UPDATE_STATUS":
 		opErr = w.updateStatus(ctx, op.TaskID, payload)
 	default:
-		opErr = fmt.Errorf("unknown operation: %s", op.Operation)
+		opErr = fmt.Errorf("%w: %s", errUnknownOperation, op.Operation)
 	}
 
 	if opErr != nil {
@@ -206,11 +206,25 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 			return opErr
 		}
 
+		if isPermanent(opErr) {
+			_ = w.store.MarkFailedPermanent(context.Background(), op.ID, opErr.Error())
+			return opErr
+		}
 		_ = w.store.MarkFailed(context.Background(), op.ID, opErr.Error())
 		return opErr
 	}
 
 	return w.store.MarkDone(ctx, op.ID)
+}
+
+var errUnknownOperation = errors.New("unknown operation")
+
+// isPermanent reports whether an op error will recur on every retry, so the op
+// should fail immediately instead of consuming max_retries attempts.
+func isPermanent(err error) bool {
+	return errors.Is(err, errUnknownOperation) ||
+		errors.Is(err, clickup.ErrUnknownStatusRole) ||
+		errors.Is(err, clickup.ErrNoMatchingStatus)
 }
 
 func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPayload) error {

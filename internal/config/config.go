@@ -18,25 +18,8 @@ type ClickUpConfig struct {
 // names. Empty fields use type-based defaults (see clickup.ResolveStatusForRole).
 type StatusMapConfig struct {
 	Start    string `toml:"start"`
-	Review   string `toml:"review"`
 	Complete string `toml:"complete"`
 	Archive  string `toml:"archive"`
-}
-
-// ByRole returns the configured overrides keyed by role name, omitting unset roles.
-func (m StatusMapConfig) ByRole() map[string]string {
-	roles := map[string]string{}
-	for role, name := range map[string]string{
-		"start":    m.Start,
-		"review":   m.Review,
-		"complete": m.Complete,
-		"archive":  m.Archive,
-	} {
-		if name != "" {
-			roles[role] = name
-		}
-	}
-	return roles
 }
 
 type GitConfig struct {
@@ -65,12 +48,11 @@ const DefaultConfigContent = `[clickup]
 api_key = ""
 
 # Optional: pin session lifecycle events to status names on your lists.
-# Unset roles use defaults: start = first "custom" status, review = a custom
-# status named "*review*", complete = first "done" (else "closed"),
-# archive = first "closed".
+# Unset roles use defaults: start = the "custom" status named like
+# "in progress", complete = first "done" (else "closed"), archive = first
+# "closed". Taskflow never moves a task back from a status someone else chose.
 [clickup.status_map]
 # start = "in progress"
-# review = "in review"
 # complete = "complete"
 # archive = "cancelled"
 

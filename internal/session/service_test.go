@@ -614,7 +614,78 @@ func TestService_StatusRoles(t *testing.T) {
 
 		// Archiving the completed session must not queue a status change, or the
 		// finished task would move to the list's closed ("cancelled") status.
-		want := []string{"start", "start", "complete"}
+		// Pausing must not queue a status change either, so a manual ClickUp
+		// move made during the session (e.g. to "in review") is preserved.
+		want := []string{"start", "complete"}
+		if got := store.statusRoles(t); !equalStrings(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("re-archiving an archived-after-completed session queues nothing more", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-rearchive", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"COMPLETED", "ARCHIVED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
+
+		want := []string{"start", "complete"}
+		if got := store.statusRoles(t); !equalStrings(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("re-archiving an abandoned session doesn't re-send archive", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-reabandon", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		id := res.Session.ID
+		for _, target := range []string{"ARCHIVED", "ARCHIVED"} {
+			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+				t.Fatalf("Stop(%s) failed: %v", target, err)
+			}
+		}
+
+		want := []string{"start", "archive"}
+		if got := store.statusRoles(t); !equalStrings(got, want) {
+			t.Errorf("expected roles %v, got %v", want, got)
+		}
+	})
+
+	t.Run("pause then resume", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+		dir := t.TempDir()
+
+		res, err := srv.Start(ctx, "task-resume", dir, false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false); err != nil {
+			t.Fatalf("Stop(PAUSED) failed: %v", err)
+		}
+		resumed, err := srv.Start(ctx, "task-resume", dir, false)
+		if err != nil {
+			t.Fatalf("resume Start failed: %v", err)
+		}
+		if resumed.Session.ID != res.Session.ID {
+			t.Errorf("expected resume to reuse session %s, got %s", res.Session.ID, resumed.Session.ID)
+		}
+
+		// The pause queues nothing; the resume's Start still queues "start".
+		want := []string{"start", "start"}
 		if got := store.statusRoles(t); !equalStrings(got, want) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}

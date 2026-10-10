@@ -39,7 +39,6 @@ api_key = "pk_your_clickup_api_key"
 # Optional — see "Status mapping" below
 [clickup.status_map]
 # start = "in progress"
-# review = "in review"
 # complete = "complete"
 # archive = "cancelled"
 
@@ -67,12 +66,11 @@ Taskflow moves your ClickUp task through lifecycle *roles*, not hardcoded status
 
 | Role | When | Default status on the task's list |
 |---|---|---|
-| `start` | Session started, resumed, or paused | First `custom` status (e.g. "in progress"), else first `open` |
+| `start` | Session started or resumed | The `custom` status named like "in progress"/"doing", else the first `custom` status that isn't a review, QA, or blocked stage |
 | `complete` | Session stopped as completed | First `done` status (e.g. "complete"), else first `closed` |
-| `archive` | Active/paused session archived (abandoned) | First `closed` status (e.g. "cancelled") |
-| `review` | Reserved for completeness checks | A `custom` status whose name contains "review"; otherwise unchanged |
+| `archive` | Active/paused session archived (abandoned) | First `closed` status (e.g. "cancelled"); otherwise unchanged |
 
-Archiving an already-completed session leaves the task's status alone. To pin a role to a specific status, set it under `[clickup.status_map]` (matched case-insensitively; a name missing from the list falls back to the default).
+Taskflow checks the task's live status first and never moves it back from a status someone else chose: `start` only moves a task that is still `open`, so a task that's in review or done stays put, and `complete`/`archive` leave tasks that are already `done` or `closed`. Pausing and archiving an already-completed session leave the task's status alone. To pin a role to a specific status, set it under `[clickup.status_map]` (matched case-insensitively; a name missing from the list falls back to the default).
 
 ### 3. Initialize Workspace & Cache
 

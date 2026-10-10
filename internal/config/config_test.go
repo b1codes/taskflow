@@ -82,8 +82,8 @@ complete = "complete"
 		t.Fatalf("LoadFrom failed: %v", err)
 	}
 
-	roles := cfg.ClickUp.StatusMap.ByRole()
-	if len(roles) != 2 || roles["start"] != "in progress" || roles["complete"] != "complete" {
-		t.Errorf("expected only start and complete overrides, got %v", roles)
+	want := StatusMapConfig{Start: "in progress", Complete: "complete"}
+	if got := cfg.ClickUp.StatusMap; got != want {
+		t.Errorf("expected status map %+v, got %+v", want, got)
 	}
 }

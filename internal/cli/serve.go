@@ -40,7 +40,7 @@ var serveCmd = &cobra.Command{
 		if cfg.ClickUp.APIKey != "" {
 			cuClient = clickup.New(cfg.ClickUp.APIKey)
 		}
-		worker := sync.NewWorker(st, cuClient, &cfg.Sync).WithStatusMap(cfg.ClickUp.StatusMap.ByRole())
+		worker := sync.NewWorker(st, cuClient, &cfg.Sync).WithStatusMap(cfg.ClickUp.StatusMap)
 
 		var wg syncPkg.WaitGroup
 		wg.Add(2)
