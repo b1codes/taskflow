@@ -42,8 +42,8 @@ type SyncConfig struct {
 // completeness manifest.
 type CompletenessConfig struct {
 	// Gate decides what stopping a session as completed does while required
-	// obligations are open: report, review, or block. A manifest's own gate
-	// overrides it.
+	// obligations are open: report, review, or block. It is a floor: a
+	// manifest's gate can make it stricter, never looser.
 	Gate string `toml:"gate"`
 }
 
@@ -90,7 +90,8 @@ drain_timeout_s = 5
 #   report = complete as usual; the stop comment lists what's open
 #   review = complete locally, move the ClickUp task to review (default)
 #   block  = refuse to complete until the work is done, attested, or waived
-# A manifest's own "gate:" overrides this.
+# This is a floor: a project manifest's "gate:" can make it stricter, never
+# looser, so an agent can't lower it by editing the repo.
 [completeness]
 gate = "review"
 

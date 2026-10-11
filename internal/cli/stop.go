@@ -65,15 +65,17 @@ var stopCmd = &cobra.Command{
 
 		fmt.Printf("✓ Session %s stopped. Status set to: %s\n", sessionID, res.Status)
 		if g := res.Gate; g != nil && g.Outcome != session.GatePassed {
-			switch g.Outcome {
-			case session.GateMovedToReview:
+			switch {
+			case g.Outcome == session.GateForced && g.Unchecked != "":
+				fmt.Printf("  ! Completion forced without a completeness check: %s (decision %s)\n", g.Unchecked, g.DecisionID)
+			case g.Outcome == session.GateForced:
+				fmt.Printf("  ! Completion forced with %d required obligation(s) open (decision %s)\n", len(g.OpenRequired), g.DecisionID)
+			case g.Outcome == session.GateMovedToReview && g.Unchecked != "":
+				fmt.Printf("  ! Completeness couldn't be checked (%s): the ClickUp task goes to review instead of complete\n", g.Unchecked)
+			case g.Outcome == session.GateMovedToReview:
 				fmt.Printf("  ! %d required obligation(s) open: the ClickUp task goes to review instead of complete\n", len(g.OpenRequired))
-			case session.GateForced:
-				if g.Unchecked != "" {
-					fmt.Printf("  ! Completion forced without a completeness check: %s (decision %s)\n", g.Unchecked, g.DecisionID)
-				} else {
-					fmt.Printf("  ! Completion forced with %d required obligation(s) open (decision %s)\n", len(g.OpenRequired), g.DecisionID)
-				}
+			case g.Unchecked != "":
+				fmt.Printf("  ! Completed without a completeness check: %s\n", g.Unchecked)
 			default:
 				fmt.Printf("  ! Completed with %d required obligation(s) open\n", len(g.OpenRequired))
 			}

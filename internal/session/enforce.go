@@ -24,8 +24,19 @@ const (
 	GateBlock GateMode = "block"
 )
 
-// DefaultGate applies when neither config nor the manifest sets a gate.
+// DefaultGate applies when config sets no gate.
 const DefaultGate = GateReview
+
+// gateRank orders gates by strictness.
+var gateRank = map[GateMode]int{GateReport: 0, GateReview: 1, GateBlock: 2}
+
+// stricter returns the stricter of g and other.
+func (g GateMode) stricter(other GateMode) GateMode {
+	if gateRank[g] > gateRank[other] {
+		return g
+	}
+	return other
+}
 
 // ParseGateMode validates a gate name; "" is the default gate.
 func ParseGateMode(s string) (GateMode, error) {
@@ -62,8 +73,8 @@ type GateResult struct {
 	OpenRequired []ObligationView `json:"open_required,omitempty"`
 	// DecisionID is the decision recording a forced completion.
 	DecisionID string `json:"decision_id,omitempty"`
-	// Unchecked says why completeness couldn't be checked, when a forced
-	// completion went ahead without knowing what was open.
+	// Unchecked says why completeness couldn't be checked, when the gate
+	// acted without knowing what was open.
 	Unchecked string `json:"unchecked,omitempty"`
 }
 
@@ -102,34 +113,33 @@ func (e *IncompleteSessionError) Error() string {
 func (e *IncompleteSessionError) Unwrap() error { return ErrIncompleteSession }
 
 // ErrCompletenessUnchecked is returned by Stop(completed) under the block
-// gate when the session's obligations can't be checked (they can't be read,
-// or the evaluation failed). The gate fails closed: the session is left
-// unchanged, since nothing shows the required work is done.
+// gate when the session's obligations can't be checked (the manifest is
+// invalid, they can't be read, or the evaluation failed). The gate fails
+// closed: the session is left unchanged, since nothing shows the required
+// work is done.
 var ErrCompletenessUnchecked = errors.New("completeness couldn't be checked")
 
 // ErrUnknownObligation is returned by Waive and Attest for an obligation the
 // session doesn't have, or one that no longer applies.
 var ErrUnknownObligation = errors.New("unknown obligation")
 
-// WithGate sets the configured completion gate; a manifest's gate overrides
-// it. Without one, the gate is DefaultGate.
+// WithGate sets the configured completion gate. It is a floor: a manifest's
+// gate can make it stricter, never looser, since the manifest lives in the
+// repo the agent is editing. Without one, the floor is DefaultGate.
 func (s *Service) WithGate(g GateMode) *Service {
 	s.gate = g
 	return s
 }
 
-// gateFor returns the gate for an evaluation: the manifest's, else the
-// configured one. An invalid manifest's rules (and gate) can't be read, so
-// its gate is report. Unreadable obligations don't change the gate: under
-// block, applyGate refuses to complete without them.
+// gateFor returns the gate for an evaluation: the stricter of the
+// configured gate and the manifest's. An invalid manifest's gate can't be
+// read, so the configured gate applies.
 func (s *Service) gateFor(st *completenessState) GateMode {
+	floor := s.configuredGate()
 	if st.eval.Error != "" {
-		return GateReport
+		return floor
 	}
-	if st.eval.Gate != "" {
-		return GateMode(st.eval.Gate)
-	}
-	return s.configuredGate()
+	return GateMode(st.eval.Gate).stricter(floor)
 }
 
 // configuredGate is the gate from config, or DefaultGate.
@@ -147,14 +157,14 @@ func (s *Service) configuredGate() GateMode {
 // override as a decision.
 func (s *Service) applyGate(ctx context.Context, sess *Session, st *completenessState, force bool) (*GateResult, StatusRole, error) {
 	g := &GateResult{Mode: s.gateFor(st), Outcome: GatePassed}
-	if st.readErr != "" {
-		// What's open is unknown. Only block depends on it, and it fails
-		// closed; other gates complete as they would with nothing open.
-		if g.Mode == GateBlock {
-			return s.blockUnchecked(ctx, sess, st.readErr, force)
-		}
-		g.Mode = GateReport
-		return g, "", nil
+	switch {
+	case st.readErr != "":
+		return s.uncheckedGate(ctx, sess, g.Mode, st.readErr, nil, force)
+	case st.eval.Error != "":
+		// The stored obligations are the last known state; list what they
+		// still owe, but new work since then can't be checked.
+		reason := fmt.Sprintf("the completeness manifest %s is invalid: %s", st.eval.Manifest, st.eval.Error)
+		return s.uncheckedGate(ctx, sess, g.Mode, reason, st.views(st.openRequired(), false), force)
 	}
 	open := st.openRequired()
 	if len(open) == 0 {
@@ -188,36 +198,55 @@ func (s *Service) applyGate(ctx context.Context, sess *Session, st *completeness
 	return g, "", nil
 }
 
-// blockUnchecked applies the block gate when completeness couldn't be
-// checked (reason says why): it refuses with ErrCompletenessUnchecked unless
-// force is set, in which case it records the override as a decision.
-func (s *Service) blockUnchecked(ctx context.Context, sess *Session, reason string, force bool) (*GateResult, StatusRole, error) {
-	if !force {
-		return nil, "", fmt.Errorf("%w: cannot complete session %s under the block gate: %s. Fix the problem and stop again",
-			ErrCompletenessUnchecked, sess.ID, reason)
+// uncheckedGate applies gate mode when completeness couldn't be checked
+// (reason says why), acting as if required work may be open: block refuses
+// with ErrCompletenessUnchecked unless force is set (then the override is
+// recorded as a decision), review moves the task to review, and report
+// completes. open lists required obligations known to be open, if any.
+func (s *Service) uncheckedGate(ctx context.Context, sess *Session, mode GateMode, reason string, open []ObligationView, force bool) (*GateResult, StatusRole, error) {
+	g := &GateResult{Mode: mode, OpenRequired: open, Unchecked: reason}
+	switch mode {
+	case GateBlock:
+		if !force {
+			return nil, "", fmt.Errorf("%w: cannot complete session %s under the block gate: %s. Fix the problem and stop again",
+				ErrCompletenessUnchecked, sess.ID, reason)
+		}
+		d, err := s.createDecision(ctx, sess, "Completion gate override",
+			"Completion forced by human without a completeness check",
+			"Completeness couldn't be checked: "+reason, "accepted", nil)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to record forced completion: %w", err)
+		}
+		g.Outcome, g.DecisionID = GateForced, d.ID
+		return g, "", nil
+	case GateReview:
+		g.Outcome = GateMovedToReview
+		return g, RoleReview, nil
 	}
-	d, err := s.createDecision(ctx, sess, "Completion gate override",
-		"Completion forced by human without a completeness check",
-		"Completeness couldn't be checked: "+reason, "accepted", nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to record forced completion: %w", err)
-	}
-	return &GateResult{Mode: GateBlock, Outcome: GateForced, DecisionID: d.ID, Unchecked: reason}, "", nil
+	g.Outcome = GateReported
+	return g, "", nil
 }
 
 // commentLine is the gate's line in the Session Finished comment, or "" when
 // nothing required was open.
 func (g *GateResult) commentLine() string {
 	n := len(g.OpenRequired)
+	if g.Unchecked != "" {
+		switch g.Outcome {
+		case GateReported:
+			return "**Completion gate (report):** completed without a completeness check: " + g.Unchecked
+		case GateMovedToReview:
+			return "**Completion gate (review):** completeness couldn't be checked, so the task goes to review instead of complete: " + g.Unchecked
+		case GateForced:
+			return "**Completion gate (block):** completion forced by human; completeness couldn't be checked: " + g.Unchecked
+		}
+	}
 	switch g.Outcome {
 	case GateReported:
 		return fmt.Sprintf("**Completion gate (report):** completed with %d required obligation(s) open", n)
 	case GateMovedToReview:
 		return fmt.Sprintf("**Completion gate (review):** %d required obligation(s) open, so the task goes to review instead of complete", n)
 	case GateForced:
-		if g.Unchecked != "" {
-			return "**Completion gate (block):** completion forced by human; completeness couldn't be checked: " + g.Unchecked
-		}
 		return fmt.Sprintf("**Completion gate (block):** completion forced by human with %d open obligation(s)", n)
 	}
 	return ""

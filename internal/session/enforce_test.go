@@ -199,21 +199,58 @@ func TestService_Gate(t *testing.T) {
 		}
 	})
 
-	t.Run("the manifest's gate overrides config", func(t *testing.T) {
+	t.Run("the manifest can raise the configured gate", func(t *testing.T) {
 		ev := screenEval()
-		ev.Gate = "report"
-		srv, _, sid := start(t, &fakeEvaluator{eval: ev}, GateBlock)
-		if res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); err != nil || res.Gate.Mode != GateReport {
-			t.Errorf("Stop = %+v, %v", res, err)
+		ev.Gate = "block"
+		srv, _, sid := start(t, &fakeEvaluator{eval: ev}, GateReport)
+		if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrIncompleteSession) {
+			t.Errorf("Stop = %v; want the manifest's block", err)
 		}
 	})
 
-	t.Run("an invalid manifest is gated as report", func(t *testing.T) {
+	t.Run("the manifest can't lower the configured gate", func(t *testing.T) {
+		for _, lower := range []string{"report", "review"} {
+			ev := screenEval()
+			ev.Gate = lower
+			srv, _, sid := start(t, &fakeEvaluator{eval: ev}, GateBlock)
+			if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrIncompleteSession) {
+				t.Errorf("manifest gate %s: Stop = %v; want config's block", lower, err)
+			}
+		}
+		ev := screenEval()
+		ev.Gate = "report"
+		srv, _, sid := start(t, &fakeEvaluator{eval: ev}, "")
+		if res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); err != nil || res.Gate.Mode != GateReview {
+			t.Errorf("Stop = %+v, %v; want the default review", res, err)
+		}
+	})
+
+	t.Run("an invalid manifest can't lower the configured gate", func(t *testing.T) {
+		invalid := &Evaluation{Manifest: ".agents/completeness.yaml", Error: "version: must be 1"}
+
 		ev := &fakeEvaluator{eval: screenEval()}
-		srv, _, sid := start(t, ev, GateBlock)
-		ev.eval = &Evaluation{Manifest: ".agents/completeness.yaml", Error: "version: must be 1"}
-		if res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); err != nil || res.Gate.Mode != GateReport {
-			t.Errorf("Stop = %+v, %v", res, err)
+		srv, store, sid := start(t, ev, GateBlock)
+		ev.eval = invalid
+		if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrCompletenessUnchecked) || !strings.Contains(err.Error(), "version: must be 1") {
+			t.Errorf("block: Stop = %v; want ErrCompletenessUnchecked", err)
+		}
+		if store.sessions[sid].Status != StatusActive {
+			t.Errorf("block: status = %s", store.sessions[sid].Status)
+		}
+
+		ev = &fakeEvaluator{eval: screenEval()}
+		srv, store, sid = start(t, ev, GateReview)
+		ev.eval = invalid
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
+		if err != nil || res.Gate.Outcome != GateMovedToReview || !strings.Contains(res.Gate.Unchecked, "is invalid") {
+			t.Fatalf("review: Stop = %+v, %v", res.Gate, err)
+		}
+		// The last known open work is still listed.
+		if len(res.Gate.OpenRequired) != 1 || res.Gate.OpenRequired[0].Requirement != "story" {
+			t.Errorf("review: open = %+v", res.Gate.OpenRequired)
+		}
+		if roles := store.statusRoles(t); !slices.Equal(roles, []StatusRole{RoleStart, RoleReview}) {
+			t.Errorf("review: roles = %v", roles)
 		}
 	})
 }
@@ -657,11 +694,26 @@ func TestService_GateFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("other gates still complete with unreadable obligations", func(t *testing.T) {
+	t.Run("review moves the task to review with unreadable obligations", func(t *testing.T) {
 		srv, store, sid := unreadable(t, screenEval(), GateReview)
 		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
-		if err != nil || res.Gate.Mode != GateReport || store.sessions[sid].Status != StatusCompleted {
-			t.Errorf("Stop = %+v, %v", res, err)
+		if err != nil || res.Gate.Mode != GateReview || res.Gate.Outcome != GateMovedToReview || store.sessions[sid].Status != StatusCompleted {
+			t.Fatalf("Stop = %+v, %v", res.Gate, err)
+		}
+		if roles := store.statusRoles(t); !slices.Equal(roles, []StatusRole{RoleStart, RoleReview}) {
+			t.Errorf("roles = %v", roles)
+		}
+		comments := store.comments(t)
+		if c := comments[len(comments)-1]; !strings.Contains(c, "**Completion gate (review):** completeness couldn't be checked, so the task goes to review instead of complete: stored obligations couldn't be read") {
+			t.Errorf("finished comment = %q", c)
+		}
+	})
+
+	t.Run("report completes with unreadable obligations", func(t *testing.T) {
+		srv, store, sid := unreadable(t, screenEval(), GateReport)
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
+		if err != nil || res.Gate.Outcome != GateReported || res.Gate.Unchecked == "" || store.sessions[sid].Status != StatusCompleted {
+			t.Errorf("Stop = %+v, %v", res.Gate, err)
 		}
 	})
 
@@ -693,11 +745,25 @@ func TestService_GateFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("a failed evaluation doesn't gate otherwise", func(t *testing.T) {
+	t.Run("a failed evaluation moves the task to review under review", func(t *testing.T) {
 		srv, store, sid := failing(t, GateReview)
 		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
-		if err != nil || res.Gate != nil || store.sessions[sid].Status != StatusCompleted {
+		if err != nil || res.Gate.Outcome != GateMovedToReview || !strings.Contains(res.Gate.Unchecked, "permission denied") || store.sessions[sid].Status != StatusCompleted {
+			t.Fatalf("Stop = %+v, %v", res, err)
+		}
+		if roles := store.statusRoles(t); !slices.Equal(roles, []StatusRole{RoleStart, RoleReview}) {
+			t.Errorf("roles = %v", roles)
+		}
+	})
+
+	t.Run("a failed evaluation completes under report", func(t *testing.T) {
+		srv, store, sid := failing(t, GateReport)
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
+		if err != nil || res.Gate.Outcome != GateReported || store.sessions[sid].Status != StatusCompleted {
 			t.Errorf("Stop = %+v, %v", res, err)
+		}
+		if roles := store.statusRoles(t); !slices.Equal(roles, []StatusRole{RoleStart, RoleComplete}) {
+			t.Errorf("roles = %v", roles)
 		}
 	})
 

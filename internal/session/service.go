@@ -704,10 +704,10 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		switch {
 		case st != nil:
 			gate, gateRole, err = s.applyGate(ctx, sess, st, force)
-		case evalErr != nil && s.configuredGate() == GateBlock:
+		case evalErr != nil:
 			// The manifest (and any gate it sets) couldn't be read, so the
-			// configured gate decides, and block fails closed.
-			gate, gateRole, err = s.blockUnchecked(ctx, sess, "evaluation failed: "+evalErr.Error(), force)
+			// configured gate decides, acting as if work may be open.
+			gate, gateRole, err = s.uncheckedGate(ctx, sess, s.configuredGate(), "evaluation failed: "+evalErr.Error(), nil, force)
 		}
 		if err != nil {
 			return nil, err

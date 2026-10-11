@@ -426,7 +426,7 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 
 // tryEvaluateCompleteness is evaluateCompleteness, returning the evaluator's
 // error rather than logging it, for callers that must not treat a failed
-// evaluation as "completeness is off" (the block gate).
+// evaluation as "completeness is off" (the completion gate).
 func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, merge bool) (*completenessState, error) {
 	if s.completeness == nil {
 		return nil, nil
