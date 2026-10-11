@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,10 @@ type fakeChecklists struct {
 	nextID     int
 	// reject answers requests whose "METHOD path" has this prefix with a 400.
 	reject string
+	// store is what ClickUp does to an item name it is sent (nil: keeps it).
+	store func(name string) string
+	// omitCreated leaves the new item out of the create item response.
+	omitCreated bool
 }
 
 func newFakeChecklists(t *testing.T, taskID string, existing ...clickup.Checklist) (*fakeChecklists, *clickup.Client) {
@@ -65,13 +70,18 @@ func (f *fakeChecklists) serve(w http.ResponseWriter, r *http.Request) {
 		f.write(w, map[string]any{"checklist": f.checklists[len(f.checklists)-1]})
 	case r.Method == "POST" && len(parts) == 3 && parts[0] == "checklist" && parts[2] == "checklist_item":
 		cl := f.checklist(parts[1])
-		cl.Items = append(cl.Items, clickup.ChecklistItem{ID: f.id("item"), Name: body.Name})
-		f.write(w, map[string]any{"checklist": cl})
+		resp := *cl
+		resp.Items = append([]clickup.ChecklistItem(nil), cl.Items...)
+		cl.Items = append(cl.Items, clickup.ChecklistItem{ID: f.id("item"), Name: f.storedName(body.Name)})
+		if !f.omitCreated {
+			resp = *cl
+		}
+		f.write(w, map[string]any{"checklist": resp})
 	case r.Method == "PUT" && len(parts) == 4 && parts[0] == "checklist" && parts[2] == "checklist_item":
 		cl := f.checklist(parts[1])
 		for i := range cl.Items {
 			if cl.Items[i].ID == parts[3] {
-				cl.Items[i].Name = body.Name
+				cl.Items[i].Name = f.storedName(body.Name)
 				if body.Resolved != nil {
 					cl.Items[i].Resolved = *body.Resolved
 				}
@@ -81,6 +91,13 @@ func (f *fakeChecklists) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (f *fakeChecklists) storedName(name string) string {
+	if f.store == nil {
+		return name
+	}
+	return f.store(name)
 }
 
 func (f *fakeChecklists) id(prefix string) string {
@@ -151,7 +168,7 @@ func item(key, match, suffix string, resolved bool) session.ChecklistItem {
 }
 
 func voidItem(key, match string) session.ChecklistItem {
-	return session.ChecklistItem{Key: key, Match: match, Name: "~~" + match + "~~", Resolved: true, Void: true}
+	return session.ChecklistItem{Key: key, Match: match, Name: match + " — void", Resolved: true, Void: true}
 }
 
 func drain(t *testing.T, st store.Store, client *clickup.Client) int {
@@ -283,22 +300,30 @@ func TestWorker_SyncChecklist_IdempotentRerun(t *testing.T) {
 	}
 }
 
-func TestWorker_SyncChecklist_StrikesVoids(t *testing.T) {
+func TestWorker_SyncChecklist_MarksVoids(t *testing.T) {
 	t.Parallel()
 	const task = "task-cl-void"
 	st := newChecklistStore(t, task)
 	fake, client := newFakeChecklists(t, task, clickup.Checklist{ID: "cl-1", Name: session.ChecklistName, Items: []clickup.ChecklistItem{
 		{ID: "i-story", Name: "[story] Stories for A — waived", Resolved: true},
 		{ID: "i-test", Name: "[test] Test for A"},
+		// Struck through: the void form of earlier builds.
+		{ID: "i-e2e", Name: "~~[e2e] E2E for A~~", Resolved: true},
 	}})
+	voids := []session.ChecklistItem{
+		voidItem("r/story/A", "[story] Stories for A"),
+		voidItem("r/test/A", "[test] Test for A"),
+		voidItem("r/e2e/A", "[e2e] E2E for A"),
+	}
 
-	enqueueChecklist(t, st, task, voidItem("r/story/A", "[story] Stories for A"), voidItem("r/test/A", "[test] Test for A"))
+	enqueueChecklist(t, st, task, voids...)
 	drain(t, st, client)
 
 	cls, _ := fake.state()
 	want := []clickup.ChecklistItem{
-		{ID: "i-story", Name: "~~[story] Stories for A~~", Resolved: true},
-		{ID: "i-test", Name: "~~[test] Test for A~~", Resolved: true},
+		{ID: "i-story", Name: "[story] Stories for A — void", Resolved: true},
+		{ID: "i-test", Name: "[test] Test for A — void", Resolved: true},
+		{ID: "i-e2e", Name: "[e2e] E2E for A — void", Resolved: true},
 	}
 	if len(cls[0].Items) != len(want) {
 		t.Fatalf("void items are renamed, never deleted: %+v", cls[0].Items)
@@ -309,14 +334,14 @@ func TestWorker_SyncChecklist_StrikesVoids(t *testing.T) {
 		}
 	}
 
-	// Struck items still match, so a re-run changes nothing.
-	enqueueChecklist(t, st, task, voidItem("r/story/A", "[story] Stories for A"), voidItem("r/test/A", "[test] Test for A"))
+	// Void items still match, so a re-run changes nothing.
+	enqueueChecklist(t, st, task, voids...)
 	drain(t, st, client)
 	if _, reqs := fake.state(); len(reqs) != 1 {
 		t.Errorf("re-run requests = %v", reqs)
 	}
 
-	// An obligation found again comes back unstruck.
+	// An obligation found again comes back.
 	enqueueChecklist(t, st, task, item("r/test/A", "[test] Test for A", "", false))
 	drain(t, st, client)
 	cls, _ = fake.state()
@@ -407,4 +432,215 @@ func TestWorker_SyncChecklist_ErrorClassification(t *testing.T) {
 			t.Errorf("expected no retryable ops, got %d (err: %v)", len(ops), err)
 		}
 	})
+}
+
+func TestWorker_SyncChecklist_MatchesByEarlierMatchOfKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const task = "task-cl-describe"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	// An earlier op whose payload can't be parsed is ignored.
+	bad := session.SyncOp{Operation: session.OpSyncChecklist, TaskID: task, Payload: `{"items": "nope"}`, MaxRetries: 3, CreatedAt: time.Now()}
+	if err := st.EnqueueSync(ctx, bad); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	enqueueChecklist(t, st, task,
+		item("r/story/A", "[story] Stories for A", "", false),
+		item("r/test/A", "[test] Test for A", "", false),
+	)
+	drain(t, st, client)
+	fake.mu.Lock()
+	fake.checklists[0].Items = append(fake.checklists[0].Items, clickup.ChecklistItem{ID: "i-new-test", Name: "[test] Test for module A"})
+	fake.mu.Unlock()
+	fake.state()
+
+	// Both describes were edited in the manifest.
+	enqueueChecklist(t, st, task,
+		item("r/story/A", "[story] Stories for module A", "structural ✓", true),
+		item("r/test/A", "[test] Test for module A", "", false),
+	)
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected 1 processed op, got %d", n)
+	}
+
+	cls, reqs := fake.state()
+	want := []clickup.ChecklistItem{
+		// Renamed: found by the Match its Key had in the earlier op.
+		{ID: "item-2", Name: "[story] Stories for module A — structural ✓", Resolved: true},
+		// An item matching the current Match wins over the earlier one,
+		// which is left alone.
+		{ID: "item-3", Name: "[test] Test for A"},
+		{ID: "i-new-test", Name: "[test] Test for module A"},
+	}
+	got := cls[0].Items
+	if len(got) != len(want) {
+		t.Fatalf("items = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("item %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if countPrefix(reqs, "POST ") != 0 || countPrefix(reqs, "PUT ") != 1 {
+		t.Errorf("requests = %v", reqs)
+	}
+}
+
+// listFailingStore fails ListSyncOps.
+type listFailingStore struct{ store.Store }
+
+func (listFailingStore) ListSyncOps(context.Context, string, string, int64, int) ([]*session.SyncOp, error) {
+	return nil, errors.New("disk on fire")
+}
+
+func TestWorker_SyncChecklist_EarlierOpsUnreadable_StillSyncs(t *testing.T) {
+	t.Parallel()
+	const task = "task-cl-describe-noops"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
+	drain(t, st, client)
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for module A", "", false))
+	if n := drain(t, listFailingStore{st}, client); n != 1 {
+		t.Fatalf("expected the sync to go ahead without earlier ops, got %d processed", n)
+	}
+	if cls, _ := fake.state(); len(cls[0].Items) != 2 {
+		t.Errorf("without earlier ops the item can only be created: %+v", cls[0].Items)
+	}
+}
+
+func TestWorker_SyncChecklist_ClickUpNormalizesNames(t *testing.T) {
+	t.Parallel()
+	// A name queued by an older taskflow, before names were normalized.
+	unnormalized := item("r/story/A", "[story] Stories  for A ", "structural ✓", true)
+	const stored = "[story] Stories for A — structural ✓"
+
+	t.Run("the created item is found and resolved", func(t *testing.T) {
+		t.Parallel()
+		const task = "task-cl-normalize"
+		st := newChecklistStore(t, task)
+		fake, client := newFakeChecklists(t, task)
+		fake.store = session.NormalizeChecklistName
+
+		enqueueChecklist(t, st, task, unnormalized)
+		if n := drain(t, st, client); n != 1 {
+			t.Fatalf("expected 1 processed op, got %d", n)
+		}
+		cls, _ := fake.state()
+		if got := itemNames(cls[0]); len(got) != 1 || !got[stored] {
+			t.Fatalf("items = %v, want only %q resolved", got, stored)
+		}
+
+		// The normalized name isn't "renamed" back on every sync.
+		enqueueChecklist(t, st, task, unnormalized)
+		drain(t, st, client)
+		if _, reqs := fake.state(); len(reqs) != 1 {
+			t.Errorf("re-run requests = %v", reqs)
+		}
+	})
+
+	t.Run("a retry doesn't create a duplicate", func(t *testing.T) {
+		t.Parallel()
+		const task = "task-cl-normalize-retry"
+		st := newChecklistStore(t, task)
+		fake, client := newFakeChecklists(t, task)
+		fake.store = session.NormalizeChecklistName
+		fake.omitCreated = true
+
+		enqueueChecklist(t, st, task, unnormalized)
+		if n := drain(t, st, client); n != 0 {
+			t.Fatalf("an item missing from the create response must fail the op, got %d processed", n)
+		}
+		st.SetRetryBackoffBase(time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
+		if n := drain(t, st, client); n != 1 {
+			t.Fatalf("expected the retry to succeed, got %d processed", n)
+		}
+		cls, reqs := fake.state()
+		if got := itemNames(cls[0]); len(got) != 1 || !got[stored] {
+			t.Errorf("items = %v, want only %q resolved", got, stored)
+		}
+		if countPrefix(reqs, "POST /checklist/") != 1 {
+			t.Errorf("the item must be created once: %v", reqs)
+		}
+	})
+}
+
+func TestWorker_SyncChecklist_ResolvesCreatedItemsByID(t *testing.T) {
+	t.Parallel()
+	const task = "task-cl-created-ids"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task, clickup.Checklist{ID: "cl-1", Name: session.ChecklistName, Items: []clickup.ChecklistItem{
+		{ID: "i-mine", Name: "Someone's own item"},
+	}})
+	// Truncated names can't be found by name: only the IDs each create adds
+	// tell the created items apart, the unresolved ones included.
+	fake.store = func(name string) string { return name[:20] }
+
+	enqueueChecklist(t, st, task,
+		item("r/story/A", "[story] Stories for screen A", "", false),
+		item("r/story/B", "[story] Stories for screen B", "structural ✓", true),
+		item("r/story/C", "[story] Stories for screen C", "structural ✓", true),
+	)
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected 1 processed op, got %d", n)
+	}
+
+	cls, _ := fake.state()
+	got := cls[0].Items
+	want := []struct {
+		id       string
+		resolved bool
+	}{{"i-mine", false}, {"item-1", false}, {"item-2", true}, {"item-3", true}}
+	if len(got) != len(want) {
+		t.Fatalf("items = %+v", got)
+	}
+	for i, w := range want {
+		if got[i].ID != w.id || got[i].Resolved != w.resolved {
+			t.Errorf("item %d = %+v, want ID %s resolved=%v", i, got[i], w.id, w.resolved)
+		}
+	}
+}
+
+func TestWorker_SyncChecklist_StaleRetryAfterNewerDone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const task = "task-cl-stale-retry"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	// op#1 (item open) fails transiently.
+	fake.reject = "GET /task/"
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
+	drain(t, st, client)
+
+	// op#2 (item resolved) runs before op#1's backoff is up.
+	fake.mu.Lock()
+	fake.reject = ""
+	fake.mu.Unlock()
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "structural ✓", true))
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected op#2 to be processed alone, got %d", n)
+	}
+	fake.state()
+
+	// op#1's retry is skipped: it must not undo op#2.
+	st.SetRetryBackoffBase(time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected op#1's retry to be processed, got %d", n)
+	}
+	cls, reqs := fake.state()
+	if len(reqs) != 0 {
+		t.Errorf("the stale op must be skipped without calling ClickUp: %v", reqs)
+	}
+	if got := itemNames(cls[0]); len(got) != 1 || !got["[story] Stories for A — structural ✓"] {
+		t.Errorf("items = %v, want the newer, resolved state", got)
+	}
+	if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
+		t.Errorf("expected no retryable ops, got %d (err: %v)", len(ops), err)
+	}
 }

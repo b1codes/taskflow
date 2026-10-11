@@ -45,9 +45,14 @@ type Store interface {
 	RequeueRateLimited(ctx context.Context, id int64, errMsg string) error
 	ListRetryable(ctx context.Context) ([]*session.SyncOp, error)
 	// HasNewerOp reports whether a later op of the same operation for the
-	// same task as op is still to run (pending, in flight, or failed with
-	// retries left), so an op carrying full state can be skipped for it.
+	// same task as op is done or still to run (pending, in flight, or failed
+	// with retries left), so an op carrying full state can be skipped for it:
+	// retrying it after a later one applied would undo the later state. Only
+	// a later op that failed for good doesn't count.
 	HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error)
+	// ListSyncOps lists the task's ops of operation with an ID below beforeID
+	// (0 for no bound), newest first, at most limit of them.
+	ListSyncOps(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error)
 	ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error)
 	SetRetryBackoffBase(d time.Duration)
 

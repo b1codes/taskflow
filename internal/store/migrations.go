@@ -157,6 +157,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_obligations_key ON obligations(session_id,
 CREATE INDEX IF NOT EXISTS idx_obligations_requirement ON obligations(rule_id, requirement_id);
 `,
 	},
+	{
+		version: 7,
+		// Full-state ops (SYNC_CHECKLIST) look up the task's other ops of the
+		// same operation: HasNewerOp, LatestSyncOp, ListSyncOps.
+		sql: `
+CREATE INDEX IF NOT EXISTS idx_sync_queue_task_op ON sync_queue(task_id, operation, id);
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

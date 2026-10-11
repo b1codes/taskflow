@@ -900,13 +900,56 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 }
 
 func (s *SQLiteStore) HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error) {
+	// A DONE op counts: it either applied a later state, or was itself
+	// skipped for a later op that applied one or still will.
 	query := `SELECT EXISTS (SELECT 1 FROM sync_queue WHERE task_id = ? AND operation = ? AND id > ?
-	AND (status IN ('PENDING', 'IN_FLIGHT') OR (status = 'FAILED' AND retries < max_retries)))`
+	AND (status IN ('PENDING', 'IN_FLIGHT', 'DONE') OR (status = 'FAILED' AND retries < max_retries)))`
 	var exists bool
 	if err := s.db.QueryRowContext(ctx, query, op.TaskID, op.Operation, op.ID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("failed to check for newer sync items: %w", err)
 	}
 	return exists, nil
+}
+
+const syncOpColumns = `id, operation, task_id, payload, status, retries, max_retries, created_at, last_attempted_at, error_msg`
+
+func scanSyncOps(rows *sql.Rows) ([]*session.SyncOp, error) {
+	var ops []*session.SyncOp
+	for rows.Next() {
+		var op session.SyncOp
+		var lastAttemptedAtSql sql.NullTime
+		var errorMsgSql sql.NullString
+		err := rows.Scan(&op.ID, &op.Operation, &op.TaskID, &op.Payload, &op.Status, &op.Retries, &op.MaxRetries, &op.CreatedAt, &lastAttemptedAtSql, &errorMsgSql)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan sync operation: %w", err)
+		}
+		if lastAttemptedAtSql.Valid {
+			op.LastAttemptedAt = &lastAttemptedAtSql.Time
+		}
+		if errorMsgSql.Valid {
+			op.ErrorMsg = errorMsgSql.String
+		}
+		ops = append(ops, &op)
+	}
+	return ops, rows.Err()
+}
+
+func (s *SQLiteStore) LatestSyncOp(ctx context.Context, taskID, operation string) (*session.SyncOp, error) {
+	ops, err := s.ListSyncOps(ctx, taskID, operation, 0, 1)
+	if err != nil || len(ops) == 0 {
+		return nil, err
+	}
+	return ops[0], nil
+}
+
+func (s *SQLiteStore) ListSyncOps(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error) {
+	query := `SELECT ` + syncOpColumns + ` FROM sync_queue WHERE task_id = ? AND operation = ? AND (? = 0 OR id < ?) ORDER BY id DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, taskID, operation, beforeID, beforeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sync operations: %w", err)
+	}
+	defer rows.Close()
+	return scanSyncOps(rows)
 }
 
 func (s *SQLiteStore) RequeueRateLimited(ctx context.Context, id int64, errMsg string) error {

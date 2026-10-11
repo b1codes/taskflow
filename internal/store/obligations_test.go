@@ -203,8 +203,8 @@ func TestSQLiteStore_Migration6_Upgrade(t *testing.T) {
 		t.Fatalf("runMigrations failed on upgrade: %v", err)
 	}
 	var version int
-	if err := db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil || version != 6 {
-		t.Fatalf("version = %d, %v; want 6", version, err)
+	if err := db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version); err != nil || version != latestMigrationVersion() {
+		t.Fatalf("version = %d, %v; want %d", version, err, latestMigrationVersion())
 	}
 	st := &SQLiteStore{db: db}
 	sess, err := st.GetSession(context.Background(), "old")

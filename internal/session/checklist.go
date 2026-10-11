@@ -2,6 +2,9 @@ package session
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 )
 
@@ -25,15 +28,20 @@ type ChecklistItem struct {
 	Key string `json:"key"`
 	// Match is the stable "[requirement] describe" part of Name, which finds
 	// the item in ClickUp whatever its status text says (ChecklistItemMatches).
+	// It is normalized (NormalizeChecklistName), as ClickUp stores names.
 	Match string `json:"match"`
-	// Name is Match plus its status: verify levels, attested, waived, or
-	// struck through when void.
+	// Name is Match plus its status after " — ": verify levels, attested,
+	// waived, or void.
 	Name     string `json:"name"`
 	Resolved bool   `json:"resolved"`
 	// Void items are only renamed, never created: they were dropped, and the
-	// strike keeps an item already shown in the checklist's history.
+	// "void" suffix keeps an item already shown in the checklist's history.
 	Void bool `json:"void,omitempty"`
 }
+
+// checklistVoid is the status suffix of a void item. ClickUp item names are
+// plain text, so it is a word rather than a strikethrough.
+const checklistVoid = "void"
 
 // checklistItems is the checklist for obligations, in the order they were
 // first seen.
@@ -46,7 +54,7 @@ func checklistItems(obligations []*Obligation) []ChecklistItem {
 }
 
 func checklistItem(o *Obligation) ChecklistItem {
-	match := "[" + o.RequirementID + "] " + o.Describe
+	match := NormalizeChecklistName("[" + o.RequirementID + "] " + o.Describe)
 	it := ChecklistItem{
 		Key:   o.RuleID + "/" + o.RequirementID + "/" + o.Subject,
 		Match: match,
@@ -56,7 +64,7 @@ func checklistItem(o *Obligation) ChecklistItem {
 		Resolved: o.Status != ObligationOpen,
 	}
 	if o.Status == ObligationVoid {
-		it.Name, it.Void = "~~"+match+"~~", true
+		it.Name, it.Void = match+" — "+checklistVoid, true
 		return it
 	}
 	var parts []string
@@ -68,7 +76,9 @@ func checklistItem(o *Obligation) ChecklistItem {
 	}
 	var verified []string
 	for _, l := range o.VerifiedLevels {
-		if l != levelAttest {
+		// A level is one word in the name, so ChecklistItemMatches can tell
+		// the suffix from the describe text.
+		if l = strings.Join(strings.Fields(l), "-"); l != "" && l != levelAttest {
 			verified = append(verified, l)
 		}
 	}
@@ -81,19 +91,89 @@ func checklistItem(o *Obligation) ChecklistItem {
 	return it
 }
 
+// NormalizeChecklistName collapses runs of whitespace (newlines from a YAML
+// block describe included) into single spaces and trims the ends, as ClickUp
+// may do to an item name; names are built and compared normalized.
+func NormalizeChecklistName(name string) string {
+	return strings.Join(strings.Fields(name), " ")
+}
+
 // ChecklistItemMatches reports whether a ClickUp checklist item named name is
-// the item whose stable part is match: the name is match itself, match with
-// a status suffix, or match struck through.
+// the item whose stable part is match: the name is match itself, or match
+// with a status suffix checklistItem builds, or match struck through (the
+// void form of earlier builds). Any other text after match is part of a
+// different item's describe ("[r] Add test — edge cases" isn't "[r] Add
+// test"). Both are compared normalized.
 func ChecklistItemMatches(name, match string) bool {
-	rest, ok := strings.CutPrefix(strings.TrimPrefix(name, "~~"), match)
-	return ok && (rest == "" || strings.HasPrefix(rest, " — ") || strings.HasPrefix(rest, "~~"))
+	name, match = NormalizeChecklistName(name), NormalizeChecklistName(match)
+	if name == match || name == "~~"+match+"~~" {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(name, match+" — ")
+	return ok && isChecklistSuffix(suffix)
+}
+
+// isChecklistSuffix reports whether s is a status suffix checklistItem
+// builds: "void", or "waived"/"attested" and verify levels, in that order,
+// joined by ", ", the levels as one-word names ending in " ✓".
+func isChecklistSuffix(s string) bool {
+	if s == checklistVoid {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(s, "waived"); ok {
+		s = rest
+	} else if rest, ok := strings.CutPrefix(s, "attested"); ok {
+		s = rest
+	} else {
+		s = ", " + s // levels alone
+	}
+	if s == "" {
+		return true
+	}
+	levels, ok := strings.CutSuffix(s, " ✓")
+	if !ok {
+		return false
+	}
+	levels, ok = strings.CutPrefix(levels, ", ")
+	if !ok {
+		return false
+	}
+	for _, l := range strings.Split(levels, ", ") {
+		switch {
+		case l == "" || strings.ContainsAny(l, " ,"):
+			return false
+		case l == checklistVoid || l == "waived" || l == "attested":
+			return false // a status, out of place
+		}
+	}
+	return true
 }
 
 // enqueueChecklist queues the session's checklist as it stands in
-// obligations.
-func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligations []*Obligation) {
-	s.enqueueSync(ctx, sess.TaskID, OpSyncChecklist, ChecklistPayload{
-		ChecklistName: ChecklistName,
-		Items:         checklistItems(obligations),
-	})
+// obligations unless ClickUp has it or will: it is queued when the task's
+// latest SYNC_CHECKLIST op carries a different checklist or failed for good,
+// or when there is no op yet. Comparing with what was queued, rather than
+// with the last merge, also repairs a checklist that drifted (its op ran out
+// of retries, or the session predates the checklist). An empty checklist is
+// never queued: a session's obligations are never deleted, so there is
+// nothing to clear. When the latest op can't be read, changed (the caller's
+// view of whether the checklist changed) decides.
+func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligations []*Obligation, changed bool) {
+	if len(obligations) == 0 {
+		return
+	}
+	payload := ChecklistPayload{ChecklistName: ChecklistName, Items: checklistItems(obligations)}
+	latest, err := s.store.LatestSyncOp(ctx, sess.TaskID, OpSyncChecklist)
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "[session] failed to read the latest checklist op for task %s: %v\n", sess.TaskID, err)
+		if !changed {
+			return
+		}
+	case latest != nil && !(latest.Status == "FAILED" && latest.Retries >= latest.MaxRetries):
+		if b, err := json.Marshal(payload); err == nil && string(b) == latest.Payload {
+			return
+		}
+	}
+	s.enqueueSync(ctx, sess.TaskID, OpSyncChecklist, payload)
 }

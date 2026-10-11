@@ -18,6 +18,8 @@ type mockStore struct {
 	decisions   map[string][]*Decision
 	obligations map[string][]*Obligation
 	syncOps     []SyncOp
+	// latestErr fails LatestSyncOp.
+	latestErr error
 }
 
 func newMockStore() *mockStore {
@@ -188,6 +190,21 @@ func (m *mockStore) CountPendingByTaskID(ctx context.Context, taskID string) (in
 func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
 	m.syncOps = append(m.syncOps, op)
 	return nil
+}
+
+func (m *mockStore) LatestSyncOp(ctx context.Context, taskID, operation string) (*SyncOp, error) {
+	if m.latestErr != nil {
+		return nil, m.latestErr
+	}
+	for i := len(m.syncOps) - 1; i >= 0; i-- {
+		if op := m.syncOps[i]; op.TaskID == taskID && op.Operation == operation {
+			if op.Status == "" {
+				op.Status = "PENDING"
+			}
+			return &op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *mockStore) SetSessionBaseSHA(ctx context.Context, id string, sha string) error {

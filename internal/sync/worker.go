@@ -278,8 +278,9 @@ func (w *Worker) latestSessionCompleted(ctx context.Context, taskID string) bool
 // op's payload, the checklist's full desired state: it finds the checklist by
 // name (creating it if missing), creates missing items, and renames or
 // (un)resolves items that differ. Items are never deleted, and void items
-// are only renamed, never created. The op is skipped when a newer one for
-// the task will apply a later state anyway.
+// are only renamed, never created. The op is skipped when a newer op for the
+// task has already been applied or still will be, so a retried stale op
+// never undoes a later state.
 func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 	var p session.ChecklistPayload
 	if err := json.Unmarshal([]byte(op.Payload), &p); err != nil {
@@ -310,40 +311,43 @@ func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 		}
 	}
 
-	matched := matchChecklistItems(cl.Items, p.Items)
+	matched := matchChecklistItems(cl.Items, p.Items, func() map[string][]string { return w.earlierMatches(ctx, op) })
+	// known holds every item ID seen so far, so the item a create adds is the
+	// one ID new in its response, whatever ClickUp did to its name.
+	known := make(map[string]bool, len(cl.Items))
+	for _, ci := range cl.Items {
+		known[ci.ID] = true
+	}
 	for i, it := range p.Items {
 		ex, ok := matched[i]
 		if !ok {
 			if it.Void {
 				continue
 			}
-			known := map[string]bool{}
-			for _, ci := range cl.Items {
-				known[ci.ID] = true
-			}
 			updated, err := w.clickup.CreateChecklistItem(ctx, cl.ID, it.Name)
 			if err != nil {
 				return checklistWriteError(fmt.Sprintf("creating checklist item %q", it.Name), err)
 			}
+			var added []clickup.ChecklistItem
 			if len(updated.Items) > 0 {
 				cl.Items = updated.Items
+				for _, ci := range cl.Items {
+					if !known[ci.ID] {
+						known[ci.ID] = true
+						added = append(added, ci)
+					}
+				}
 			}
 			if !it.Resolved {
 				continue
 			}
 			// New items start unresolved; find this one to resolve it.
-			for _, ci := range cl.Items {
-				if !known[ci.ID] && ci.Name == it.Name {
-					ex, ok = ci, true
-					break
-				}
-			}
-			if !ok {
+			if ex, ok = createdItem(added, it.Name); !ok {
 				// A retry finds the item by name and resolves it.
 				return fmt.Errorf("created checklist item %q is missing from ClickUp's response", it.Name)
 			}
 		}
-		if ex.Name != it.Name || ex.Resolved != it.Resolved {
+		if !sameChecklistName(ex.Name, it.Name) || ex.Resolved != it.Resolved {
 			if err := w.clickup.UpdateChecklistItem(ctx, cl.ID, ex.ID, it.Name, it.Resolved); err != nil {
 				return checklistWriteError(fmt.Sprintf("updating checklist item %q", it.Name), err)
 			}
@@ -352,11 +356,68 @@ func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 	return nil
 }
 
+// createdItem picks the item a create added from the items new in its
+// response: the only one, else (someone else added items meanwhile) the one
+// named name.
+func createdItem(added []clickup.ChecklistItem, name string) (clickup.ChecklistItem, bool) {
+	if len(added) == 1 {
+		return added[0], true
+	}
+	for _, ci := range added {
+		if sameChecklistName(ci.Name, name) {
+			return ci, true
+		}
+	}
+	return clickup.ChecklistItem{}, false
+}
+
+// sameChecklistName compares names as ClickUp may store them (whitespace
+// collapsed and trimmed), so a name it normalized isn't renamed on every sync.
+func sameChecklistName(a, b string) bool {
+	return session.NormalizeChecklistName(a) == session.NormalizeChecklistName(b)
+}
+
+// maxEarlierChecklistOps caps how many of a task's earlier SYNC_CHECKLIST ops
+// are read for the Match values its items had before.
+const maxEarlierChecklistOps = 50
+
+// earlierMatches maps each obligation Key to the Match values its item had in
+// the task's earlier checklist ops, so an item whose describe text changed in
+// the manifest is still found without storing ClickUp IDs. A failed lookup
+// only loses that matching pass, so it is logged rather than failing the sync.
+func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[string][]string {
+	ops, err := w.store.ListSyncOps(ctx, op.TaskID, op.Operation, op.ID, maxEarlierChecklistOps)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] couldn't list earlier checklist ops for task %s: %v\n", op.TaskID, err)
+		return nil
+	}
+	out := map[string][]string{}
+	seen := map[[2]string]bool{}
+	for _, o := range ops {
+		var p session.ChecklistPayload
+		if json.Unmarshal([]byte(o.Payload), &p) != nil {
+			continue
+		}
+		for _, it := range p.Items {
+			k := [2]string{it.Key, session.NormalizeChecklistName(it.Match)}
+			if it.Key == "" || k[1] == "" || seen[k] {
+				continue
+			}
+			seen[k] = true
+			out[it.Key] = append(out[it.Key], k[1])
+		}
+	}
+	return out
+}
+
 // matchChecklistItems pairs each wanted item with an existing ClickUp item,
-// each existing item used at most once: first by exact name, then by the
-// wanted item's stable part (session.ChecklistItemMatches), so an item whose
-// status text changed is updated rather than duplicated.
-func matchChecklistItems(existing []clickup.ChecklistItem, want []session.ChecklistItem) map[int]clickup.ChecklistItem {
+// each existing item used at most once: first by name, then by the wanted
+// item's stable part (session.ChecklistItemMatches), so an item whose status
+// text changed is updated rather than duplicated, and last by a stable part
+// the same Key had in an earlier op (earlier, called only if that pass can
+// match anything), so an item whose describe text changed is renamed. The
+// current name and Match go first so they win over history.
+func matchChecklistItems(existing []clickup.ChecklistItem, want []session.ChecklistItem, earlier func() map[string][]string) map[int]clickup.ChecklistItem {
 	matched := map[int]clickup.ChecklistItem{}
 	used := map[string]bool{}
 	pass := func(match func(name string, it session.ChecklistItem) bool) {
@@ -372,8 +433,22 @@ func matchChecklistItems(existing []clickup.ChecklistItem, want []session.Checkl
 			}
 		}
 	}
-	pass(func(name string, it session.ChecklistItem) bool { return name == it.Name })
-	pass(func(name string, it session.ChecklistItem) bool { return session.ChecklistItemMatches(name, it.Match) })
+	pass(func(name string, it session.ChecklistItem) bool { return sameChecklistName(name, it.Name) })
+	pass(func(name string, it session.ChecklistItem) bool {
+		return session.ChecklistItemMatches(name, session.NormalizeChecklistName(it.Match))
+	})
+	if earlier == nil || len(matched) == len(want) || len(used) == len(existing) {
+		return matched
+	}
+	byKey := earlier()
+	pass(func(name string, it session.ChecklistItem) bool {
+		for _, m := range byKey[it.Key] {
+			if session.ChecklistItemMatches(name, m) {
+				return true
+			}
+		}
+		return false
+	})
 	return matched
 }
 

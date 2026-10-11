@@ -333,9 +333,10 @@ func (s *Service) Waive(ctx context.Context, sessionID, obligationID, rationale 
 	if err := s.store.WaiveObligation(ctx, o.ID, d.ID, rationale, time.Now()); err != nil {
 		return nil, fmt.Errorf("failed to waive obligation: %w", err)
 	}
-	before := checklistItem(o)
 	o.Status, o.WaiverDecisionID, o.Evidence = ObligationWaived, d.ID, rationale
-	s.syncChecklistItem(ctx, sess, st, before, o)
+	// Waiving always renames the item. Waive doesn't evaluate, so this is
+	// its only checklist op.
+	s.enqueueChecklist(ctx, sess, st.obligations, true)
 	res := s.obligationResult(ctx, st, o)
 	res.DecisionID = d.ID
 	return res, nil
@@ -373,7 +374,7 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if s.completeness == nil {
 		return nil, unchecked("completeness is not enabled")
 	}
-	st, err := s.tryEvaluateCompleteness(ctx, sess, true)
+	st, mr, err := s.evaluateUnsaved(ctx, sess)
 	switch {
 	case err != nil:
 		return nil, unchecked("the evaluation failed: " + err.Error())
@@ -383,6 +384,14 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 		return nil, unchecked(st.readErr)
 	case st.eval.Error != "":
 		return nil, unchecked(fmt.Sprintf("the completeness manifest %s is invalid: %s", st.eval.Manifest, st.eval.Error))
+	}
+	// The evaluation is written now, whether or not the attestation goes
+	// ahead, but its checklist is queued once, on the way out, so that one
+	// op carries the attestation too. A failed write queues nothing (see
+	// persistMerge).
+	checklistChanged := mr.checklistChanged
+	if s.writeMerge(ctx, st, mr) == nil {
+		defer func() { s.enqueueChecklist(ctx, sess, st.obligations, checklistChanged) }()
 	}
 	o, err := st.resolvable(sess.ID, obligationID)
 	if err != nil {
@@ -420,17 +429,10 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if status == ObligationSatisfied {
 		o.SatisfiedAt = &now
 	}
-	s.syncChecklistItem(ctx, sess, st, before, o)
+	// Evidence isn't part of the item, so replacing an attestation's
+	// evidence changes nothing.
+	checklistChanged = checklistChanged || checklistItem(o) != before
 	return s.obligationResult(ctx, st, o), nil
-}
-
-// syncChecklistItem queues the session's checklist when o's item changed
-// from before (e.g. it is now waived or attested). Evidence isn't part of the
-// item, so replacing an attestation's evidence pushes nothing.
-func (s *Service) syncChecklistItem(ctx context.Context, sess *Session, st *completenessState, before ChecklistItem, o *Obligation) {
-	if checklistItem(o) != before {
-		s.enqueueChecklist(ctx, sess, st.obligations)
-	}
 }
 
 // finding returns the evaluation's finding for o, or nil when o wasn't
@@ -580,8 +582,9 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	}
 	// The plan is only recorded once all of its obligations are: a plan
 	// state with obligations missing would claim work is tracked that isn't.
-	// The checklist is pushed whether or not the plan changed it, so it shows
-	// the planned work as soon as the plan is made.
+	// The checklist is pushed whether or not the plan changed it, unless the
+	// task's latest checklist op already carries it, so it shows the planned
+	// work as soon as the plan is made.
 	st, mr := mergeEvaluation(sess, stored, ev)
 	mr.checklistChanged = true
 	if err := s.persistMerge(ctx, sess, st, mr); err != nil {

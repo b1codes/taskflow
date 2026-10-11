@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1209,5 +1210,69 @@ func TestHasNewerOp(t *testing.T) {
 	}
 	if hasNewer(older) {
 		t.Error("a newer op that will never run must not hold back an older one")
+	}
+
+	// A retried older op must not undo a newer state that already applied.
+	done := enqueue(session.OpSyncChecklist, "task-a")
+	if err := st.MarkDone(ctx, done.ID); err != nil {
+		t.Fatalf("MarkDone failed: %v", err)
+	}
+	if !hasNewer(older) {
+		t.Error("a newer op that is done must hold back an older one")
+	}
+}
+
+func TestListSyncOps(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if op, err := st.LatestSyncOp(ctx, "task-a", session.OpSyncChecklist); err != nil || op != nil {
+		t.Fatalf("expected no op for an empty queue, got %+v, %v", op, err)
+	}
+	for i, p := range []string{`{"n":1}`, `{"n":2}`, `{"n":3}`} {
+		for _, op := range []session.SyncOp{
+			{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: p},
+			{Operation: "POST_COMMENT", TaskID: "task-a", Payload: p},
+			{Operation: session.OpSyncChecklist, TaskID: "task-b", Payload: p},
+		} {
+			op.MaxRetries, op.CreatedAt = 3, time.Now().Add(time.Duration(i)*time.Second)
+			if err := st.EnqueueSync(ctx, op); err != nil {
+				t.Fatalf("EnqueueSync failed: %v", err)
+			}
+		}
+	}
+
+	latest, err := st.LatestSyncOp(ctx, "task-a", session.OpSyncChecklist)
+	if err != nil || latest == nil {
+		t.Fatalf("LatestSyncOp: %+v, %v", latest, err)
+	}
+	if latest.Payload != `{"n":3}` || latest.Status != "PENDING" || latest.MaxRetries != 3 {
+		t.Errorf("unexpected latest op: %+v", latest)
+	}
+
+	all, err := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 10)
+	if err != nil {
+		t.Fatalf("ListSyncOps failed: %v", err)
+	}
+	var got []string
+	for _, op := range all {
+		got = append(got, op.Payload)
+	}
+	if strings.Join(got, " ") != `{"n":3} {"n":2} {"n":1}` {
+		t.Errorf("expected the task's checklist ops newest first, got %v", got)
+	}
+
+	before, err := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, latest.ID, 1)
+	if err != nil {
+		t.Fatalf("ListSyncOps failed: %v", err)
+	}
+	if len(before) != 1 || before[0].Payload != `{"n":2}` {
+		t.Errorf("expected only the op just before the latest, got %+v", before)
 	}
 }
