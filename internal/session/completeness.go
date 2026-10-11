@@ -138,6 +138,16 @@ type PlannedSubject struct {
 	Subject string
 }
 
+// DroppedSubject is a stored obligation's rule and subject that the manifest
+// no longer applies to.
+type DroppedSubject struct {
+	RuleID  string
+	Subject string
+	// Reason says why (the rule left the manifest, its stack is missing, or
+	// the subject no longer fits the rule).
+	Reason string
+}
+
 // Evaluation is the result of checking a session's changes against the
 // project's completeness manifest.
 type Evaluation struct {
@@ -151,13 +161,21 @@ type Evaluation struct {
 	Findings []CompletenessFinding
 	// Partial means the changed set may be incomplete (no git, only
 	// uncommitted changes readable, or capped), so stored obligations that
-	// weren't found are kept rather than voided.
+	// weren't found are kept rather than voided. Dropped ones are voided
+	// regardless.
 	Partial  bool
 	Warnings []string
 	// Gate is the manifest's completion gate, "" when it sets none.
 	Gate string
 	// Planned are the subjects of the plan items passed to Plan.
 	Planned []PlannedSubject
+	// Dropped are rechecked (rule, subject) pairs the manifest can no longer
+	// apply to: the rule was removed or renamed, its stack is missing, or the
+	// subject is outside the stack root or no longer fits the rule. Their
+	// obligations, planned and inherited ones included, are voided whatever
+	// their status, even in a partial evaluation: dropping is decided by the
+	// manifest, not by the change set.
+	Dropped []DroppedSubject
 }
 
 // ErrInvalidPlan is returned by Plan for items the manifest can't plan.
@@ -169,8 +187,10 @@ type CompletenessEvaluator interface {
 	// BaseSHA returns the commit a new session's changes are measured from.
 	BaseSHA(projectPath string) (string, error)
 	// Evaluate returns nil, nil when the project has no manifest. stored are
-	// the session's obligations: when the changed set is partial, open and
-	// satisfied ones are verified again even if their subject isn't in it.
+	// the session's obligations: planned and inherited ones are verified
+	// again even if their subject isn't in the changed set, and when it is
+	// partial, open, satisfied, and attested ones too. Those the manifest can
+	// no longer apply to are reported in Evaluation.Dropped.
 	Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error)
 	// Plan is Evaluate with the plan items' subjects checked too, whether or
 	// not their files exist yet; their findings include the subject-file
@@ -272,11 +292,21 @@ type mergeResult struct {
 //   - other existing ones are recomputed open ⇄ satisfied (a void one that
 //     is found again comes back);
 //   - stored keys that weren't found are voided (e.g. the file was reverted),
-//     unless they were planned, inherited, waived, or attested, or the
-//     evaluation is partial.
+//     unless they were planned, or the evaluation is partial, or they
+//     originated in this session and were waived or attested. An inherited
+//     obligation that isn't found is voided whatever its status: it is
+//     rechecked only while its file exists, so the work it named is gone;
+//   - stored keys whose (rule, subject) the manifest dropped (ev.Dropped)
+//     are voided whatever their status, planned or not, even when the
+//     evaluation is partial, since the manifest decides that, not the
+//     change set.
 func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, now time.Time) *mergeResult {
 	mr := &mergeResult{newlyOpen: map[string]bool{}, attest: map[string]string{}}
 	byKey := make(map[string]*Obligation, len(stored))
+	dropped := make(map[string]bool, len(ev.Dropped))
+	for _, d := range ev.Dropped {
+		dropped[subjectKey(d.RuleID, d.Subject)] = true
+	}
 	planned := map[string]bool{}
 	for _, o := range stored {
 		byKey[o.key()] = o
@@ -384,17 +414,21 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 		}
 	}
 
-	if !ev.Partial {
-		for _, o := range stored {
-			if found[o.key()] || o.Planned || o.InheritedFrom != "" || o.attested() {
+	for _, o := range stored {
+		if o.Status == ObligationVoid || found[o.key()] {
+			continue
+		}
+		if !dropped[o.subjectKey()] {
+			if ev.Partial || o.Planned {
 				continue
 			}
-			if o.Status == ObligationOpen || o.Status == ObligationSatisfied {
-				o.Status = ObligationVoid
-				o.UpdatedAt = now
-				mr.voided = append(mr.voided, o)
+			if o.InheritedFrom == "" && (o.Status == ObligationWaived || o.attested()) {
+				continue
 			}
 		}
+		o.Status = ObligationVoid
+		o.UpdatedAt = now
+		mr.voided = append(mr.voided, o)
 	}
 	return mr
 }
@@ -409,6 +443,9 @@ type completenessState struct {
 	// readErr is set when the stored obligations couldn't be read; the state
 	// then can't say what is owed, and must not claim nothing is.
 	readErr string
+	// unsaved are the IDs of obligations merged in memory but not written
+	// yet (see mergeEvaluation); they aren't known to the store.
+	unsaved map[string]bool
 }
 
 // evaluateCompleteness evaluates sess and, when merge is set and the
@@ -452,44 +489,91 @@ func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, me
 }
 
 // applyEvaluation merges ev into the session's stored obligations and writes
-// the result, unless the manifest is invalid.
+// the result, unless the manifest is invalid. Failed writes are logged and
+// never fail the caller; callers that must know use mergeEvaluation and
+// persistMerge.
 func (s *Service) applyEvaluation(ctx context.Context, sess *Session, stored []*Obligation, ev *Evaluation) *completenessState {
+	st, mr := mergeEvaluation(sess, stored, ev)
+	_ = s.persistMerge(ctx, st, mr)
+	return st
+}
+
+// mergeEvaluation merges ev into the session's stored obligations in memory,
+// writing nothing. The merge to write is nil when the manifest is invalid
+// (stored obligations are then left as they are); persistMerge writes it.
+// Until then, obligations the merge inserted are marked unsaved in the state.
+func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*completenessState, *mergeResult) {
 	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
 	if ev.Error != "" {
-		return st
+		return st, nil
 	}
+	have := make(map[string]bool, len(stored))
+	for _, o := range stored {
+		have[o.ID] = true
+	}
+	mr := mergeObligations(sess.ID, stored, ev, time.Now())
+	st.obligations = mr.obligations
+	st.newlyOpen = mr.newlyOpen
+	st.newlySatisfied = mr.newlySatisfied
+	st.attest = mr.attest
+	st.unsaved = map[string]bool{}
+	for _, o := range mr.upserts {
+		if !have[o.ID] {
+			st.unsaved[o.ID] = true
+		}
+	}
+	return st, mr
+}
 
-	now := time.Now()
-	mr := mergeObligations(sess.ID, stored, ev, now)
+// persistMerge writes a merge from mergeEvaluation: its upserts, then its
+// voids. A failed write is logged and the others still go ahead; the
+// returned error joins every failure, nil when all were written.
+func (s *Service) persistMerge(ctx context.Context, st *completenessState, mr *mergeResult) error {
+	if mr == nil {
+		return nil
+	}
+	var errs []error
 	for _, o := range mr.upserts {
 		id := o.ID
 		if err := s.store.UpsertObligation(ctx, o); err != nil {
 			fmt.Fprintf(os.Stderr, "[session] failed to save obligation %s/%s for %s: %v\n", o.RuleID, o.RequirementID, o.Subject, err)
+			errs = append(errs, fmt.Errorf("obligation %s/%s for %s: %w", o.RuleID, o.RequirementID, o.Subject, err))
 			continue
 		}
 		// Another evaluation (the MCP server and the CLI) inserted the key
 		// first; the upsert kept its ID, so follow it.
 		if o.ID != id {
-			if mr.newlyOpen[id] {
-				delete(mr.newlyOpen, id)
-				mr.newlyOpen[o.ID] = true
+			if st.newlyOpen[id] {
+				delete(st.newlyOpen, id)
+				st.newlyOpen[o.ID] = true
 			}
-			if prompt, ok := mr.attest[id]; ok {
-				delete(mr.attest, id)
-				mr.attest[o.ID] = prompt
+			if prompt, ok := st.attest[id]; ok {
+				delete(st.attest, id)
+				st.attest[o.ID] = prompt
 			}
 		}
 	}
 	for _, o := range mr.voided {
-		if err := s.store.UpdateObligationStatus(ctx, o.ID, ObligationVoid, now); err != nil {
+		if err := s.store.UpdateObligationStatus(ctx, o.ID, ObligationVoid, o.UpdatedAt); err != nil {
 			fmt.Fprintf(os.Stderr, "[session] failed to void obligation %s: %v\n", o.ID, err)
+			errs = append(errs, fmt.Errorf("voiding obligation %s: %w", o.ID, err))
 		}
 	}
-	st.obligations = mr.obligations
-	st.newlyOpen = mr.newlyOpen
-	st.newlySatisfied = mr.newlySatisfied
-	st.attest = mr.attest
-	return st
+	st.unsaved = nil
+	return errors.Join(errs...)
+}
+
+// evaluateUnsaved is tryEvaluateCompleteness merging in memory only: it
+// returns the merge for persistMerge to write once the caller decides to go
+// ahead (Stop, after the completion gate). The merge is nil when there is
+// nothing to write.
+func (s *Service) evaluateUnsaved(ctx context.Context, sess *Session) (*completenessState, *mergeResult, error) {
+	st, err := s.tryEvaluateCompleteness(ctx, sess, false)
+	if st == nil || err != nil || st.readErr != "" {
+		return st, nil, err
+	}
+	merged, mr := mergeEvaluation(sess, st.obligations, st.eval)
+	return merged, mr, nil
 }
 
 // errText is the evaluation's manifest error, or why the obligations

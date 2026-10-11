@@ -265,6 +265,8 @@ func (m *Manifest) validate() []string {
 	if m.Version != 1 {
 		add("version: must be 1, got %d", m.Version)
 	}
+	// The gate names mirror session.GateMode; this package stays free of a
+	// session import, and session treats any name it doesn't know as block.
 	switch m.Gate {
 	case "", "report", "review", "block":
 	default:

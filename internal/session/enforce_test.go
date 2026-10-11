@@ -341,7 +341,9 @@ func TestService_Attest(t *testing.T) {
 	ctx := context.Background()
 	e2e := finding("react-screen", "e2e", "Page.tsx", false)
 	e2e.AttestPrompt = "Name the spec covering Page"
-	ev := &fakeEvaluator{eval: evalWith(e2e, finding("react-screen", "story", "Page.tsx", false))}
+	contract := finding("react-screen", "contract", "Page.tsx", false)
+	contract.AttestPrompt = "Name the contract test covering Page"
+	ev := &fakeEvaluator{eval: evalWith(e2e, finding("react-screen", "story", "Page.tsx", false), contract)}
 	srv, store, dir := newCompletenessService(t, ev)
 	res, err := srv.Start(ctx, "task-1", dir, false)
 	if err != nil {
@@ -358,15 +360,20 @@ func TestService_Attest(t *testing.T) {
 	}
 
 	// The spec isn't in the diff yet: the claim stands alone.
+	calls := ev.calls
 	got, err := srv.Attest(ctx, sid, id, "e2e/checkout.spec.ts: 'pays with a card'")
 	if err != nil {
 		t.Fatalf("Attest: %v", err)
 	}
-	if got.Obligation.Status != ObligationAttested || got.Obligation.Evidence != "e2e/checkout.spec.ts: 'pays with a card'" || got.Summary.Attested != 1 {
+	if n := ev.calls - calls; n != 1 {
+		t.Errorf("Attest evaluated %d times, want once", n)
+	}
+	if got.Obligation.Status != ObligationAttested || got.Obligation.Evidence != "e2e/checkout.spec.ts: 'pays with a card'" ||
+		got.Obligation.Attest != "Name the spec covering Page" || got.Summary != (CompletenessSummary{Open: 2, Attested: 1}) || len(got.StillOpen) != 2 {
 		t.Errorf("attested = %+v", got)
 	}
-	if o := store.obligation(id); !slices.Equal(o.VerifiedLevels, []string{"attest"}) {
-		t.Errorf("levels = %v", o.VerifiedLevels)
+	if o := store.obligation(id); o.Status != ObligationAttested || o.SatisfiedAt != nil || !slices.Equal(o.VerifiedLevels, []string{"attest"}) {
+		t.Errorf("stored = %+v", o)
 	}
 	if slices.Contains(store.ops(), "POST_DECISION") {
 		t.Error("attestations don't post comments")
@@ -381,28 +388,157 @@ func TestService_Attest(t *testing.T) {
 	if o := store.obligation(id); o.Status != ObligationSatisfied || !slices.Equal(o.VerifiedLevels, []string{"structural", "attest"}) {
 		t.Errorf("attested + checks = %+v", o)
 	}
-	if cp.Completeness.Summary != (CompletenessSummary{Open: 1, Satisfied: 1}) {
+	if cp.Completeness.Summary != (CompletenessSummary{Open: 2, Satisfied: 1}) {
 		t.Errorf("summary = %+v", cp.Completeness.Summary)
 	}
 
-	// Attesting a waived obligation takes the waiver back.
-	story := store.find(sid, "story")
-	if _, err := srv.Waive(ctx, sid, story.ID, "not needed"); err != nil {
+	// Replacing the evidence while the checks pass keeps it satisfied.
+	got, err = srv.Attest(ctx, sid, id, "e2e/checkout.spec.ts: 'pays with a card', 'retries'")
+	if err != nil || got.Obligation.Status != ObligationSatisfied {
+		t.Fatalf("re-attesting = %+v, %v", got, err)
+	}
+	if o := store.obligation(id); o.Status != ObligationSatisfied || o.SatisfiedAt == nil || o.Evidence != "e2e/checkout.spec.ts: 'pays with a card', 'retries'" ||
+		!slices.Equal(o.VerifiedLevels, []string{"structural", "attest"}) {
+		t.Errorf("stored = %+v", o)
+	}
+
+	// Attesting a waived obligation that asks for an attestation takes the
+	// waiver back, and unlinks the waiver's decision.
+	c := store.find(sid, "contract")
+	if _, err := srv.Waive(ctx, sid, c.ID, "not needed"); err != nil {
 		t.Fatal(err)
 	}
-	ev.eval.Findings[1].ChecksPassed = true
-	got, err = srv.Attest(ctx, sid, story.ID, "Page.stories.tsx covers it after all")
-	if err != nil || got.Obligation.Status != ObligationSatisfied {
-		t.Errorf("attesting a waived obligation = %+v, %v", got, err)
+	if o := store.obligation(c.ID); o.WaiverDecisionID == "" {
+		t.Fatalf("waiver not linked: %+v", o)
+	}
+	ev.eval.Findings[2].ChecksPassed = true
+	got, err = srv.Attest(ctx, sid, c.ID, "contract/page_test.go covers it after all")
+	if err != nil || got.Obligation.Status != ObligationSatisfied || got.Summary != (CompletenessSummary{Open: 1, Satisfied: 2}) {
+		t.Fatalf("attesting a waived obligation = %+v, %v", got, err)
+	}
+	if o := store.obligation(c.ID); o.Status != ObligationSatisfied || o.WaiverDecisionID != "" || o.SatisfiedAt == nil || o.Evidence != "contract/page_test.go covers it after all" {
+		t.Errorf("stored after taking back the waiver = %+v", o)
 	}
 
 	// An obligation its checks already satisfy has nothing to attest.
 	plain := &fakeEvaluator{eval: evalWith(finding("r", "q", "A", true))}
 	srv2, store2, dir2 := newCompletenessService(t, plain)
 	res2, _ := srv2.Start(ctx, "task-2", dir2, false)
-	if _, err := srv2.Attest(ctx, res2.Session.ID, store2.find(res2.Session.ID, "q").ID, "x"); !errors.Is(err, ErrUnknownObligation) {
+	if _, err := srv2.Attest(ctx, res2.Session.ID, store2.find(res2.Session.ID, "q").ID, "x"); !errors.Is(err, ErrUnknownObligation) || !strings.Contains(err.Error(), "already satisfied") {
 		t.Errorf("attesting a satisfied obligation = %v", err)
 	}
+}
+
+// TestService_AttestRefusesFileChecks: an attestation can't stand in for
+// work checked from files, so it can't get past the completion gate.
+func TestService_AttestRefusesFileChecks(t *testing.T) {
+	ctx := context.Background()
+	srv, store, dir := newCompletenessService(t, &fakeEvaluator{eval: screenEval()})
+	srv.WithGate(GateBlock)
+	res, err := srv.Start(ctx, "task-1", dir, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sid := res.Session.ID
+	story := store.find(sid, "story")
+
+	_, err = srv.Attest(ctx, sid, story.ID, "done")
+	if !errors.Is(err, ErrNotAttestable) || !strings.Contains(err.Error(), "asks for no attestation") ||
+		!strings.Contains(err.Error(), "Page.tsx.story") || !strings.Contains(err.Error(), "tf_waive") {
+		t.Errorf("attesting a file-checked obligation = %v", err)
+	}
+	if o := store.obligation(story.ID); o.Status != ObligationOpen || o.Evidence != "" || slices.Contains(o.VerifiedLevels, levelAttest) {
+		t.Errorf("a refused attestation changed the obligation: %+v", o)
+	}
+	if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrIncompleteSession) {
+		t.Errorf("Stop = %v; the block gate must still refuse", err)
+	}
+
+	// A waiver of it can't be taken back by attesting either.
+	if _, err := srv.Waive(ctx, sid, story.ID, "behind a flag"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Attest(ctx, sid, story.ID, "done"); !errors.Is(err, ErrNotAttestable) {
+		t.Errorf("attesting a waived file-checked obligation = %v", err)
+	}
+	if o := store.obligation(story.ID); o.Status != ObligationWaived || o.WaiverDecisionID == "" || o.Evidence != "behind a flag" {
+		t.Errorf("a refused attestation changed the waiver: %+v", o)
+	}
+}
+
+// TestService_AttestUnchecked: an attestation that can't be checked against
+// its requirement is refused, never accepted blind.
+func TestService_AttestUnchecked(t *testing.T) {
+	ctx := context.Background()
+	e2e := finding("react-screen", "e2e", "Page.tsx", false)
+	e2e.AttestPrompt = "Name the spec"
+	start := func(t *testing.T) (*Service, *mockStore, *fakeEvaluator, string, string) {
+		t.Helper()
+		ev := &fakeEvaluator{eval: evalWith(e2e)}
+		srv, store, dir := newCompletenessService(t, ev)
+		res, err := srv.Start(ctx, "task-1", dir, false)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		return srv, store, ev, res.Session.ID, store.find(res.Session.ID, "e2e").ID
+	}
+	refused := func(t *testing.T, store *mockStore, err error, id, want string) {
+		t.Helper()
+		if !errors.Is(err, ErrCompletenessUnchecked) || !strings.Contains(err.Error(), want) {
+			t.Errorf("Attest = %v; want ErrCompletenessUnchecked (%s)", err, want)
+		}
+		if o := store.obligation(id); o.Status != ObligationOpen || o.Evidence != "" {
+			t.Errorf("a refused attestation changed the obligation: %+v", o)
+		}
+	}
+
+	t.Run("invalid manifest", func(t *testing.T) {
+		srv, store, ev, sid, id := start(t)
+		ev.eval = &Evaluation{Manifest: ".agents/completeness.yaml", Error: "version: must be 1"}
+		_, err := srv.Attest(ctx, sid, id, "e2e/page.spec.ts")
+		refused(t, store, err, id, "version: must be 1")
+	})
+
+	t.Run("no manifest", func(t *testing.T) {
+		srv, store, ev, sid, id := start(t)
+		ev.eval = nil
+		_, err := srv.Attest(ctx, sid, id, "e2e/page.spec.ts")
+		refused(t, store, err, id, "no completeness manifest")
+	})
+
+	t.Run("failed evaluation", func(t *testing.T) {
+		srv, store, ev, sid, id := start(t)
+		ev.err = errors.New("permission denied")
+		_, err := srv.Attest(ctx, sid, id, "e2e/page.spec.ts")
+		refused(t, store, err, id, "permission denied")
+	})
+
+	t.Run("completeness off", func(t *testing.T) {
+		srv, store, _, sid, id := start(t)
+		srv.WithCompleteness(nil)
+		_, err := srv.Attest(ctx, sid, id, "e2e/page.spec.ts")
+		refused(t, store, err, id, "not enabled")
+	})
+
+	t.Run("unreadable obligations", func(t *testing.T) {
+		store := newMockStore()
+		failing := false
+		hook := &listHook{mockStore: store, list: func(id string) ([]*Obligation, error) {
+			if failing {
+				return nil, errors.New("database is locked")
+			}
+			return store.ListObligations(context.Background(), id)
+		}}
+		srv := NewService(hook, &mockGit{ctx: &GitContext{}}, nil).WithCompleteness(&fakeEvaluator{eval: evalWith(e2e)})
+		res, err := srv.Start(ctx, "task-1", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		id := store.find(res.Session.ID, "e2e").ID
+		failing = true
+		_, err = srv.Attest(ctx, res.Session.ID, id, "e2e/page.spec.ts")
+		refused(t, store, err, id, "database is locked")
+	})
 }
 
 // plannedScreen resolves plan items for react-screen to Name.tsx, with a
@@ -587,7 +723,8 @@ func TestService_InheritOnRestart(t *testing.T) {
 	}
 
 	// Rework: the new session's diff no longer touches the page.
-	ev.eval = evalWith()
+	// Page.tsx still exists, so the inherited obligations' rechecks find it.
+	ev.eval = evalWith(finding("react-screen", "story", "Page.tsx", false), e2e, finding("react-screen", "contract", "Page.tsx", false))
 	second, err := srv.Start(ctx, "task-1", dir, false)
 	if err != nil {
 		t.Fatalf("restart: %v", err)

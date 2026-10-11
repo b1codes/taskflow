@@ -69,19 +69,33 @@ type RuleSummary struct {
 type Recheck struct {
 	RuleID  string
 	Subject string
-	// Declared subjects (planned with tf_plan, or inherited from an earlier
-	// session) are checked even when the file doesn't exist (yet). Others are
-	// checked only while it exists.
+	// Declared subjects (planned with tf_plan) are checked even when the file
+	// doesn't exist (yet). Others, inherited ones included, are checked only
+	// while it exists: their trigger fired on the file, so once it is gone the
+	// work they named is too.
 	Declared bool
 	// SubjectFile adds the subject-file requirement: the planned file itself
 	// must exist. File-scoped rules only.
 	SubjectFile bool
 }
 
+// DroppedRecheck is a recheck the manifest no longer applies to, so its
+// obligations can't be found again whatever changes.
+type DroppedRecheck struct {
+	Recheck
+	// Reason says why, for warnings.
+	Reason string
+}
+
 type Result struct {
 	Stacks   []ResolvedStack
 	Rules    []RuleSummary
 	Findings []Finding
+	// Dropped are the rechecks that can no longer apply: their rule left the
+	// manifest, its stack is missing, or the subject is outside the stack
+	// root or no longer fits the rule. It is decided by the manifest alone,
+	// never by the change set.
+	Dropped  []DroppedRecheck
 	Warnings []string
 }
 
@@ -104,9 +118,11 @@ const commandsExecuted = false
 // the attestation stands in for the command it can't run yet.
 //
 // recheck lists earlier findings to verify again even when their subject
-// isn't in changes: declared subjects always, others only when changes may
-// be incomplete (a partial change set), since a recheck counts as found and
-// so can't be voided.
+// isn't in changes; a recheck that still applies is reported as found, so the
+// caller won't void it. Declared subjects are checked even when the file
+// doesn't exist, others only while it does. A recheck the manifest can no
+// longer apply to at all is reported in Result.Dropped instead, so the caller
+// can void its obligations whatever the change set.
 func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck) *Result {
 	res := &Result{Stacks: ResolveStacks(projectPath, m, o)}
 	stacks := map[string]*ResolvedStack{}
@@ -121,6 +137,9 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 	for _, rc := range recheck {
 		rechecks[rc.RuleID] = append(rechecks[rc.RuleID], rc)
 	}
+	drop := func(rc Recheck, reason string) {
+		res.Dropped = append(res.Dropped, DroppedRecheck{Recheck: rc, Reason: reason})
+	}
 	cache := newFSCache()
 
 	for i := range m.Rules {
@@ -132,6 +151,9 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 		if r.Stack != "" {
 			rs = stacks[r.Stack]
 			if rs.Missing {
+				for _, rc := range rechecks[r.ID] {
+					drop(rc, fmt.Sprintf("stack %s is missing", r.Stack))
+				}
 				continue
 			}
 			root = rs.Root
@@ -150,7 +172,15 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			if subject == "" {
 				subject = "*"
 			}
-			fired := slices.ContainsFunc(rechecks[r.ID], func(rc Recheck) bool { return rc.Subject == subject })
+			fired := false
+			for _, rc := range rechecks[r.ID] {
+				if rc.Subject == subject {
+					fired = true
+				} else {
+					// The rule's stack, or its scope, changed since.
+					drop(rc, fmt.Sprintf("the rule now applies to %q", subject))
+				}
+			}
 			for _, ch := range c.changes {
 				if _, ok := r.match(ch); ok {
 					fired = true
@@ -184,10 +214,12 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 		for _, rc := range rechecks[r.ID] {
 			rel, ok := c.rootRel(rc.Subject)
 			if !ok {
+				drop(rc, fmt.Sprintf("it is outside stack %s's root %q", r.Stack, root))
 				continue
 			}
 			caps, ok := r.matchPath(rel)
 			if !ok {
+				drop(rc, "it no longer fits the rule's triggers")
 				continue
 			}
 			if rc.SubjectFile {
@@ -196,12 +228,22 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			if checked[rel] {
 				continue
 			}
+			// No trigger fires on a deleted file (deleted: is parsed but not
+			// acted on, and changed: skips deletions), so an undeclared
+			// subject existed when it was found, and once it's gone so is the
+			// work. Acting on deleted: triggers would need their subjects
+			// checked without the file.
 			if !rc.Declared {
 				if _, err := statInRoot(c.rootAbs, rel); err != nil {
 					continue
 				}
 			}
 			fileFindings(rel, caps)
+		}
+	}
+	for _, rc := range recheck {
+		if !slices.ContainsFunc(res.Rules, func(r RuleSummary) bool { return r.ID == rc.RuleID }) {
+			drop(rc, "the rule is no longer in the manifest")
 		}
 	}
 	return res

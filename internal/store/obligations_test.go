@@ -304,6 +304,42 @@ func TestSQLiteStore_AttestAndWaive(t *testing.T) {
 	}
 }
 
+// TestSQLiteStore_AttestClearsWaiver: attesting a waived obligation takes
+// the waiver back, so it must no longer link the revoked waiver decision.
+func TestSQLiteStore_AttestClearsWaiver(t *testing.T) {
+	t.Parallel()
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	newSessionFixture(t, st, "s1")
+	now := time.Now().Truncate(time.Second)
+	if err := st.UpsertObligation(ctx, &session.Obligation{
+		ID: "o1", SessionID: "s1", RuleID: "r", RequirementID: "e2e", Subject: "A", Severity: "required", Describe: "e2e",
+		Status: session.ObligationOpen, FirstSeenAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateDecision(ctx, &session.Decision{ID: "d1", SessionID: "s1", Topic: "waiver", Decision: "skip", Rationale: "n/a", Status: "rejected_alternative", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WaiveObligation(ctx, "o1", "d1", "doesn't apply", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AttestObligation(ctx, "o1", "e2e/a.spec.ts covers it", []string{"attest"}, session.ObligationAttested, now); err != nil {
+		t.Fatalf("AttestObligation: %v", err)
+	}
+	list, err := st.ListObligations(ctx, "s1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListObligations = %d, %v", len(list), err)
+	}
+	if o := list[0]; o.Status != session.ObligationAttested || o.WaiverDecisionID != "" || o.Evidence != "e2e/a.spec.ts covers it" {
+		t.Errorf("attested after waiver = %+v; want the waiver link cleared", o)
+	}
+}
+
 func TestSQLiteStore_InheritObligations(t *testing.T) {
 	t.Parallel()
 	st, err := New(":memory:")

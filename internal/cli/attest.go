@@ -15,7 +15,11 @@ var attestEvidence string
 var attestCmd = &cobra.Command{
 	Use:   "attest [session_id] [obligation_id]",
 	Short: "Attest that a completeness obligation is met, with evidence",
-	Args:  cobra.ExactArgs(2),
+	Long: `Attest that a completeness obligation is met, with evidence taskflow can't
+check from files. Only obligations whose requirement asks for an attestation
+(they carry an attest prompt) can be attested; one checked from files is
+refused: do the work, or waive it with a rationale.`,
+	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg := ConfigFromContext(cmd.Context())
 		if cfg == nil {

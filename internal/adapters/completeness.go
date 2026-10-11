@@ -30,9 +30,12 @@ func (e *CompletenessEvaluator) BaseSHA(projectPath string) (string, error) {
 // since its base commit against it. It returns nil, nil when the project has
 // no manifest, and an Evaluation carrying Error when the manifest is invalid.
 // Planned and inherited obligations are checked by subject, whether or not it
-// changed. When the changed set is partial, the other stored open, satisfied,
-// and attested obligations are verified again too, so work finished outside it
-// is still noticed.
+// changed: planned ones even before their file exists, inherited ones only
+// while it does (so one whose file was deleted or reverted isn't found, and a
+// full evaluation voids it). When the changed set is partial, the other stored
+// open, satisfied, and attested obligations are verified again too, so work
+// finished outside it is still noticed. Rechecked subjects the manifest no
+// longer applies to are reported in Evaluation.Dropped.
 func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Session, stored []*session.Obligation) (*session.Evaluation, error) {
 	return e.evaluate(sess, stored, nil)
 }
@@ -98,14 +101,22 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 	for _, o := range stored {
 		switch {
 		case o.Status == session.ObligationVoid:
-		case o.Planned || o.InheritedFrom != "":
-			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject, Declared: true, SubjectFile: o.Planned})
+		case o.Planned:
+			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject, Declared: true, SubjectFile: true})
+		case o.InheritedFrom != "":
+			// Any status: a waived or attested one still voids once its
+			// file is gone.
+			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
 		case ev.Partial && o.Status != session.ObligationWaived:
 			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
 		}
 	}
 	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes, rechecks.list)
 	ev.Warnings = append(ev.Warnings, res.Warnings...)
+	for _, d := range res.Dropped {
+		ev.Dropped = append(ev.Dropped, session.DroppedSubject{RuleID: d.RuleID, Subject: d.Subject, Reason: d.Reason})
+		ev.Warnings = append(ev.Warnings, fmt.Sprintf("rule %s no longer applies to %s: %s", d.RuleID, d.Subject, d.Reason))
+	}
 	for _, rs := range res.Stacks {
 		info := session.StackInfo{ID: rs.ID, Root: rs.Root, Commands: map[string]*string{}, Warning: strings.Join(rs.Warnings, "; ")}
 		for _, name := range rs.CommandNames() {

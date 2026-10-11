@@ -32,7 +32,7 @@ func TestMCPServer_Handlers(t *testing.T) {
 		},
 	}
 
-	srv := New(st, cfg, nil)
+	srv := mustNew(t, st, cfg)
 	ctx := context.Background()
 
 	// 1. Test tf_start handler
@@ -131,7 +131,7 @@ func TestServer_RunReader_ContextCancellation(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, &config.Config{}, nil)
+	srv := mustNew(t, st, &config.Config{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -182,7 +182,7 @@ func TestMCPServer_Completeness(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
-	srv := New(st, &config.Config{}, nil)
+	srv := mustNew(t, st, &config.Config{})
 
 	t.Run("no manifest", func(t *testing.T) {
 		contract := callTool(t, "tf_start", srv.handleStart, map[string]any{"task_id": "task-plain", "project_path": t.TempDir()})
@@ -295,7 +295,7 @@ rules:
     when: { added: "{name}.go" }
     plannable: true
     require:
-      - { id: test, describe: "Test for {name}", verify: { exists: "{name}_test.go" } }
+      - { id: test, describe: "Test for {name}", verify: { exists: "{name}_test.go" }, attest: "Name the test cases covering {name}" }
       - { id: docs, describe: "Docs for {name}", verify: { exists: "docs/{name}.md" } }
 `
 	if err := os.MkdirAll(filepath.Join(dir, ".taskflow"), 0o755); err != nil {
@@ -309,7 +309,7 @@ rules:
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
-	srv := New(st, &config.Config{Completeness: config.CompletenessConfig{Gate: "report"}}, nil)
+	srv := mustNew(t, st, &config.Config{Completeness: config.CompletenessConfig{Gate: "report"}})
 
 	contract := callTool(t, "tf_start", srv.handleStart, map[string]any{"task_id": "task-gate", "project_path": dir})
 	sid := contract["session_id"].(string)
@@ -355,11 +355,20 @@ rules:
 	if waived["decision_id"] == "" || waived["obligation"].(map[string]any)["status"] != "waived" {
 		t.Errorf("tf_waive = %v", waived)
 	}
-	for _, req := range []string{"test", "subject-file"} {
-		attested := callTool(t, "tf_attest", srv.handleAttest, map[string]any{"session_id": sid, "obligation_id": ids[req], "evidence": "done in another repo"})
-		if attested["obligation"].(map[string]any)["status"] != "attested" {
-			t.Errorf("tf_attest %s = %v", req, attested)
-		}
+	attested := callTool(t, "tf_attest", srv.handleAttest, map[string]any{"session_id": sid, "obligation_id": ids["test"], "evidence": "widget_test.go: TestWidget"})
+	if attested["obligation"].(map[string]any)["status"] != "attested" {
+		t.Errorf("tf_attest test = %v", attested)
+	}
+	// The subject file is checked from files and asks for no attestation:
+	// tf_attest can't stand in for creating it, and the gate still blocks.
+	if text := callToolError(t, "tf_attest", srv.handleAttest, map[string]any{"session_id": sid, "obligation_id": ids["subject-file"], "evidence": "done in another repo"}); !strings.Contains(text, "asks for no attestation") || !strings.Contains(text, "tf_waive") {
+		t.Errorf("tf_attest on a file-checked obligation = %q", text)
+	}
+	if text := callToolError(t, "tf_stop", srv.handleStop, map[string]any{"session_id": sid, "status": "completed"}); !strings.Contains(text, ids["subject-file"]) {
+		t.Errorf("tf_stop after a refused attestation = %q", text)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "widget.go"), []byte("package x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	stop := callTool(t, "tf_stop", srv.handleStop, map[string]any{"session_id": sid, "status": "completed"})
@@ -371,5 +380,86 @@ rules:
 	}
 	if _, ok := stop["completeness"].(map[string]any); !ok {
 		t.Errorf("tf_stop should carry the final report: %v", stop)
+	}
+}
+
+// TestMCPServer_PlanDecisionSurvivesRestart: with the real store, a task
+// restarted after a completed session keeps its declined plan, so the new
+// session isn't asked to plan again.
+func TestMCPServer_PlanDecisionSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "-b", "main").Run(); err != nil {
+		t.Skip("skipping: git init failed")
+	}
+	manifest := `version: 1
+rules:
+  - id: r
+    when: { added: "{name}.go" }
+    plannable: true
+    plan_hints: [local]
+    require:
+      - { id: test, describe: "Test for {name}", verify: { exists: "{name}_test.go" } }
+`
+	if err := os.MkdirAll(filepath.Join(dir, ".taskflow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".taskflow", "completeness.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	srv := mustNew(t, st, &config.Config{})
+
+	// Without ClickUp the task is named "Local Task", which the hint matches.
+	first := callTool(t, "tf_start", srv.handleStart, map[string]any{"task_id": "task-plan", "project_path": dir})
+	prev := first["session_id"].(string)
+	if _, ok := first["completeness"].(map[string]any)["suggested_plan"]; !ok {
+		t.Fatalf("first start should suggest a plan: %v", first["completeness"])
+	}
+	callTool(t, "tf_plan", srv.handlePlan, map[string]any{"session_id": prev, "decline_reason": "Config change only"})
+	callTool(t, "tf_stop", srv.handleStop, map[string]any{"session_id": prev, "status": "completed"})
+
+	second := callTool(t, "tf_start", srv.handleStart, map[string]any{"task_id": "task-plan", "project_path": dir})
+	sid := second["session_id"].(string)
+	if sid == prev {
+		t.Fatal("restarting a completed task must create a new session")
+	}
+	if sp, ok := second["completeness"].(map[string]any)["suggested_plan"]; ok {
+		t.Errorf("restart suggested a plan again: %v", sp)
+	}
+	if sess, err := st.GetSession(context.Background(), sid); err != nil || sess.PlanState != session.PlanDeclined {
+		t.Errorf("new session plan state = %+v, %v; want declined", sess, err)
+	}
+	cp := callTool(t, "tf_checkpoint", srv.handleCheckpoint, map[string]any{"session_id": sid, "summary": "work"})
+	if r, ok := cp["completeness"].(map[string]any)["plan_reminder"]; ok {
+		t.Errorf("checkpoint plan reminder = %v", r)
+	}
+}
+
+// mustNew builds a Server, failing the test if cfg is rejected.
+func mustNew(t *testing.T, st store.Store, cfg *config.Config) *Server {
+	t.Helper()
+	srv, err := New(st, cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return srv
+}
+
+func TestNew_RejectsInvalidGate(t *testing.T) {
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	// A Config not built by config.LoadFrom skips its validation; New must
+	// still refuse the typo instead of running with a gate that fails open.
+	srv, err := New(st, &config.Config{Completeness: config.CompletenessConfig{Gate: "blok"}}, nil)
+	if err == nil || srv != nil || !strings.Contains(err.Error(), `"blok"`) {
+		t.Errorf("New with gate blok = %v, %v; want an invalid gate error", srv, err)
 	}
 }

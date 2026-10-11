@@ -275,7 +275,7 @@ func (m *mockStore) AttestObligation(ctx context.Context, id string, evidence st
 		return errors.New("not found")
 	}
 	o.Status, o.Evidence, o.VerifiedLevels, o.UpdatedAt = status, evidence, slices.Clone(levels), at
-	o.SatisfiedAt = nil
+	o.WaiverDecisionID, o.SatisfiedAt = "", nil
 	if status == ObligationSatisfied {
 		o.SatisfiedAt = &at
 	}

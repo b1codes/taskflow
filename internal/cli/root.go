@@ -71,7 +71,21 @@ func newSessionService(st store.Store, cfg *config.Config) *session.Service {
 	srv := session.NewService(st, adapters.NewGitCapturer(), cuClient).
 		WithCompleteness(adapters.NewCompletenessEvaluator())
 	if cfg != nil {
-		srv.WithGate(session.GateMode(cfg.Completeness.Gate))
+		srv.WithGate(cliGate(cfg))
 	}
 	return srv
+}
+
+// cliGate is the configured completion gate. PersistentPreRunE has already
+// rejected an invalid gate (config.Load validates it, failing the command
+// before it runs), so the error branch only guards a Config built some other
+// way: it fails closed as block rather than letting a bad value loosen the
+// gate.
+func cliGate(cfg *config.Config) session.GateMode {
+	g, err := cfg.Completeness.GateMode()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v; using the block gate\n", err)
+		return session.GateBlock
+	}
+	return g
 }

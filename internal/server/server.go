@@ -26,8 +26,13 @@ type Server struct {
 
 // New builds the MCP server. client may be nil (no ClickUp sync); serve passes
 // the same paced client it gives the sync worker, so both share one
-// rate-limit budget.
-func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
+// rate-limit budget. It fails on an invalid completion gate in cfg.
+func New(st store.Store, cfg *config.Config, client *clickup.Client) (*Server, error) {
+	gate, err := cfg.Completeness.GateMode()
+	if err != nil {
+		return nil, err
+	}
+
 	s := server.NewMCPServer(
 		"taskflow",
 		"1.0.0",
@@ -43,14 +48,14 @@ func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
 		mcpServer: s,
 		service: session.NewService(st, adapters.NewGitCapturer(), cuClient).
 			WithCompleteness(adapters.NewCompletenessEvaluator()).
-			WithGate(session.GateMode(cfg.Completeness.Gate)),
+			WithGate(gate),
 		store:  st,
 		config: cfg,
 	}
 
 	srv.registerTools()
 
-	return srv
+	return srv, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -120,10 +125,10 @@ func (s *Server) registerTools() {
 	), s.handleWaive)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_attest",
-		mcp.WithDescription("Attest that a completeness obligation is met, with evidence taskflow can't check from files (e.g. which spec and test cases cover a screen, or a test run's summary line). Attestations are shown in ClickUp for human review"),
+		mcp.WithDescription("Attest that a completeness obligation is met, with evidence taskflow can't check from files (e.g. which spec and test cases cover a screen, or a test run's summary line). Only obligations whose requirement asks for an attestation (they carry an `attest` prompt) can be attested; one checked from files is refused: do the work, or tf_waive it with a rationale. Attestations are shown in ClickUp for human review"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
 		mcp.WithString("obligation_id", mcp.Required(), mcp.Description("The obligation_id from tf_checkpoint, tf_completeness, or the start contract")),
-		mcp.WithString("evidence", mcp.Required(), mcp.Description("What shows the obligation is met, answering its attest prompt when it has one")),
+		mcp.WithString("evidence", mcp.Required(), mcp.Description("What shows the obligation is met, answering its attest prompt")),
 	), s.handleAttest)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_plan",

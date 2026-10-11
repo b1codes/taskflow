@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -30,20 +31,39 @@ const DefaultGate = GateReview
 // gateRank orders gates by strictness.
 var gateRank = map[GateMode]int{GateReport: 0, GateReview: 1, GateBlock: 2}
 
-// stricter returns the stricter of g and other.
-func (g GateMode) stricter(other GateMode) GateMode {
-	if gateRank[g] > gateRank[other] {
+// failClosed maps a gate the code doesn't know (a value that got past
+// ParseGateMode) to GateBlock, so a bad value can only tighten the gate,
+// never loosen it. "" (no gate set) is kept as is.
+func (g GateMode) failClosed() GateMode {
+	if _, ok := gateRank[g]; ok || g == "" {
 		return g
 	}
-	return other
+	return GateBlock
 }
 
-// ParseGateMode validates a gate name; "" is the default gate.
+// stricter returns the stricter of g and other. "" (no gate set) defers to
+// the other gate; an unknown gate counts as GateBlock.
+func (g GateMode) stricter(other GateMode) GateMode {
+	a, b := g.failClosed(), other.failClosed()
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	case gateRank[a] > gateRank[b]:
+		return a
+	}
+	return b
+}
+
+// ParseGateMode validates a gate name; "" is the default gate. It is the one
+// place a gate name from config is checked.
 func ParseGateMode(s string) (GateMode, error) {
-	switch g := GateMode(s); g {
-	case "":
+	g := GateMode(s)
+	if g == "" {
 		return DefaultGate, nil
-	case GateReport, GateReview, GateBlock:
+	}
+	if _, ok := gateRank[g]; ok {
 		return g, nil
 	}
 	return "", fmt.Errorf("invalid completion gate %q: must be report, review, or block", s)
@@ -88,13 +108,18 @@ type StopResult struct {
 }
 
 // ErrIncompleteSession is returned by Stop(completed) under the block gate
-// while required obligations are open; the session is left unchanged.
+// while required obligations are open; nothing is written, so the session,
+// its obligations, and their reminder counts are left unchanged.
 var ErrIncompleteSession = errors.New("session has open required obligations")
 
 // IncompleteSessionError lists the obligations holding up completion.
 type IncompleteSessionError struct {
 	SessionID string
 	Open      []ObligationView
+	// Unrecorded are the IDs in Open first found by the refused stop: it
+	// wrote nothing, so they can't be waived or attested until a checkpoint
+	// or tf_completeness records them.
+	Unrecorded []string
 }
 
 func (e *IncompleteSessionError) Error() string {
@@ -105,8 +130,14 @@ func (e *IncompleteSessionError) Error() string {
 		if o.Expected != "" {
 			fmt.Fprintf(&b, " (expected: %s)", o.Expected)
 		}
+		if slices.Contains(e.Unrecorded, o.ObligationID) {
+			b.WriteString(" [not recorded yet]")
+		}
 	}
-	b.WriteString("\nDo the work, attest it with tf_attest, or waive it with tf_waive and a rationale, then stop again.")
+	b.WriteString("\nDo the work, attest it with tf_attest if it has an attest prompt, or waive it with tf_waive and a rationale, then stop again.")
+	if len(e.Unrecorded) > 0 {
+		b.WriteString(" Obligations not recorded yet were first found by this stop: call tf_checkpoint or tf_completeness to record them before attesting or waiving.")
+	}
 	return b.String()
 }
 
@@ -116,7 +147,8 @@ func (e *IncompleteSessionError) Unwrap() error { return ErrIncompleteSession }
 // gate when the session's obligations can't be checked (the manifest is
 // invalid, they can't be read, or the evaluation failed). The gate fails
 // closed: the session is left unchanged, since nothing shows the required
-// work is done.
+// work is done. Attest wraps it too, refusing an attestation it can't check
+// against the requirement.
 var ErrCompletenessUnchecked = errors.New("completeness couldn't be checked")
 
 // ErrUnknownObligation is returned by Waive and Attest for an obligation the
@@ -142,10 +174,11 @@ func (s *Service) gateFor(st *completenessState) GateMode {
 	return GateMode(st.eval.Gate).stricter(floor)
 }
 
-// configuredGate is the gate from config, or DefaultGate.
+// configuredGate is the gate from config, or DefaultGate. A gate that
+// slipped past ParseGateMode fails closed as GateBlock.
 func (s *Service) configuredGate() GateMode {
 	if s.gate != "" {
-		return s.gate
+		return s.gate.failClosed()
 	}
 	return DefaultGate
 }
@@ -174,8 +207,14 @@ func (s *Service) applyGate(ctx context.Context, sess *Session, st *completeness
 	switch g.Mode {
 	case GateBlock:
 		if !force {
-			s.remind(ctx, st)
-			return nil, "", &IncompleteSessionError{SessionID: sess.ID, Open: g.OpenRequired}
+			// A refused stop writes nothing, reminder counts included.
+			e := &IncompleteSessionError{SessionID: sess.ID, Open: g.OpenRequired}
+			for _, o := range open {
+				if st.unsaved[o.ID] {
+					e.Unrecorded = append(e.Unrecorded, o.ID)
+				}
+			}
+			return nil, "", e
 		}
 		var describes, subjects []string
 		for _, o := range open {
@@ -300,11 +339,20 @@ func (s *Service) Waive(ctx context.Context, sessionID, obligationID, rationale 
 	return res, nil
 }
 
+// ErrNotAttestable is returned by Attest for an obligation whose requirement
+// asks for no attestation: it is checked from the project's files, so the
+// work must be done, or the obligation waived with a rationale (a decision
+// posted to ClickUp). An attestation must never stand in for either.
+var ErrNotAttestable = errors.New("obligation can't be attested")
+
 // Attest records the agent's evidence that an obligation is met, for the
-// checks taskflow can't make itself. The obligation is attested, and
-// satisfied once its file checks pass too. Open, attested (to replace the
-// evidence), and waived (to take back the waiver) obligations can be
-// attested.
+// checks taskflow can't make itself. Only an obligation whose requirement
+// asks for an attestation (its current finding has an attest prompt) can be
+// attested; it is then attested, and satisfied once its file checks pass
+// too. Open, attested (to replace the evidence), and waived (to take back
+// the waiver) obligations can be attested. Attest evaluates the session
+// once, and refuses (wrapping ErrCompletenessUnchecked) when it can't: no
+// evaluator or manifest, an invalid manifest, or unreadable obligations.
 func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence string) (*ObligationResult, error) {
 	sess, err := s.activeSession(ctx, sessionID, "attest an obligation")
 	if err != nil {
@@ -314,28 +362,74 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if evidence == "" {
 		return nil, errors.New("evidence is required to attest an obligation")
 	}
-	st, o, err := s.obligationFor(ctx, sess, obligationID)
+
+	// Evaluate first: only the current finding says whether the requirement
+	// asks for an attestation, and whether its checks pass.
+	unchecked := func(reason string) error {
+		return fmt.Errorf("%w: cannot attest obligation %q: %s", ErrCompletenessUnchecked, obligationID, reason)
+	}
+	if s.completeness == nil {
+		return nil, unchecked("completeness is not enabled")
+	}
+	st, err := s.tryEvaluateCompleteness(ctx, sess, true)
+	switch {
+	case err != nil:
+		return nil, unchecked("the evaluation failed: " + err.Error())
+	case st == nil:
+		return nil, unchecked("the project has no completeness manifest")
+	case st.readErr != "":
+		return nil, unchecked(st.readErr)
+	case st.eval.Error != "":
+		return nil, unchecked(fmt.Sprintf("the completeness manifest %s is invalid: %s", st.eval.Manifest, st.eval.Error))
+	}
+	o, err := st.resolvable(sess.ID, obligationID)
 	if err != nil {
 		return nil, err
 	}
 	if o.Status == ObligationSatisfied && !o.attested() {
 		return nil, st.obligationError(obligationID, "is already satisfied by its checks; there is nothing to attest")
 	}
+	f := st.eval.finding(o)
+	switch {
+	case f == nil:
+		return nil, fmt.Errorf("%w: obligation %q (%s) wasn't checked in this evaluation (its subject isn't among the session's changes), so it can't be attested; do the work, or call tf_waive with a rationale if it doesn't apply",
+			ErrNotAttestable, obligationID, o.Describe)
+	case f.AttestPrompt == "":
+		msg := fmt.Sprintf("obligation %q (%s) is checked from the project's files and asks for no attestation", obligationID, o.Describe)
+		if len(o.Expected) > 0 {
+			msg += " (expected: " + strings.Join(o.Expected, ", ") + ")"
+		}
+		return nil, fmt.Errorf("%w: %s; do the work, or call tf_waive with a rationale if it doesn't apply", ErrNotAttestable, msg)
+	}
 
-	if err := s.store.AttestObligation(ctx, o.ID, evidence, withAttest(o.VerifiedLevels), ObligationAttested, time.Now()); err != nil {
+	// With the attestation on record, passing checks satisfy the obligation;
+	// otherwise the claim stands alone (as mergeObligations would decide).
+	status, levels, now := ObligationAttested, withAttest(f.Levels), time.Now()
+	if f.ChecksPassed {
+		status = ObligationSatisfied
+	}
+	if err := s.store.AttestObligation(ctx, o.ID, evidence, levels, status, now); err != nil {
 		return nil, fmt.Errorf("failed to attest obligation: %w", err)
 	}
-	// Re-evaluate: with the attestation on record, passing checks now
-	// satisfy the obligation.
-	if next := s.evaluateCompleteness(ctx, sess, true); next != nil && next.readErr == "" {
-		st = next
-	} else {
-		o.Status, o.Evidence, o.VerifiedLevels = ObligationAttested, evidence, withAttest(o.VerifiedLevels)
-	}
-	if found := st.find(o.ID); found != nil {
-		o = found
+	o.Status, o.Evidence, o.VerifiedLevels, o.UpdatedAt = status, evidence, levels, now
+	o.WaiverDecisionID = "" // an attestation takes back a waiver
+	o.SatisfiedAt = nil
+	if status == ObligationSatisfied {
+		o.SatisfiedAt = &now
 	}
 	return s.obligationResult(ctx, st, o), nil
+}
+
+// finding returns the evaluation's finding for o, or nil when o wasn't
+// checked. Like mergeObligations, the first finding for a key wins.
+func (ev *Evaluation) finding(o *Obligation) *CompletenessFinding {
+	k := o.key()
+	for i := range ev.Findings {
+		if ev.Findings[i].key() == k {
+			return &ev.Findings[i]
+		}
+	}
+	return nil
 }
 
 // activeSession returns the session, which must be active for action.
@@ -361,14 +455,24 @@ func (s *Service) obligationFor(ctx context.Context, sess *Session, id string) (
 		return nil, nil, fmt.Errorf("failed to list obligations: %w", err)
 	}
 	st := &completenessState{eval: &Evaluation{}, obligations: stored, attest: map[string]string{}}
+	o, err := st.resolvable(sess.ID, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, o, nil
+}
+
+// resolvable returns the session's obligation with id, which must not be
+// void.
+func (st *completenessState) resolvable(sessionID, id string) (*Obligation, error) {
 	o := st.find(id)
 	switch {
 	case o == nil:
-		return nil, nil, st.obligationError(id, "is not an obligation of session "+sess.ID)
+		return nil, st.obligationError(id, "is not an obligation of session "+sessionID)
 	case o.Status == ObligationVoid:
-		return nil, nil, st.obligationError(id, "no longer applies (its trigger file was reverted)")
+		return nil, st.obligationError(id, "no longer applies (its trigger file was reverted)")
 	}
-	return st, o, nil
+	return o, nil
 }
 
 // obligationError is an ErrUnknownObligation error naming the obligations
@@ -458,7 +562,15 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	case ev.Error != "":
 		return nil, fmt.Errorf("%w: the completeness manifest %s is invalid: %s", ErrInvalidPlan, ev.Manifest, ev.Error)
 	}
-	st := s.applyEvaluation(ctx, sess, stored, ev)
+	if err := checkPlanFindings(ev); err != nil {
+		return nil, err
+	}
+	// The plan is only recorded once all of its obligations are: a plan
+	// state with obligations missing would claim work is tracked that isn't.
+	st, mr := mergeEvaluation(sess, stored, ev)
+	if err := s.persistMerge(ctx, st, mr); err != nil {
+		return nil, fmt.Errorf("failed to save the plan's obligations, so the plan wasn't recorded; call tf_plan again: %w", err)
+	}
 	if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanPlanned); err != nil {
 		return nil, fmt.Errorf("failed to save plan state: %w", err)
 	}
@@ -481,6 +593,39 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	}
 	s.remind(ctx, st)
 	return res, nil
+}
+
+// checkPlanFindings returns an error wrapping ErrInvalidPlan when a planned
+// subject has no findings: nothing would track it, so the plan would claim
+// work it never checks. A stack-scoped rule finds nothing when its stack
+// isn't detected (its root is missing), so the error says so.
+func checkPlanFindings(ev *Evaluation) error {
+	found := map[string]bool{}
+	for i := range ev.Findings {
+		found[subjectKey(ev.Findings[i].RuleID, ev.Findings[i].Subject)] = true
+	}
+	stacks := map[string]string{}
+	for _, r := range ev.Rules {
+		stacks[r.ID] = r.Stack
+	}
+	seen := map[string]bool{}
+	var problems []string
+	for _, p := range ev.Planned {
+		k := subjectKey(p.RuleID, p.Subject)
+		if found[k] || seen[k] {
+			continue
+		}
+		seen[k] = true
+		problem := fmt.Sprintf("rule %q yields no obligations for %s", p.RuleID, p.Subject)
+		if stack := stacks[p.RuleID]; stack != "" {
+			problem += fmt.Sprintf(" (the rule is scoped to stack %q, which may not be detected in the project: check that its root exists)", stack)
+		}
+		problems = append(problems, problem)
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s; nothing was planned", ErrInvalidPlan, strings.Join(problems, "; "))
 }
 
 // SuggestedPlan suggests declaring the task's expected work with tf_plan,
@@ -584,4 +729,15 @@ func (s *Service) inheritObligations(ctx context.Context, prev, sess *Session) {
 	if err := s.store.InheritObligations(ctx, prev.ID, sess.ID); err != nil {
 		fmt.Fprintf(os.Stderr, "[session] failed to inherit obligations from session %s: %v\n", prev.ID, err)
 	}
+}
+
+// inheritedPlanState is the plan state a new session starts with after the
+// task's finished session prev: a plan or a declined plan is a decision
+// already made for the task, so it carries over instead of being suggested
+// again. Anything else starts from PlanNone.
+func inheritedPlanState(prev *Session) PlanState {
+	if prev != nil && (prev.PlanState == PlanPlanned || prev.PlanState == PlanDeclined) {
+		return prev.PlanState
+	}
+	return PlanNone
 }

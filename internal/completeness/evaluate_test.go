@@ -504,4 +504,83 @@ rules:
 	if len(got) != 2 {
 		t.Errorf("findings = %v, want only the two rechecks", got)
 	}
+	// A missing file may come back, so it isn't dropped: the caller voids its
+	// obligations only when the change set is complete.
+	if len(res.Dropped) != 0 {
+		t.Errorf("dropped = %+v, want none", res.Dropped)
+	}
+}
+
+// TestEvaluate_RecheckDropped: rechecks the manifest can no longer apply to,
+// whatever changes, are reported as dropped.
+func TestEvaluate_RecheckDropped(t *testing.T) {
+	m, err := Parse([]byte(`
+version: 1
+stacks:
+  - { id: web, root: web }
+  - { id: mobile, root: mobile }
+rules:
+  - id: files
+    stack: web
+    when: { added: "src/{name}.ts", exclude: ["src/legacy/**"] }
+    require: [{ id: test, describe: "d", verify: { exists: "src/{name}.test.ts" } }]
+  - id: native
+    stack: mobile
+    when: { added: "{name}.swift" }
+    require: [{ id: test, describe: "d", verify: { exists: "{name}Tests.swift" } }]
+  - id: suite
+    stack: web
+    scope: stack
+    when: { changed: "**" }
+    require: [{ id: q, describe: "d", attest: "ran it" }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"web/src/a.ts": "", "web/src/legacy/old.ts": ""}) // no mobile/
+	recheck := []Recheck{
+		{RuleID: "files", Subject: "web/src/a.ts"},                                          // still applies
+		{RuleID: "files", Subject: "web/src/gone.ts"},                                       // missing file: no finding, not dropped
+		{RuleID: "files", Subject: "web/src/Planned.ts", Declared: true, SubjectFile: true}, // planned, not created yet
+		{RuleID: "react-screen", Subject: "web/src/Page.tsx", Declared: true},               // rule renamed away
+		{RuleID: "native", Subject: "mobile/App.swift"},                                     // stack root missing
+		{RuleID: "files", Subject: "web/src/legacy/old.ts"},                                 // now excluded
+		{RuleID: "files", Subject: "web/src/b.tsx", Declared: true},                         // no longer fits the trigger
+		{RuleID: "files", Subject: "app/src/a.ts"},                                          // outside the stack root (moved)
+		{RuleID: "suite", Subject: "web"},                                                   // still applies
+		{RuleID: "suite", Subject: "api"},                                                   // the rule's stack changed
+	}
+	res := Evaluate(root, m, &Overrides{}, nil, recheck)
+
+	dropped := map[string]string{}
+	for _, d := range res.Dropped {
+		dropped[d.RuleID+"/"+d.Subject] = d.Reason
+	}
+	want := map[string]string{
+		"react-screen/web/src/Page.tsx": "no longer in the manifest",
+		"native/mobile/App.swift":       "stack mobile is missing",
+		"files/web/src/legacy/old.ts":   "no longer fits",
+		"files/web/src/b.tsx":           "no longer fits",
+		"files/app/src/a.ts":            "outside stack web's root",
+		"suite/api":                     "now applies to",
+	}
+	for k, reason := range want {
+		if got, ok := dropped[k]; !ok || !strings.Contains(got, reason) {
+			t.Errorf("dropped[%s] = %q (present %v), want a reason containing %q", k, got, ok, reason)
+		}
+	}
+	if len(dropped) != len(want) {
+		t.Errorf("dropped = %v, want exactly %v", dropped, want)
+	}
+
+	got := findingsByKey(res)
+	for _, k := range []string{"files/test/web/src/a.ts", "files/test/web/src/Planned.ts", "files/subject-file/web/src/Planned.ts", "suite/q/web"} {
+		if _, ok := got[k]; !ok {
+			t.Errorf("missing finding %s", k)
+		}
+	}
+	if len(got) != 4 {
+		t.Errorf("findings = %v, want only the rechecks that still apply", got)
+	}
 }

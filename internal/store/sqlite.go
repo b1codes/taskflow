@@ -514,8 +514,11 @@ func (s *SQLiteStore) IncrementObligationReminders(ctx context.Context, ids []st
 }
 
 func (s *SQLiteStore) AttestObligation(ctx context.Context, id string, evidence string, levels []string, status session.ObligationStatus, at time.Time) error {
+	// An attestation takes back any waiver, so the obligation no longer links
+	// to the revoked waiver decision.
 	query := `UPDATE obligations SET status = ?, evidence = ?, verified_levels = ?, updated_at = ?,
-		satisfied_at = CASE ? WHEN 'satisfied' THEN ? ELSE NULL END
+		satisfied_at = CASE ? WHEN 'satisfied' THEN ? ELSE NULL END,
+		waiver_decision_id = NULL
 	WHERE id = ?`
 	_, err := s.db.ExecContext(ctx, query, string(status), evidence, jsonMarshal(levels), at, string(status), at, id)
 	if err != nil {

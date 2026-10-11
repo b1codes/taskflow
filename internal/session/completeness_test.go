@@ -133,11 +133,16 @@ func TestMergeObligations(t *testing.T) {
 		inherited := stored("r", "story", "Inherited", ObligationOpen)
 		inherited.InheritedFrom = "older"
 		mr := mergeObligations("s", []*Obligation{gone, kept, planned, inherited}, evalWith(finding("r", "story", "A", false)), now)
-		if gone.Status != ObligationVoid || len(mr.voided) != 1 || mr.voided[0] != gone {
+		if gone.Status != ObligationVoid || len(mr.voided) != 2 || mr.voided[0] != gone {
 			t.Errorf("reverted file should void its obligation: %+v voided=%v", gone, mr.voided)
 		}
-		if planned.Status != ObligationOpen || inherited.Status != ObligationOpen {
-			t.Errorf("planned/inherited obligations must not be voided")
+		if planned.Status != ObligationOpen {
+			t.Errorf("planned obligations must not be voided, got %s", planned.Status)
+		}
+		// An inherited obligation is rechecked while its file exists; not
+		// finding it means the file is gone.
+		if inherited.Status != ObligationVoid {
+			t.Errorf("an inherited obligation not found again must be voided, got %s", inherited.Status)
 		}
 		if len(mr.upserts) != 0 {
 			t.Errorf("an unchanged obligation must not be rewritten, got %d upserts", len(mr.upserts))
@@ -151,6 +156,71 @@ func TestMergeObligations(t *testing.T) {
 		mr := mergeObligations("s", []*Obligation{o}, ev, now)
 		if o.Status != ObligationSatisfied || len(mr.voided) != 0 {
 			t.Errorf("partial evaluation voided %+v", o)
+		}
+	})
+
+	t.Run("inherited obligations not found are voided whatever their status", func(t *testing.T) {
+		var all []*Obligation
+		for _, st := range []ObligationStatus{ObligationOpen, ObligationSatisfied, ObligationAttested, ObligationWaived} {
+			o := stored("r", string(st), "Deleted", st)
+			o.InheritedFrom = "older-" + string(st)
+			all = append(all, o)
+		}
+		// Waived and attested ones that originated here stay sticky.
+		ownWaived, ownAttested := stored("r", "story", "Mine", ObligationWaived), stored("r", "e2e", "Mine", ObligationAttested)
+		foundInherited := stored("r", "story", "Kept", ObligationWaived)
+		foundInherited.InheritedFrom = "older"
+		mr := mergeObligations("s", append(all, ownWaived, ownAttested, foundInherited), evalWith(finding("r", "story", "Kept", false)), now)
+		for _, o := range all {
+			if o.Status != ObligationVoid {
+				t.Errorf("inherited %s obligation = %s, want void", o.RequirementID, o.Status)
+			}
+		}
+		if ownWaived.Status != ObligationWaived || ownAttested.Status != ObligationAttested || foundInherited.Status != ObligationWaived {
+			t.Errorf("sticky statuses changed: %s, %s, %s", ownWaived.Status, ownAttested.Status, foundInherited.Status)
+		}
+		if len(mr.voided) != len(all) {
+			t.Errorf("voided %d, want %d", len(mr.voided), len(all))
+		}
+	})
+
+	t.Run("a partial evaluation keeps inherited obligations it didn't find", func(t *testing.T) {
+		o := stored("r", "story", "A", ObligationOpen)
+		o.InheritedFrom = "older"
+		ev := evalWith()
+		ev.Partial = true
+		ev.Dropped = []DroppedSubject{{RuleID: "r", Subject: "Other"}}
+		mr := mergeObligations("s", []*Obligation{o}, ev, now)
+		if o.Status != ObligationOpen || len(mr.voided) != 0 {
+			t.Errorf("partial evaluation voided %+v", o)
+		}
+	})
+
+	t.Run("dropped subjects are voided whatever their status, even when partial", func(t *testing.T) {
+		planned := stored("react-screen", "story", "Checkout.tsx", ObligationOpen)
+		planned.Planned = true
+		subjectFile := stored("react-screen", "subject-file", "Checkout.tsx", ObligationSatisfied)
+		subjectFile.Planned = true
+		waived := stored("react-screen", "e2e", "Checkout.tsx", ObligationWaived)
+		inherited := stored("react-screen", "unit-test", "Checkout.tsx", ObligationAttested)
+		inherited.InheritedFrom = "older"
+		other := stored("react-screen", "story", "Other.tsx", ObligationOpen)
+		other.Planned = true
+		already := stored("react-screen", "contract", "Checkout.tsx", ObligationVoid)
+		ev := evalWith()
+		ev.Partial = true
+		ev.Dropped = []DroppedSubject{{RuleID: "react-screen", Subject: "Checkout.tsx", Reason: "the rule is no longer in the manifest"}}
+		mr := mergeObligations("s", []*Obligation{planned, subjectFile, waived, inherited, other, already}, ev, now)
+		for _, o := range []*Obligation{planned, subjectFile, waived, inherited} {
+			if o.Status != ObligationVoid {
+				t.Errorf("dropped %s = %s, want void", o.RequirementID, o.Status)
+			}
+		}
+		if other.Status != ObligationOpen {
+			t.Errorf("an obligation for another subject must be kept, got %s", other.Status)
+		}
+		if len(mr.voided) != 4 || slices.Contains(mr.voided, already) {
+			t.Errorf("voided = %d, want the 4 live ones only", len(mr.voided))
 		}
 	})
 

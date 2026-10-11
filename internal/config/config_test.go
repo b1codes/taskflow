@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/b1codes/taskflow/internal/session"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -116,5 +118,28 @@ func TestLoadCompletenessGate(t *testing.T) {
 	cfg, err = load(t, DefaultConfigContent)
 	if err != nil || cfg.Completeness.Gate != "review" {
 		t.Errorf("DefaultConfigContent gate = %q, %v", cfg.Completeness.Gate, err)
+	}
+
+	// An explicitly empty gate is the default gate.
+	cfg, err = load(t, "[completeness]\ngate = \"\"\n")
+	if err != nil || cfg.Completeness.Gate != "review" {
+		t.Errorf("empty gate = %q, %v; want review", cfg.Completeness.Gate, err)
+	}
+}
+
+func TestCompletenessConfigGateMode(t *testing.T) {
+	for gate, want := range map[string]session.GateMode{
+		"":       session.GateReview,
+		"report": session.GateReport,
+		"review": session.GateReview,
+		"block":  session.GateBlock,
+	} {
+		if got, err := (CompletenessConfig{Gate: gate}).GateMode(); err != nil || got != want {
+			t.Errorf("GateMode(%q) = %q, %v; want %q", gate, got, err, want)
+		}
+	}
+	// A Config not built by LoadFrom is checked the same way.
+	if got, err := (CompletenessConfig{Gate: "blok"}).GateMode(); err == nil || got != "" || !strings.Contains(err.Error(), "completeness.gate") {
+		t.Errorf("GateMode(blok) = %q, %v; want an error", got, err)
 	}
 }

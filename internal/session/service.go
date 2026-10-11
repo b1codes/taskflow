@@ -277,7 +277,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 				TaskName:    taskName,
 				ProjectPath: projectPath,
 				Status:      StatusActive,
-				PlanState:   PlanNone,
+				PlanState:   inheritedPlanState(existing),
 				StartedAt:   time.Now(),
 				UpdatedAt:   time.Now(),
 			}
@@ -392,20 +392,41 @@ func (s *Service) startCompleteness(ctx context.Context, sess *Session, st *comp
 			cc.Inherited[i].FromSession = inheritedFrom
 		}
 	}
-	if st.errText() == "" && (sess.PlanState == PlanNone || sess.PlanState == PlanSuggested || sess.PlanState == "") {
+	noPlan := sess.PlanState == PlanNone || sess.PlanState == PlanSuggested || sess.PlanState == ""
+	switch {
+	case noPlan && hasPlanned(st.visible()):
+		// Planned obligations (e.g. inherited) mean a plan already exists:
+		// record it rather than suggesting another.
+		s.setPlanState(ctx, sess, PlanPlanned)
+	case noPlan && st.errText() == "":
 		if sp := suggestPlan(st.eval.Rules, taskName, taskDesc); sp != nil {
 			cc.SuggestedPlan = sp
 			if sess.PlanState != PlanSuggested {
-				if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanSuggested); err != nil {
-					fmt.Fprintf(os.Stderr, "[session] failed to save plan state for session %s: %v\n", sess.ID, err)
-				} else {
-					sess.PlanState = PlanSuggested
-				}
+				s.setPlanState(ctx, sess, PlanSuggested)
 			}
 		}
 	}
 	s.remind(ctx, st)
 	return cc
+}
+
+// hasPlanned reports whether any of obligations came from a plan.
+func hasPlanned(obligations []*Obligation) bool {
+	for _, o := range obligations {
+		if o.Planned {
+			return true
+		}
+	}
+	return false
+}
+
+// setPlanState saves sess's plan state, logging (not failing) on error.
+func (s *Service) setPlanState(ctx context.Context, sess *Session, state PlanState) {
+	if err := s.store.SetSessionPlanState(ctx, sess.ID, state); err != nil {
+		fmt.Fprintf(os.Stderr, "[session] failed to save plan state for session %s: %v\n", sess.ID, err)
+		return
+	}
+	sess.PlanState = state
 }
 
 // createCheckpoint saves a checkpoint and queues its progress comment, with
@@ -660,9 +681,11 @@ func (s *Service) List(ctx context.Context, filter SessionFilter) ([]*SessionSum
 
 // Stop ends or pauses a session. Completing a session with required
 // completeness obligations open goes through the completion gate (see
-// GateMode): under block it returns an *IncompleteSessionError and changes
-// nothing, unless force is set (a human override, recorded as a decision).
-// Pausing and archiving are never gated.
+// GateMode): under block it returns an *IncompleteSessionError (or
+// ErrCompletenessUnchecked when completeness can't be checked) and writes
+// nothing, not even the stop's evaluation of the obligations or their
+// reminder counts, unless force is set (a human override, recorded as a
+// decision). Pausing and archiving are never gated.
 func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus string, autoGit, force bool) (*StopResult, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
@@ -682,11 +705,13 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	// A finished session's obligations are final; only evaluate work that
-	// was still in progress.
+	// was still in progress. The evaluation is merged in memory only, and
+	// written once the gate lets the stop go ahead.
 	var st *completenessState
+	var pending *mergeResult
 	var evalErr error
 	if sess.Status == StatusActive || sess.Status == StatusPaused {
-		st, evalErr = s.tryEvaluateCompleteness(ctx, sess, true)
+		st, pending, evalErr = s.evaluateUnsaved(ctx, sess)
 		if evalErr != nil {
 			fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, evalErr)
 		}
@@ -696,7 +721,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	role := stopStatusRole(fromStatus, tStatus)
 	res := &StopResult{SessionID: sessionID, Status: tStatus}
 	// The gate runs before anything is written, so a blocked stop leaves the
-	// session as it was.
+	// session as it was, its obligations and their reminder counts included.
 	if tStatus == StatusCompleted {
 		var gate *GateResult
 		var gateRole StatusRole
@@ -716,6 +741,14 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		if gateRole != "" && role != "" {
 			role = gateRole
 		}
+	}
+
+	// The stop goes ahead: record its evaluation. An obligation another
+	// writer inserted first keeps the stored ID, so list the gate's open
+	// obligations again by the IDs written.
+	_ = s.persistMerge(ctx, st, pending)
+	if g := res.Gate; g != nil && g.Unchecked == "" && len(g.OpenRequired) > 0 {
+		g.OpenRequired = st.views(st.openRequired(), false)
 	}
 
 	// The completeness table goes in the Session Finished comment below, so

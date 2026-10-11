@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/b1codes/taskflow/internal/session"
 )
 
 type ClickUpConfig struct {
@@ -45,6 +46,17 @@ type CompletenessConfig struct {
 	// obligations are open: report, review, or block. It is a floor: a
 	// manifest's gate can make it stricter, never looser.
 	Gate string `toml:"gate"`
+}
+
+// GateMode parses Gate with session.ParseGateMode, the one check of gate
+// names, so a typo is an error rather than a gate that fails open. "" is the
+// default gate.
+func (c CompletenessConfig) GateMode() (session.GateMode, error) {
+	g, err := session.ParseGateMode(c.Gate)
+	if err != nil {
+		return "", fmt.Errorf("invalid config: completeness.gate: %w", err)
+	}
+	return g, nil
 }
 
 type DatabaseConfig struct {
@@ -171,7 +183,7 @@ func LoadFrom(configPath string) (*Config, error) {
 			DrainTimeoutS: 5,
 		},
 		Completeness: CompletenessConfig{
-			Gate: "review",
+			Gate: string(session.DefaultGate),
 		},
 		Database: DatabaseConfig{
 			Path: "~/.taskflow/sessions.db",
@@ -188,11 +200,11 @@ func LoadFrom(configPath string) (*Config, error) {
 		}
 	}
 
-	switch cfg.Completeness.Gate {
-	case "report", "review", "block":
-	default:
-		return nil, fmt.Errorf("invalid config: completeness.gate must be report, review, or block, got %q", cfg.Completeness.Gate)
+	gate, err := cfg.Completeness.GateMode()
+	if err != nil {
+		return nil, err
 	}
+	cfg.Completeness.Gate = string(gate)
 
 	if apiKey := os.Getenv("CLICKUP_API_KEY"); apiKey != "" {
 		cfg.ClickUp.APIKey = apiKey

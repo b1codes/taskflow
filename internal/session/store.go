@@ -51,7 +51,8 @@ type SessionStore interface {
 
 	SetSessionPlanState(ctx context.Context, id string, state PlanState) error
 	// AttestObligation records an attestation: the evidence, the verified
-	// levels (which include "attest"), and the resulting status.
+	// levels (which include "attest"), and the resulting status. It clears
+	// any waiver link, since an attestation takes the waiver back.
 	AttestObligation(ctx context.Context, id string, evidence string, levels []string, status ObligationStatus, at time.Time) error
 	// WaiveObligation marks the obligation waived, linking the decision that
 	// records why, and keeps the rationale as its evidence.
