@@ -5,6 +5,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,6 +56,13 @@ type RuleSummary struct {
 	Requires []string
 }
 
+// Recheck names an obligation found by an earlier evaluation, by rule and
+// subject (relative to the project).
+type Recheck struct {
+	RuleID  string
+	Subject string
+}
+
 type Result struct {
 	Stacks   []ResolvedStack
 	Rules    []RuleSummary
@@ -69,7 +77,11 @@ const noCommand = "the project's test suite"
 // projectPath. Command checks (run:) are not executed, so a requirement with
 // an attest prompt always needs an attestation: for attest_when: no_command
 // the attestation stands in for the command it can't run yet.
-func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change) *Result {
+//
+// recheck lists earlier findings to verify again even when their subject
+// isn't in changes. Pass it only when changes may be incomplete (a partial
+// change set): a recheck counts as found, so it can't be voided.
+func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck) *Result {
 	res := &Result{Stacks: ResolveStacks(projectPath, m, o)}
 	stacks := map[string]*ResolvedStack{}
 	for i := range res.Stacks {
@@ -79,6 +91,11 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change) *
 
 	sorted := append([]Change(nil), changes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	rechecks := map[string][]string{}
+	for _, rc := range recheck {
+		rechecks[rc.RuleID] = append(rechecks[rc.RuleID], rc.Subject)
+	}
+	cache := newFSCache()
 
 	for i := range m.Rules {
 		r := &m.Rules[i]
@@ -98,36 +115,57 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change) *
 			root:        root,
 			rootAbs:     filepath.Join(projectPath, filepath.FromSlash(root)),
 			changes:     relativeTo(root, sorted),
-			files:       map[string]*string{},
+			cache:       cache,
 		}
 		base := map[string]string{"stack": r.Stack, "root": root}
 
 		if r.Scope == ScopeStack {
+			subject := r.Stack
+			if subject == "" {
+				subject = "*"
+			}
+			fired := slices.Contains(rechecks[r.ID], subject)
 			for _, ch := range c.changes {
 				if _, ok := r.match(ch); ok {
-					subject := r.Stack
-					if subject == "" {
-						subject = "*"
-					}
-					res.Findings = append(res.Findings, c.check(r, rs, subject, "", base)...)
+					fired = true
 					break
 				}
 			}
+			if fired {
+				res.Findings = append(res.Findings, c.check(r, rs, subject, "", base)...)
+			}
 			continue
 		}
-		for _, ch := range c.changes {
-			caps, ok := r.match(ch)
-			if !ok {
-				continue
-			}
-			vars := builtinVars(ch.Path)
+		checked := map[string]bool{}
+		fileFindings := func(rel string, caps map[string]string) {
+			checked[rel] = true
+			vars := builtinVars(rel)
 			for k, v := range base {
 				vars[k] = v
 			}
 			for k, v := range caps {
 				vars[k] = v
 			}
-			res.Findings = append(res.Findings, c.check(r, rs, c.projectRel(ch.Path), ch.Path, vars)...)
+			res.Findings = append(res.Findings, c.check(r, rs, c.projectRel(rel), rel, vars)...)
+		}
+		for _, ch := range c.changes {
+			if caps, ok := r.match(ch); ok {
+				fileFindings(ch.Path, caps)
+			}
+		}
+		// A recheck's trigger fired in an earlier evaluation; it still applies
+		// while the file exists and fits the rule.
+		for _, subject := range rechecks[r.ID] {
+			rel, ok := c.rootRel(subject)
+			if !ok || checked[rel] {
+				continue
+			}
+			if _, err := statInRoot(c.rootAbs, rel); err != nil {
+				continue
+			}
+			if caps, ok := r.matchPath(rel); ok {
+				fileFindings(rel, caps)
+			}
 		}
 	}
 	return res
@@ -157,6 +195,25 @@ func (r *Rule) match(ch Change) (map[string]string, bool) {
 		}
 		if caps, ok := t.pattern.Match(ch.Path); ok {
 			return caps, true
+		}
+	}
+	return nil, false
+}
+
+// matchPath reports whether path fits one of r's acted-on triggers whatever
+// its change type, with the captures.
+func (r *Rule) matchPath(p string) (map[string]string, bool) {
+	for _, ex := range r.exclude {
+		if _, ok := ex.Match(p); ok {
+			return nil, false
+		}
+	}
+	for _, t := range r.triggers {
+		switch t.kind {
+		case "added", "modified", "changed":
+			if caps, ok := t.pattern.Match(p); ok {
+				return caps, true
+			}
 		}
 	}
 	return nil, false
@@ -197,7 +254,7 @@ type checker struct {
 	root        string
 	rootAbs     string
 	changes     []Change
-	files       map[string]*string // contents cache; nil = unreadable
+	cache       *fsCache
 }
 
 func (c *checker) projectRel(rel string) string {
@@ -205,6 +262,14 @@ func (c *checker) projectRel(rel string) string {
 		return rel
 	}
 	return path.Join(c.root, rel)
+}
+
+// rootRel is the inverse of projectRel: p relative to the checker's root.
+func (c *checker) rootRel(p string) (string, bool) {
+	if c.root == "." {
+		return p, true
+	}
+	return strings.CutPrefix(p, c.root+"/")
 }
 
 func (c *checker) check(r *Rule, rs *ResolvedStack, subject, subjectPath string, vars map[string]string) []Finding {
@@ -287,11 +352,11 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 	var targets []string
 	haveTargets := false
 	if v.Exists != "" {
-		pat, missing := render(v.Exists, vars)
+		pat, missing := renderPath(v.Exists, vars)
 		if len(missing) > 0 {
 			return false
 		}
-		matches, err := globFS(c.rootAbs, pat)
+		matches, err := c.cache.glob(c.rootAbs, pat)
 		if err != nil || len(matches) == 0 {
 			return false
 		}
@@ -328,7 +393,7 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 			if !ok || !containsAll(text, contains) || (len(containsAny) > 0 && !containsSome(text, containsAny)) {
 				continue
 			}
-			if contentMM && !minMatches(text, v.MinMatches) {
+			if contentMM && !c.minMatches(text, v.MinMatches) {
 				continue
 			}
 			passed = true
@@ -340,7 +405,7 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 	}
 
 	if ci := v.ContainsIn; ci != nil {
-		file, missing := render(ci.File, vars)
+		file, missing := renderPath(ci.File, vars)
 		text, ok := c.read(file)
 		if len(missing) > 0 || !ok {
 			return false
@@ -353,9 +418,9 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 		}
 	}
 	if mm := v.MinMatches; mm != nil && mm.File != "" {
-		file, missing := render(mm.File, vars)
+		file, missing := renderPath(mm.File, vars)
 		text, ok := c.read(file)
-		if len(missing) > 0 || !ok || !minMatches(text, mm) {
+		if len(missing) > 0 || !ok || !c.minMatches(text, mm) {
 			return false
 		}
 	}
@@ -381,11 +446,11 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 
 // changedMatching returns the changed (non-deleted) files matching tmpl.
 func (c *checker) changedMatching(tmpl string, vars map[string]string) []string {
-	pat, missing := render(tmpl, vars)
+	pat, missing := renderPath(tmpl, vars)
 	if len(missing) > 0 {
 		return nil
 	}
-	p, err := CompilePattern(pat)
+	p, err := c.cache.pattern(pat)
 	if err != nil {
 		return nil
 	}
@@ -412,7 +477,7 @@ func (c *checker) expected(v *Verify, vars map[string]string) []string {
 			if tmpl == "" {
 				continue
 			}
-			p, _ := render(tmpl, vars)
+			p, _ := renderPath(tmpl, vars)
 			if p = c.projectRel(p); !seen[p] {
 				seen[p] = true
 				out = append(out, p)
@@ -444,20 +509,7 @@ func fileOfMM(mm *MinMatches) string {
 }
 
 func (c *checker) read(rel string) (string, bool) {
-	if cached, ok := c.files[rel]; ok {
-		if cached == nil {
-			return "", false
-		}
-		return *cached, true
-	}
-	data, err := readInRoot(c.rootAbs, rel)
-	if err != nil {
-		c.files[rel] = nil
-		return "", false
-	}
-	text := string(data)
-	c.files[rel] = &text
-	return text, true
+	return c.cache.read(c.rootAbs, rel)
 }
 
 func renderAll(tmpls []string, vars map[string]string) []string {
@@ -487,9 +539,9 @@ func containsSome(text string, subs []string) bool {
 	return false
 }
 
-func minMatches(text string, mm *MinMatches) bool {
-	re, err := regexp.Compile(mm.Pattern)
-	if err != nil {
+func (c *checker) minMatches(text string, mm *MinMatches) bool {
+	re := c.cache.regexp(mm.Pattern)
+	if re == nil {
 		return false
 	}
 	return len(re.FindAllStringIndex(text, mm.Count)) >= mm.Count

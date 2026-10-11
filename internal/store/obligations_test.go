@@ -98,6 +98,9 @@ func TestSQLiteStore_ObligationCRUD(t *testing.T) {
 	if err := st.UpsertObligation(ctx, &again); err != nil {
 		t.Fatalf("UpsertObligation (conflict): %v", err)
 	}
+	if again.ID != "o1" {
+		t.Errorf("upsert on conflict should report the stored ID, got %q", again.ID)
+	}
 	// The same key in another session is a separate obligation.
 	other := *o
 	other.ID, other.SessionID = "o2", "s2"

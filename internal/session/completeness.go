@@ -111,8 +111,10 @@ type Evaluation struct {
 type CompletenessEvaluator interface {
 	// BaseSHA returns the commit a new session's changes are measured from.
 	BaseSHA(projectPath string) (string, error)
-	// Evaluate returns nil, nil when the project has no manifest.
-	Evaluate(ctx context.Context, sess *Session) (*Evaluation, error)
+	// Evaluate returns nil, nil when the project has no manifest. stored are
+	// the session's obligations: when the changed set is partial, open and
+	// satisfied ones are verified again even if their subject isn't in it.
+	Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error)
 }
 
 // CompletenessSummary counts obligations by status (void ones aren't counted).
@@ -294,6 +296,9 @@ type completenessState struct {
 	newlyOpen      map[string]bool
 	newlySatisfied []*Obligation
 	attest         map[string]string
+	// readErr is set when the stored obligations couldn't be read; the state
+	// then can't say what is owed, and must not claim nothing is.
+	readErr string
 }
 
 // evaluateCompleteness evaluates sess and, when merge is set and the
@@ -304,7 +309,11 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	if s.completeness == nil {
 		return nil
 	}
-	ev, err := s.completeness.Evaluate(ctx, sess)
+	stored, listErr := s.store.ListObligations(ctx, sess.ID)
+	if listErr != nil {
+		fmt.Fprintf(os.Stderr, "[session] failed to list obligations for session %s: %v\n", sess.ID, listErr)
+	}
+	ev, err := s.completeness.Evaluate(ctx, sess, stored)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, err)
 		return nil
@@ -312,10 +321,8 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	if ev == nil {
 		return nil
 	}
-	stored, err := s.store.ListObligations(ctx, sess.ID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[session] failed to list obligations for session %s: %v\n", sess.ID, err)
-		return &completenessState{eval: ev}
+	if listErr != nil {
+		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}
 	}
 	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
 	if ev.Error != "" || !merge {
@@ -325,8 +332,22 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	now := time.Now()
 	mr := mergeObligations(sess.ID, stored, ev, now)
 	for _, o := range mr.upserts {
+		id := o.ID
 		if err := s.store.UpsertObligation(ctx, o); err != nil {
 			fmt.Fprintf(os.Stderr, "[session] failed to save obligation %s/%s for %s: %v\n", o.RuleID, o.RequirementID, o.Subject, err)
+			continue
+		}
+		// Another evaluation (the MCP server and the CLI) inserted the key
+		// first; the upsert kept its ID, so follow it.
+		if o.ID != id {
+			if mr.newlyOpen[id] {
+				delete(mr.newlyOpen, id)
+				mr.newlyOpen[o.ID] = true
+			}
+			if prompt, ok := mr.attest[id]; ok {
+				delete(mr.attest, id)
+				mr.attest[o.ID] = prompt
+			}
 		}
 	}
 	for _, o := range mr.voided {
@@ -339,6 +360,15 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	st.newlySatisfied = mr.newlySatisfied
 	st.attest = mr.attest
 	return st
+}
+
+// errText is the evaluation's manifest error, or why the obligations
+// couldn't be read.
+func (st *completenessState) errText() string {
+	if st.readErr != "" {
+		return st.readErr
+	}
+	return st.eval.Error
 }
 
 func (st *completenessState) summary() CompletenessSummary {
@@ -414,7 +444,7 @@ func (st *completenessState) checkpointView() *CheckpointCompleteness {
 		NewlyOpen:      []ObligationView{},
 		NewlySatisfied: []string{},
 		StillOpen:      []string{},
-		Error:          st.eval.Error,
+		Error:          st.errText(),
 		Warnings:       st.eval.Warnings,
 	}
 	for _, o := range st.open() {
@@ -450,7 +480,7 @@ func (st *completenessState) report(sessionID string) *CompletenessReport {
 		SessionID:   sessionID,
 		Enabled:     true,
 		Manifest:    st.eval.Manifest,
-		Error:       st.eval.Error,
+		Error:       st.errText(),
 		Summary:     st.summary(),
 		Obligations: []ObligationView{},
 		Stacks:      st.eval.Stacks,
@@ -478,6 +508,9 @@ func (st *completenessState) visible() []*Obligation {
 // commentLine is the one-line completeness summary for the checkpoint
 // comment, e.g. "**Completeness:** 2/5 · open: story, e2e ×2".
 func (st *completenessState) commentLine() string {
+	if st.readErr != "" {
+		return "**Completeness:** unavailable: " + st.readErr
+	}
 	if st.eval.Error != "" {
 		return "**Completeness:** manifest error: " + st.eval.Error
 	}
@@ -511,6 +544,9 @@ func (st *completenessState) commentLine() string {
 
 // reportTable is the completeness section of the "Session Finished" comment.
 func (st *completenessState) reportTable() string {
+	if st.readErr != "" {
+		return "### Completeness\nUnavailable: " + st.readErr
+	}
 	if st.eval.Error != "" {
 		return "### Completeness\nManifest error: " + st.eval.Error
 	}
@@ -546,7 +582,8 @@ func cell(s string) string {
 }
 
 // Completeness re-evaluates an active session and returns the full report.
-// For a session that isn't active, obligations are reported as stored.
+// For a session that isn't active, obligations are reported as stored,
+// without evaluating: the project may have moved on or lost its manifest.
 func (s *Service) Completeness(ctx context.Context, sessionID string) (*CompletenessReport, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
@@ -555,14 +592,30 @@ func (s *Service) Completeness(ctx context.Context, sessionID string) (*Complete
 	if sess == nil {
 		return nil, fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
 	}
-	active := sess.Status == StatusActive
-	st := s.evaluateCompleteness(ctx, sess, active)
+	if sess.Status != StatusActive {
+		return s.storedCompleteness(ctx, sess)
+	}
+	st := s.evaluateCompleteness(ctx, sess, true)
 	if st == nil {
 		return &CompletenessReport{SessionID: sessionID, Obligations: []ObligationView{}}, nil
 	}
 	r := st.report(sessionID)
-	if active {
-		s.remind(ctx, st)
+	s.remind(ctx, st)
+	return r, nil
+}
+
+// storedCompleteness reports a session's obligations as they were recorded;
+// it is enabled when any were.
+func (s *Service) storedCompleteness(ctx context.Context, sess *Session) (*CompletenessReport, error) {
+	stored, err := s.store.ListObligations(ctx, sess.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list obligations: %w", err)
 	}
+	if len(stored) == 0 {
+		return &CompletenessReport{SessionID: sess.ID, Obligations: []ObligationView{}}, nil
+	}
+	st := &completenessState{eval: &Evaluation{}, obligations: stored}
+	r := st.report(sess.ID)
+	r.Warnings = []string{fmt.Sprintf("session is %s: obligations are as recorded, not re-evaluated", strings.ToLower(string(sess.Status)))}
 	return r, nil
 }

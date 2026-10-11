@@ -633,8 +633,10 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		st = s.evaluateCompleteness(ctx, sess, true)
 	}
 
+	// The completeness table goes in the Session Finished comment below, so
+	// the stop checkpoint's comment leaves out its summary line.
 	if summary != "" {
-		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit, st)
+		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit, nil)
 		if err != nil {
 			return fmt.Errorf("failed to write stop checkpoint: %w", err)
 		}

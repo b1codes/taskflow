@@ -40,7 +40,8 @@ type SessionStore interface {
 	SetSessionBaseSHA(ctx context.Context, id string, sha string) error
 	// UpsertObligation inserts o, or updates the obligation with the same
 	// (session, rule, requirement, subject) key, keeping that one's ID,
-	// first_seen_at, reminder count, evidence, and waiver.
+	// first_seen_at, reminder count, evidence, and waiver. It sets o.ID to the
+	// stored row's ID.
 	UpsertObligation(ctx context.Context, o *Obligation) error
 	ListObligations(ctx context.Context, sessionID string) ([]*Obligation, error)
 	// UpdateObligationStatus sets satisfied_at to at when status is

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
 	return f.baseSHA, nil
 }
 
-func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session) (*Evaluation, error) {
+func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error) {
 	f.calls++
 	if f.eval == nil {
 		return nil, nil
@@ -379,8 +380,8 @@ func TestService_StopReport(t *testing.T) {
 	if len(comments) != 2 {
 		t.Fatalf("expected stop checkpoint + finished comments, got %d", len(comments))
 	}
-	if !strings.HasSuffix(comments[0], "**Completeness:** 1/2 · open: story") {
-		t.Errorf("stop checkpoint comment = %q", comments[0])
+	if strings.Contains(comments[0], "Completeness") {
+		t.Errorf("stop checkpoint comment repeats the finished comment's table: %q", comments[0])
 	}
 	finished := comments[1]
 	for _, want := range []string{
@@ -398,12 +399,13 @@ func TestService_StopReport(t *testing.T) {
 		t.Errorf("open obligations should be listed first:\n%s", finished)
 	}
 
-	// The report for the finished session is read-only.
+	// The report for the finished session is read-only and doesn't evaluate,
+	// so it survives the manifest going away.
 	calls := ev.calls
-	ev.eval = evalWith()
+	ev.eval = nil
 	report, err := srv.Completeness(ctx, res.Session.ID)
-	if err != nil || !report.Enabled || len(report.Obligations) != 2 || ev.calls != calls+1 {
-		t.Fatalf("report = %+v, %v", report, err)
+	if err != nil || !report.Enabled || len(report.Obligations) != 2 || ev.calls != calls {
+		t.Fatalf("report = %+v, %v (evaluations: %d)", report, err, ev.calls-calls)
 	}
 	for _, o := range store.obligations[res.Session.ID] {
 		if o.Status == ObligationVoid || o.RemindedCount != 0 {
@@ -441,5 +443,90 @@ func TestService_CompletenessReport(t *testing.T) {
 		if o.RequirementID == "test" && o.RemindedCount != 1 {
 			t.Errorf("tf_completeness should count as a reminder, got %d", o.RemindedCount)
 		}
+	}
+}
+
+// listHook replaces mockStore's ListObligations, to fake a stale read or a
+// failure.
+type listHook struct {
+	*mockStore
+	list func(sessionID string) ([]*Obligation, error)
+}
+
+func (l *listHook) ListObligations(ctx context.Context, sessionID string) ([]*Obligation, error) {
+	return l.list(sessionID)
+}
+
+func TestService_ConcurrentInsertKeepsStoredID(t *testing.T) {
+	ev := &fakeEvaluator{baseSHA: "base", eval: evalWith(finding("r", "story", "Page.tsx", false))}
+	store := newMockStore()
+	hook := &listHook{mockStore: store, list: func(string) ([]*Obligation, error) { return nil, nil }}
+	srv := NewService(hook, &mockGit{ctx: &GitContext{Branch: "main", SHA: "abc123"}}, nil).WithCompleteness(ev)
+	ctx := context.Background()
+
+	res, err := srv.Start(ctx, "task-1", t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sid := res.Session.ID
+	stored := store.obligations[sid]
+	if len(stored) != 1 {
+		t.Fatalf("Start should record one obligation, got %d", len(stored))
+	}
+
+	// The list read misses the row (another process inserted it after), so
+	// the merge mints a new ID; the upsert keeps the stored one.
+	cp, err := srv.Checkpoint(ctx, sid, "work", nil, false)
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if len(store.obligations[sid]) != 1 {
+		t.Fatalf("duplicate obligation rows: %+v", store.obligations[sid])
+	}
+	c := cp.Completeness
+	if c == nil || len(c.NewlyOpen) != 1 || c.NewlyOpen[0].ObligationID != stored[0].ID {
+		t.Fatalf("newly_open = %+v, want the stored ID %s", c, stored[0].ID)
+	}
+	if got := store.obligation(stored[0].ID).RemindedCount; got != 1 {
+		t.Errorf("reminder counted on a phantom ID: stored reminded_count = %d", got)
+	}
+}
+
+func TestService_ObligationsUnreadable(t *testing.T) {
+	ev := &fakeEvaluator{baseSHA: "base", eval: evalWith(finding("r", "story", "Page.tsx", false))}
+	store := newMockStore()
+	failing := false
+	hook := &listHook{mockStore: store, list: func(id string) ([]*Obligation, error) {
+		if failing {
+			return nil, errors.New("database is locked")
+		}
+		return store.ListObligations(context.Background(), id)
+	}}
+	srv := NewService(hook, &mockGit{ctx: &GitContext{Branch: "main", SHA: "abc123"}}, nil).WithCompleteness(ev)
+	ctx := context.Background()
+
+	res, err := srv.Start(ctx, "task-1", t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	failing = true
+	cp, err := srv.Checkpoint(ctx, res.Session.ID, "work", nil, false)
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if cp.Completeness == nil || !strings.Contains(cp.Completeness.Error, "database is locked") {
+		t.Errorf("checkpoint completeness = %+v, want the read error", cp.Completeness)
+	}
+	if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	comments := store.comments(t)
+	for _, c := range comments {
+		if strings.Contains(c, "nothing owed") || strings.Contains(c, "Nothing owed") {
+			t.Errorf("comment claims nothing is owed after a failed read: %q", c)
+		}
+	}
+	if last := comments[len(comments)-1]; !strings.Contains(last, "### Completeness\nUnavailable: stored obligations couldn't be read") {
+		t.Errorf("finished comment = %q", last)
 	}
 }

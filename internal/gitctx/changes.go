@@ -70,9 +70,13 @@ func HeadSHA(projectPath string) (string, error) {
 // tree, with rename detection) plus untracked files, which count as added.
 // Paths under .b1codes/ are left out.
 //
-// When baseSHA is empty or unreachable (rebased away, branch reset), the
-// merge-base of HEAD and the default branch is used instead; if that fails
-// too, only uncommitted changes are read and the set is marked Partial.
+// When baseSHA is empty or no longer in HEAD's history (rebased away, branch
+// reset), the merge-base of HEAD and the default branch is used instead. If
+// there is none, or it is HEAD itself (working on the default branch), only
+// uncommitted changes are read and the set is marked Partial.
+//
+// Files that changed only because a merge on HEAD's first-parent line
+// brought them in (e.g. main merged into the branch) are left out.
 func ChangedSince(projectPath, baseSHA string) (*ChangeSet, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -81,24 +85,35 @@ func ChangedSince(projectPath, baseSHA string) (*ChangeSet, error) {
 	}
 
 	cs := &ChangeSet{}
-	if baseSHA != "" && objectExists(ctx, projectPath, baseSHA) {
+	head, _ := runGitCmd(ctx, projectPath, "rev-parse", "--verify", "--quiet", "HEAD")
+	exists := baseSHA != "" && objectExists(ctx, projectPath, baseSHA)
+	switch {
+	case baseSHA == EmptyTreeSHA, exists && isAncestor(ctx, projectPath, baseSHA, head):
 		cs.Base = baseSHA
-	} else {
+	default:
 		why := "no base commit was recorded for this session"
-		if baseSHA != "" {
+		if exists {
+			why = fmt.Sprintf("base commit %s is no longer in HEAD's history", short(baseSHA))
+		} else if baseSHA != "" {
 			why = fmt.Sprintf("base commit %s is unreachable", short(baseSHA))
 		}
 		branch := defaultBranch(projectPath)
-		if mb, err := runGitCmd(ctx, projectPath, "merge-base", "HEAD", branch); err == nil && mb != "" {
+		mb, err := runGitCmd(ctx, projectPath, "merge-base", "HEAD", branch)
+		switch {
+		case err == nil && mb != "" && mb != head:
 			cs.Base = mb
 			cs.Warnings = append(cs.Warnings, fmt.Sprintf("%s; comparing against the merge-base with %s (%s)", why, branch, short(mb)))
-		} else {
+		default:
 			cs.Base = "HEAD"
-			if !objectExists(ctx, projectPath, "HEAD") {
+			if head == "" {
 				cs.Base = EmptyTreeSHA
 			}
 			cs.Partial = true
-			cs.Warnings = append(cs.Warnings, fmt.Sprintf("%s and there is no merge-base with %s; only uncommitted changes are checked", why, branch))
+			if err == nil && mb != "" {
+				cs.Warnings = append(cs.Warnings, fmt.Sprintf("%s and HEAD is on %s; only uncommitted changes are checked", why, branch))
+			} else {
+				cs.Warnings = append(cs.Warnings, fmt.Sprintf("%s and there is no merge-base with %s; only uncommitted changes are checked", why, branch))
+			}
 		}
 	}
 
@@ -107,6 +122,9 @@ func ChangedSince(projectPath, baseSHA string) (*ChangeSet, error) {
 		return nil, gitErr(ctx, "git diff", err)
 	}
 	cs.Files = parseNameStatus(diff)
+	if cs.Base == baseSHA && baseSHA != EmptyTreeSHA {
+		cs.Files = dropMergedIn(ctx, projectPath, baseSHA, cs)
+	}
 
 	untracked, err := runGitCmdRaw(ctx, projectPath, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
@@ -132,6 +150,56 @@ func ChangedSince(projectPath, baseSHA string) (*ChangeSet, error) {
 		cs.Warnings = append(cs.Warnings, fmt.Sprintf("more than %d files changed; only the first %d are checked", maxChangedFiles, maxChangedFiles))
 	}
 	return cs, nil
+}
+
+// dropMergedIn removes the files that differ from base only because a merge
+// on HEAD's first-parent line brought them in: touched by a merge (compared
+// to its first parent) but not by the branch's own commits or uncommitted
+// edits. On any git error the files are returned as they are.
+func dropMergedIn(ctx context.Context, projectPath, base string, cs *ChangeSet) []ChangedFile {
+	rng := base + "..HEAD"
+	merged, err := runGitCmdRaw(ctx, projectPath, "log", "--first-parent", "--merges", "--diff-merges=first-parent",
+		"--no-renames", "--name-only", "--relative", "-z", "--format=", rng)
+	if err != nil || len(bytes.Trim(merged, "\x00\n")) == 0 {
+		return cs.Files
+	}
+	own, err := runGitCmdRaw(ctx, projectPath, "log", "--first-parent", "--no-merges",
+		"--no-renames", "--name-only", "--relative", "-z", "--format=", rng)
+	if err != nil {
+		return cs.Files
+	}
+	dirty, err := runGitCmdRaw(ctx, projectPath, "diff", "--no-renames", "--name-only", "--relative", "-z", "HEAD")
+	if err != nil {
+		return cs.Files
+	}
+	upstream, mine := pathSet(merged), pathSet(own)
+	for p := range pathSet(dirty) {
+		mine[p] = true
+	}
+	kept := cs.Files[:0]
+	dropped := 0
+	for _, f := range cs.Files {
+		if upstream[f.Path] && !mine[f.Path] && (f.OldPath == "" || !mine[f.OldPath]) {
+			dropped++
+			continue
+		}
+		kept = append(kept, f)
+	}
+	if dropped > 0 {
+		cs.Warnings = append(cs.Warnings, fmt.Sprintf("%d file(s) changed only by merges into this branch are not counted", dropped))
+	}
+	return kept
+}
+
+// pathSet splits NUL-separated `git log --name-only -z --format=` output.
+// Each commit's list starts on a new line, so the separators are NUL and
+// newline.
+func pathSet(out []byte) map[string]bool {
+	set := map[string]bool{}
+	for _, p := range bytes.FieldsFunc(out, func(r rune) bool { return r == 0 || r == '\n' }) {
+		set[string(p)] = true
+	}
+	return set
 }
 
 // parseNameStatus parses `git diff --name-status -z` output: a status token
@@ -194,6 +262,15 @@ func checkRepo(ctx context.Context, projectPath string) error {
 // objectExists reports whether rev names a commit or tree in the repo.
 func objectExists(ctx context.Context, projectPath, rev string) bool {
 	_, err := runGitCmd(ctx, projectPath, "rev-parse", "--verify", "--quiet", rev+"^{tree}")
+	return err == nil
+}
+
+// isAncestor reports whether commit rev is head or one of its ancestors.
+func isAncestor(ctx context.Context, projectPath, rev, head string) bool {
+	if head == "" {
+		return false
+	}
+	_, err := runGitCmd(ctx, projectPath, "merge-base", "--is-ancestor", rev, head)
 	return err == nil
 }
 

@@ -423,14 +423,15 @@ func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligatio
 		status = excluded.status,
 		verified_levels = excluded.verified_levels,
 		satisfied_at = excluded.satisfied_at,
-		updated_at = excluded.updated_at`
+		updated_at = excluded.updated_at
+	RETURNING id`
 	var planned int
 	if o.Planned {
 		planned = 1
 	}
-	_, err := s.db.ExecContext(ctx, query, o.ID, o.SessionID, o.RuleID, o.RequirementID, o.Subject, o.Source, o.Severity, o.Describe,
+	err := s.db.QueryRowContext(ctx, query, o.ID, o.SessionID, o.RuleID, o.RequirementID, o.Subject, o.Source, o.Severity, o.Describe,
 		jsonMarshal(o.Expected), string(o.Status), jsonMarshal(o.VerifiedLevels), o.Evidence, nullString(o.WaiverDecisionID),
-		planned, nullString(o.InheritedFrom), o.RemindedCount, o.FirstSeenAt, o.SatisfiedAt, o.UpdatedAt)
+		planned, nullString(o.InheritedFrom), o.RemindedCount, o.FirstSeenAt, o.SatisfiedAt, o.UpdatedAt).Scan(&o.ID)
 	if err != nil {
 		return fmt.Errorf("failed to upsert obligation: %w", err)
 	}

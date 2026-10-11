@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -156,6 +157,24 @@ func render(tmpl string, vars map[string]string) (string, []string) {
 	return out, missing
 }
 
+// renderPath renders a path template. {dir} is "." for a file at the root,
+// so "." segments are dropped: "{dir}/{stem}.test.ts" must give
+// "foo.test.ts", the form changed and globbed paths take.
+func renderPath(tmpl string, vars map[string]string) (string, []string) {
+	p, missing := render(tmpl, vars)
+	segs := strings.Split(p, "/")
+	kept := segs[:0]
+	for _, s := range segs {
+		if s != "." {
+			kept = append(kept, s)
+		}
+	}
+	if len(kept) == 0 {
+		return ".", missing
+	}
+	return strings.Join(kept, "/"), missing
+}
+
 // templateVars returns the placeholder names used in tmpl.
 func templateVars(tmpl string) []string {
 	var out []string
@@ -218,18 +237,77 @@ func statInRoot(root, rel string) (fs.FileInfo, error) {
 // literal prefix, so "src/features/*/pages/*.tsx" only reads src/features.
 // Like readInRoot, it never looks outside root.
 func globFS(root, pattern string) ([]string, error) {
-	r, err := os.OpenRoot(root)
-	if err != nil {
-		return nil, nil
+	return newFSCache().glob(root, pattern)
+}
+
+// fsCache memoizes filesystem reads and compiled patterns for one
+// evaluation. Walks are cached by where they start rather than by pattern:
+// rendered patterns differ per subject ("src/**/Foo.test.ts",
+// "src/**/Bar.test.ts") but share one walk of src.
+type fsCache struct {
+	walks    map[string][]string       // root, start, named skipped dirs → paths
+	patterns map[string]*Pattern       // nil = invalid
+	regexps  map[string]*regexp.Regexp // nil = invalid
+	files    map[string]*string        // absolute path → contents; nil = unreadable
+}
+
+func newFSCache() *fsCache {
+	return &fsCache{
+		walks:    map[string][]string{},
+		patterns: map[string]*Pattern{},
+		regexps:  map[string]*regexp.Regexp{},
+		files:    map[string]*string{},
 	}
-	defer r.Close()
+}
+
+func (fc *fsCache) pattern(src string) (*Pattern, error) {
+	if p, ok := fc.patterns[src]; ok {
+		if p == nil {
+			return nil, fmt.Errorf("invalid pattern %q", src)
+		}
+		return p, nil
+	}
+	p, err := CompilePattern(src)
+	fc.patterns[src] = p
+	return p, err
+}
+
+func (fc *fsCache) regexp(src string) *regexp.Regexp {
+	re, ok := fc.regexps[src]
+	if !ok {
+		re, _ = regexp.Compile(src)
+		fc.regexps[src] = re
+	}
+	return re
+}
+
+// read returns rel's contents under root, confined like readInRoot.
+func (fc *fsCache) read(root, rel string) (string, bool) {
+	key := filepath.Join(root, filepath.FromSlash(rel))
+	if cached, ok := fc.files[key]; ok {
+		if cached == nil {
+			return "", false
+		}
+		return *cached, true
+	}
+	data, err := readInRoot(root, rel)
+	if err != nil {
+		fc.files[key] = nil
+		return "", false
+	}
+	text := string(data)
+	fc.files[key] = &text
+	return text, true
+}
+
+func (fc *fsCache) glob(root, pattern string) ([]string, error) {
 	if !hasGlob(pattern) {
-		if _, err := r.Stat(filepath.FromSlash(pattern)); err != nil {
+		if _, err := statInRoot(root, pattern); err != nil {
 			return nil, nil
 		}
 		return []string{pattern}, nil
 	}
-	p, err := CompilePattern(pattern)
+	p, err := fc.pattern(pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -245,11 +323,41 @@ func globFS(root, pattern string) ([]string, error) {
 	if len(prefix) > 0 {
 		start = strings.Join(prefix, "/")
 	}
-	explicit := map[string]bool{}
+	var named []string
 	for _, s := range segs {
-		explicit[s] = true
+		if skippedDirs[s] {
+			named = append(named, s)
+		}
+	}
+	paths, err := fc.walk(root, start, named)
+	if err != nil {
+		return nil, err
 	}
 	var out []string
+	for _, rel := range paths {
+		if _, ok := p.Match(rel); ok {
+			out = append(out, rel)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// walk lists every path under start (relative to root), descending into a
+// skipped dir only when the pattern names it.
+func (fc *fsCache) walk(root, start string, named []string) ([]string, error) {
+	sort.Strings(named)
+	key := root + "\x00" + start + "\x00" + strings.Join(named, "/")
+	if paths, ok := fc.walks[key]; ok {
+		return paths, nil
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		fc.walks[key] = nil
+		return nil, nil
+	}
+	defer r.Close()
+	var paths []string
 	err = fs.WalkDir(r.FS(), start, func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if rel == start {
@@ -260,17 +368,15 @@ func globFS(root, pattern string) ([]string, error) {
 		if rel == "." {
 			return nil
 		}
-		if d.IsDir() && skippedDirs[d.Name()] && !explicit[d.Name()] {
+		if d.IsDir() && skippedDirs[d.Name()] && !slices.Contains(named, d.Name()) {
 			return fs.SkipDir
 		}
-		if _, ok := p.Match(rel); ok {
-			out = append(out, rel)
-		}
+		paths = append(paths, rel)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(out)
-	return out, nil
+	fc.walks[key] = paths
+	return paths, nil
 }

@@ -228,3 +228,75 @@ func TestChangedSince_NotARepo(t *testing.T) {
 		t.Errorf("HeadSHA: expected ErrNotAGitRepository, got %v", err)
 	}
 }
+
+func TestChangedSince_OnDefaultBranchWithoutBase(t *testing.T) {
+	dir := newRepo(t)
+	git(t, dir, "checkout", "-q", "-b", "main")
+	write(t, dir, "a.txt", "x")
+	commitAll(t, dir, "initial")
+	write(t, dir, "b.txt", "y")
+	commitAll(t, dir, "session work") // committed, so invisible without a base
+
+	cs, err := ChangedSince(dir, "")
+	if err != nil {
+		t.Fatalf("ChangedSince: %v", err)
+	}
+	if !cs.Partial || len(cs.Warnings) != 1 || !strings.Contains(cs.Warnings[0], "HEAD is on main") {
+		t.Errorf("partial=%v warnings=%v, want partial: the merge-base is HEAD itself", cs.Partial, cs.Warnings)
+	}
+}
+
+func TestChangedSince_BaseNotAncestor(t *testing.T) {
+	dir := newRepo(t)
+	git(t, dir, "checkout", "-q", "-b", "main")
+	write(t, dir, "a.txt", "x")
+	commitAll(t, dir, "initial")
+	git(t, dir, "checkout", "-q", "-b", "feature")
+	write(t, dir, "old.txt", "y")
+	commitAll(t, dir, "work that gets reset away")
+	base := git(t, dir, "rev-parse", "HEAD")
+	git(t, dir, "reset", "-q", "--hard", "main")
+	write(t, dir, "new.txt", "z")
+	commitAll(t, dir, "new work")
+
+	cs, err := ChangedSince(dir, base)
+	if err != nil {
+		t.Fatalf("ChangedSince: %v", err)
+	}
+	if got, want := summarize(cs.Files), []string{"A new.txt"}; !slices.Equal(got, want) {
+		t.Errorf("files = %v, want %v (diffing from the stale base would also report old.txt deleted)", got, want)
+	}
+	if len(cs.Warnings) != 1 || !strings.Contains(cs.Warnings[0], "no longer in HEAD's history") {
+		t.Errorf("warnings = %v", cs.Warnings)
+	}
+}
+
+func TestChangedSince_IgnoresMergedInChanges(t *testing.T) {
+	dir := newRepo(t)
+	git(t, dir, "checkout", "-q", "-b", "main")
+	write(t, dir, "shared.txt", "1")
+	commitAll(t, dir, "initial")
+	git(t, dir, "checkout", "-q", "-b", "feature")
+	base := git(t, dir, "rev-parse", "HEAD")
+	write(t, dir, "mine.txt", "m")
+	commitAll(t, dir, "session work")
+
+	git(t, dir, "checkout", "-q", "main")
+	write(t, dir, "teammate.txt", "t")
+	write(t, dir, "shared.txt", "2")
+	commitAll(t, dir, "upstream work")
+	git(t, dir, "checkout", "-q", "feature")
+	git(t, dir, "merge", "-q", "--no-edit", "main")
+	write(t, dir, "shared.txt", "3") // the session edits a merged-in file too
+
+	cs, err := ChangedSince(dir, base)
+	if err != nil {
+		t.Fatalf("ChangedSince: %v", err)
+	}
+	if got, want := summarize(cs.Files), []string{"A mine.txt", "M shared.txt"}; !slices.Equal(got, want) {
+		t.Errorf("files = %v, want %v", got, want)
+	}
+	if cs.Partial || len(cs.Warnings) != 1 || !strings.Contains(cs.Warnings[0], "1 file(s) changed only by merges") {
+		t.Errorf("partial=%v warnings=%v", cs.Partial, cs.Warnings)
+	}
+}

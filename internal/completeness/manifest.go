@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -280,9 +281,9 @@ func (m *Manifest) validate() []string {
 			add("%s.id: duplicate stack %q", at, s.ID)
 		}
 		stackIDs[s.ID] = true
-		if s.Root == "" {
-			s.Root = "."
-		}
+		// Clean so "./web" or "web/" match changed paths, which are relative
+		// to the project with no "./" prefix or trailing slash.
+		s.Root = path.Clean(s.Root)
 		if !filepath.IsLocal(filepath.FromSlash(s.Root)) {
 			add("%s.root: must be a path inside the project, got %q", at, s.Root)
 		}

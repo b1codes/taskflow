@@ -199,8 +199,8 @@ func TestCompleteness_EndToEnd_ReactScreen(t *testing.T) {
 	if !strings.HasSuffix(comments[0], "**Completeness:** 0/3 · open: story, unit-test, suite") {
 		t.Errorf("first checkpoint line = %q", comments[0][strings.LastIndex(comments[0], "\n")+1:])
 	}
-	if !strings.HasSuffix(comments[2], "**Completeness:** 2/3 · open: suite") {
-		t.Errorf("stop checkpoint line = %q", comments[2][strings.LastIndex(comments[2], "\n")+1:])
+	if strings.Contains(comments[2], "Completeness") {
+		t.Errorf("stop checkpoint repeats the finished comment's table: %q", comments[2])
 	}
 	finished := comments[3]
 	for _, want := range []string{

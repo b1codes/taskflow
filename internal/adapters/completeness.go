@@ -28,7 +28,9 @@ func (e *CompletenessEvaluator) BaseSHA(projectPath string) (string, error) {
 // Evaluate re-reads the project's manifest and checks the session's changes
 // since its base commit against it. It returns nil, nil when the project has
 // no manifest, and an Evaluation carrying Error when the manifest is invalid.
-func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Session) (*session.Evaluation, error) {
+// When the changed set is partial, stored open and satisfied obligations are
+// verified again, so work finished outside it is still noticed.
+func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Session, stored []*session.Obligation) (*session.Evaluation, error) {
 	m, err := completeness.Load(sess.ProjectPath)
 	if err != nil {
 		var me *completeness.ManifestError
@@ -65,7 +67,15 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 		}
 	}
 
-	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes)
+	var recheck []completeness.Recheck
+	if ev.Partial {
+		for _, o := range stored {
+			if o.Status == session.ObligationOpen || o.Status == session.ObligationSatisfied {
+				recheck = append(recheck, completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
+			}
+		}
+	}
+	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes, recheck)
 	ev.Warnings = append(ev.Warnings, res.Warnings...)
 	for _, rs := range res.Stacks {
 		info := session.StackInfo{ID: rs.ID, Root: rs.Root, Commands: map[string]*string{}, Warning: strings.Join(rs.Warnings, "; ")}

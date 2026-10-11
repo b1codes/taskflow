@@ -83,7 +83,7 @@ func evalFixture(t *testing.T, manifest string, files map[string]string, changes
 	if err != nil {
 		t.Fatalf("LoadOverrides: %v", err)
 	}
-	return Evaluate(root, m, o, changes)
+	return Evaluate(root, m, o, changes, nil)
 }
 
 func findingsByKey(res *Result) map[string]Finding {
@@ -412,7 +412,7 @@ rules:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	res := Evaluate(root, m, &Overrides{}, []Change{{Path: "src/Foo.ts", Type: Added}})
+	res := Evaluate(root, m, &Overrides{}, []Change{{Path: "src/Foo.ts", Type: Added}}, nil)
 	if len(res.Findings) != 2 {
 		t.Fatalf("findings = %+v", res.Findings)
 	}
@@ -420,5 +420,88 @@ rules:
 		if f.Satisfied {
 			t.Errorf("%s satisfied by a file outside the project", f.RequirementID)
 		}
+	}
+}
+
+func TestEvaluate_DirAtRoot(t *testing.T) {
+	manifest := `
+version: 1
+rules:
+  - id: r
+    when: { added: "{name}.ts", exclude: ["*.test.ts"] }
+    require:
+      - { id: changed, describe: "d", verify: { changed: "{dir}/{stem}.test.ts" } }
+      - { id: exists, describe: "d", verify: { exists: "{dir}/{stem}.test.ts" } }
+`
+	res := evalFixture(t, manifest, map[string]string{"foo.ts": "", "foo.test.ts": ""},
+		[]Change{{Path: "foo.ts", Type: Added}, {Path: "foo.test.ts", Type: Added}})
+	for _, f := range res.Findings {
+		if !f.Satisfied {
+			t.Errorf("%s not satisfied for a root-level file", f.RequirementID)
+		}
+		if !slices.Equal(f.Expected, []string{"foo.test.ts"}) {
+			t.Errorf("%s expected = %v, want [foo.test.ts]", f.RequirementID, f.Expected)
+		}
+	}
+	if len(res.Findings) != 2 {
+		t.Fatalf("findings = %+v", res.Findings)
+	}
+}
+
+func TestEvaluate_StackRootIsCleaned(t *testing.T) {
+	manifest := `
+version: 1
+stacks: [{ id: web, root: ./web/ }]
+rules:
+  - id: r
+    stack: web
+    when: { added: "src/{name}.ts" }
+    require: [{ id: q, describe: "d", verify: { exists: "src/{name}.test.ts" } }]
+`
+	res := evalFixture(t, manifest, map[string]string{"web/src/a.ts": "", "web/src/a.test.ts": ""},
+		[]Change{{Path: "web/src/a.ts", Type: Added}})
+	if len(res.Findings) != 1 || !res.Findings[0].Satisfied || res.Findings[0].Subject != "web/src/a.ts" {
+		t.Fatalf("findings = %+v, want one satisfied finding for web/src/a.ts", res.Findings)
+	}
+}
+
+func TestEvaluate_Recheck(t *testing.T) {
+	m, err := Parse([]byte(`
+version: 1
+stacks: [{ id: web, root: web }]
+rules:
+  - id: files
+    stack: web
+    when: { added: "src/{name}.ts" }
+    require: [{ id: test, describe: "d", verify: { exists: "src/{name}.test.ts" } }]
+  - id: suite
+    stack: web
+    scope: stack
+    when: { changed: "**" }
+    require: [{ id: q, describe: "d", attest: "ran it" }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"web/src/a.ts": "", "web/src/a.test.ts": "", "web/src/b.ts": ""})
+	recheck := []Recheck{
+		{RuleID: "files", Subject: "web/src/a.ts"},    // committed earlier, test since added
+		{RuleID: "files", Subject: "web/src/gone.ts"}, // file no longer exists
+		{RuleID: "suite", Subject: "web"},
+	}
+	res := Evaluate(root, m, &Overrides{}, nil, recheck)
+	got := findingsByKey(res)
+	if f, ok := got["files/test/web/src/a.ts"]; !ok || !f.Satisfied {
+		t.Errorf("rechecked a.ts = %+v, want satisfied", f)
+	}
+	if _, ok := got["files/test/web/src/gone.ts"]; ok {
+		t.Error("a recheck whose file is gone must not be reported")
+	}
+	if _, ok := got["suite/q/web"]; !ok {
+		t.Error("stack-scoped recheck not reported")
+	}
+	if len(got) != 2 {
+		t.Errorf("findings = %v, want only the two rechecks", got)
 	}
 }
