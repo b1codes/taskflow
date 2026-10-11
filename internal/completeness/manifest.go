@@ -461,8 +461,12 @@ func validateCondition(c *Condition, at string, add func(string, ...any)) {
 			add("%s.exists: %v", at, err)
 		}
 	}
-	if c.FileContains != nil && (c.FileContains.File == "" || c.FileContains.Text == "") {
-		add("%s.file_contains: needs file and text", at)
+	if c.FileContains != nil {
+		if c.FileContains.File == "" || c.FileContains.Text == "" {
+			add("%s.file_contains: needs file and text", at)
+		} else if _, err := CompilePattern(c.FileContains.File); err != nil {
+			add("%s.file_contains.file: %v", at, err)
+		}
 	}
 	for i := range c.Any {
 		validateCondition(&c.Any[i], fmt.Sprintf("%s.any[%d]", at, i), add)

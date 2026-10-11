@@ -77,6 +77,8 @@ func TestParse_ValidationErrors(t *testing.T) {
 		{"run without stack", strings.Replace(minimalRule, `verify: { exists: "src/{name}.test.ts" }`, `run: { command: test }`, 1), "the rule has no stack"},
 		{"stack scope has no captures", strings.Replace(minimalRule, "  - id: r\n", "  - id: r\n    scope: stack\n", 1), "unknown variable {name}"},
 		{"root escapes project", minimalRule + "stacks:\n  - id: web\n    root: ../elsewhere\n", "must be a path inside the project"},
+		{"verify path escapes project", strings.Replace(minimalRule, `verify: { exists: "src/{name}.test.ts" }`, `verify: { contains_in: { file: "../secrets.txt", any: [x] } }`, 1), "must stay inside the project"},
+		{"condition path escapes project", minimalRule + "stacks:\n  - id: web\n    commands:\n      test:\n        - { if: { file_contains: { file: \"../../.ssh/config\", text: x } }, run: t }\n", "file_contains.file"},
 		{"empty", "", "manifest is empty"},
 	}
 	for _, tt := range tests {

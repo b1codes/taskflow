@@ -39,6 +39,12 @@ func CompilePattern(src string) (*Pattern, error) {
 	var b strings.Builder
 	b.WriteString("^")
 	segs := strings.Split(src, "/")
+	for _, seg := range segs {
+		// Checks read files, so a manifest must not reach outside its root.
+		if seg == ".." {
+			return nil, fmt.Errorf("pattern %q must stay inside the project (no \"..\")", src)
+		}
+	}
 	for i, seg := range segs {
 		last := i == len(segs)-1
 		if seg == "**" {

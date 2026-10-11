@@ -55,7 +55,7 @@ func TestPattern_Match(t *testing.T) {
 }
 
 func TestCompilePattern_Errors(t *testing.T) {
-	for _, src := range []string{"", "/abs/path", "src/a**b", "src/{unclosed"} {
+	for _, src := range []string{"", "/abs/path", "src/a**b", "src/{unclosed", "../outside.txt", "src/../../etc/passwd"} {
 		if _, err := CompilePattern(src); err == nil {
 			t.Errorf("CompilePattern(%q): expected an error", src)
 		}
