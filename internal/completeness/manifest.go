@@ -369,6 +369,9 @@ func (m *Manifest) validate() []string {
 				if reqIDs[q.ID] {
 					add("%s: duplicate requirement id", qat)
 				}
+				if q.ID == SubjectFileRequirement {
+					add("%s.id: %q is reserved for planned subject files", qat, q.ID)
+				}
 			}
 			reqIDs[q.ID] = true
 			switch q.Severity {

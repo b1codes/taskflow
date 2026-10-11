@@ -95,6 +95,26 @@ func TestResolveStatusForRole_Defaults(t *testing.T) {
 		{"archive picks closed", developmentTaskListStatuses, RoleArchive, "cancelled", nil},
 		{"reopen picks the in-progress custom status", developmentTaskListStatuses, RoleReopen, "in progress", nil},
 		{"archive skips ClickUp's default closed status", clickUpDefaultListStatuses, RoleArchive, "", ErrSkipStatusChange},
+		{"review picks the custom status named review", developmentTaskListStatuses, RoleReview, "in review", nil},
+		{"review leaves a list without a review status alone", clickUpDefaultListStatuses, RoleReview, "", ErrSkipStatusChange},
+		{
+			name: "review matches the whole word, not a substring",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "preview build", "type": "custom", "orderindex": 1},
+				{"status": "Reviewing", "type": "custom", "orderindex": 2},
+				{"status": "Code-Review", "type": "custom", "orderindex": 3},
+				{"status": "complete", "type": "done", "orderindex": 4}
+			]`,
+			role: RoleReview,
+			want: "Code-Review",
+		},
+		{
+			name:     "review only picks custom statuses",
+			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "reviewed", "type": "done", "orderindex": 1}, {"status": "review", "type": "closed", "orderindex": 2}]`,
+			role:     RoleReview,
+			wantErr:  ErrSkipStatusChange,
+		},
 		{"complete falls back to ClickUp's default closed status", clickUpDefaultListStatuses, RoleComplete, "complete", nil},
 		{
 			name: "archive picks a closed status named like a cancellation",
@@ -283,6 +303,10 @@ func TestResolveStatusForRole_RespectsCurrentStatus(t *testing.T) {
 		{"reopen starts an open task", openTaskStatus, RoleReopen, "in progress"},
 		{"reopen leaves a task in review", inReview, RoleReopen, ""},
 		{"reopen leaves a task already in progress", inProgress, RoleReopen, ""},
+		{"review moves a task in progress to review", inProgress, RoleReview, "in review"},
+		{"review moves a task in QA back to review", `{"status": "testing/qa", "type": "custom"}`, RoleReview, "in review"},
+		{"review leaves a completed task", complete, RoleReview, ""},
+		{"review leaves a cancelled task", cancelled, RoleReview, ""},
 	}
 
 	for _, tt := range tests {
@@ -342,13 +366,51 @@ func TestResolveStatusForRole_Overrides(t *testing.T) {
 	}
 }
 
+func TestResolveStatusForRole_Review(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	if role, err := ParseStatusRole("review"); err != nil || role != RoleReview {
+		t.Fatalf("ParseStatusRole(review) = %q, %v", role, err)
+	}
+
+	t.Run("a task already in review is left there", func(t *testing.T) {
+		t.Parallel()
+		server := newTaskStatusServer(t, "task-1", "list-1", `{"status": "in review", "type": "custom"}`, developmentTaskListStatuses, nil, nil)
+		client := New("api-key").WithBaseURL(server.URL)
+		if got, err := ResolveStatusForRole(ctx, newMemStore(t), client, "task-1", RoleReview, nil); !errors.Is(err, ErrSkipStatusChange) {
+			t.Fatalf("expected ErrSkipStatusChange, got %q, %v", got, err)
+		}
+	})
+
+	t.Run("status_map.review overrides the default", func(t *testing.T) {
+		t.Parallel()
+		server := newStatusServer(t, "task-1", "list-1", developmentTaskListStatuses, nil, nil)
+		client := New("api-key").WithBaseURL(server.URL)
+		got, err := ResolveStatusForRole(ctx, newMemStore(t), client, "task-1", RoleReview, map[StatusRole]string{RoleReview: "Testing/QA"})
+		if err != nil || got != "testing/qa" {
+			t.Fatalf("expected override 'testing/qa', got %q, %v", got, err)
+		}
+	})
+
+	t.Run("a missing status_map.review falls back to the default", func(t *testing.T) {
+		t.Parallel()
+		server := newStatusServer(t, "task-1", "list-review-fallback", developmentTaskListStatuses, nil, nil)
+		client := New("api-key").WithBaseURL(server.URL)
+		got, err := ResolveStatusForRole(ctx, newMemStore(t), client, "task-1", RoleReview, map[StatusRole]string{RoleReview: "awaiting sign-off"})
+		if err != nil || got != "in review" {
+			t.Fatalf("expected default 'in review', got %q, %v", got, err)
+		}
+	})
+}
+
 func TestResolveStatusForRole_UnknownRole(t *testing.T) {
 	t.Parallel()
 
 	server := newStatusServer(t, "task-1", "list-1", developmentTaskListStatuses, nil, nil)
 	client := New("api-key").WithBaseURL(server.URL)
 
-	_, err := ResolveStatusForRole(context.Background(), nil, client, "task-1", StatusRole("review"), nil)
+	_, err := ResolveStatusForRole(context.Background(), nil, client, "task-1", StatusRole("deploy"), nil)
 	if !errors.Is(err, ErrUnknownStatusRole) {
 		t.Fatalf("expected ErrUnknownStatusRole, got %v", err)
 	}

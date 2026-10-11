@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,4 +265,111 @@ func TestMCPServer_Completeness(t *testing.T) {
 			t.Errorf("expected a tool error for an unknown session, got %v, %v", res, err)
 		}
 	})
+}
+
+// callToolError calls a handler expecting a tool error, and returns its text.
+func callToolError(t *testing.T, name string, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), args map[string]any) string {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = args
+	res, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("%s failed: %v", name, err)
+	}
+	text := res.Content[0].(mcp.TextContent).Text
+	if !res.IsError {
+		t.Fatalf("%s should have returned a tool error, got: %s", name, text)
+	}
+	return text
+}
+
+func TestMCPServer_Enforcement(t *testing.T) {
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "-b", "main").Run(); err != nil {
+		t.Skip("skipping: git init failed")
+	}
+	manifest := `version: 1
+gate: block
+rules:
+  - id: r
+    when: { added: "{name}.go" }
+    plannable: true
+    require:
+      - { id: test, describe: "Test for {name}", verify: { exists: "{name}_test.go" } }
+      - { id: docs, describe: "Docs for {name}", verify: { exists: "docs/{name}.md" } }
+`
+	if err := os.MkdirAll(filepath.Join(dir, ".taskflow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".taskflow", "completeness.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	srv := New(st, &config.Config{Completeness: config.CompletenessConfig{Gate: "report"}}, nil)
+
+	contract := callTool(t, "tf_start", srv.handleStart, map[string]any{"task_id": "task-gate", "project_path": dir})
+	sid := contract["session_id"].(string)
+	cc := contract["completeness"].(map[string]any)
+	for _, k := range []string{"manifest", "gate", "stacks", "rules", "summary", "open", "protocol"} {
+		if _, ok := cc[k]; !ok {
+			t.Errorf("contract completeness lacks %q: %v", k, cc)
+		}
+	}
+	if cc["gate"] != "block" {
+		t.Errorf("the manifest's gate should override config: %v", cc["gate"])
+	}
+
+	// tf_plan: items are parsed from objects; non-string vars are rejected.
+	if text := callToolError(t, "tf_plan", srv.handlePlan, map[string]any{"session_id": sid, "items": []any{map[string]any{"rule_id": "r", "vars": map[string]any{"name": 3}}}}); !strings.Contains(text, "items must be") {
+		t.Errorf("tf_plan with a numeric var = %q", text)
+	}
+	if text := callToolError(t, "tf_plan", srv.handlePlan, map[string]any{"session_id": sid, "items": []any{map[string]any{"rule_id": "nope"}}}); !strings.Contains(text, `unknown rule "nope"`) {
+		t.Errorf("tf_plan with an unknown rule = %q", text)
+	}
+	plan := callTool(t, "tf_plan", srv.handlePlan, map[string]any{"session_id": sid, "items": []any{map[string]any{"rule_id": "r", "vars": map[string]any{"name": "widget"}}}})
+	planned := plan["planned"].([]any)
+	if plan["plan_state"] != "planned" || len(planned) != 3 {
+		t.Fatalf("tf_plan = %v", plan)
+	}
+	ids := map[string]string{}
+	for _, p := range planned {
+		p := p.(map[string]any)
+		ids[p["requirement"].(string)] = p["obligation_id"].(string)
+	}
+
+	// tf_stop is blocked, and has no force.
+	if text := callToolError(t, "tf_stop", srv.handleStop, map[string]any{"session_id": sid, "status": "completed", "force": true}); !strings.Contains(text, "tf_waive") || !strings.Contains(text, ids["docs"]) {
+		t.Errorf("blocked tf_stop = %q", text)
+	}
+
+	// tf_waive and tf_attest resolve what's open.
+	if text := callToolError(t, "tf_waive", srv.handleWaive, map[string]any{"session_id": sid, "obligation_id": "nope", "rationale": "x"}); !strings.Contains(text, ids["docs"]) {
+		t.Errorf("tf_waive on an unknown obligation should name the open ones: %q", text)
+	}
+	callToolError(t, "tf_waive", srv.handleWaive, map[string]any{"session_id": sid, "obligation_id": ids["docs"]})
+	waived := callTool(t, "tf_waive", srv.handleWaive, map[string]any{"session_id": sid, "obligation_id": ids["docs"], "rationale": "Internal helper; no user docs"})
+	if waived["decision_id"] == "" || waived["obligation"].(map[string]any)["status"] != "waived" {
+		t.Errorf("tf_waive = %v", waived)
+	}
+	for _, req := range []string{"test", "subject-file"} {
+		attested := callTool(t, "tf_attest", srv.handleAttest, map[string]any{"session_id": sid, "obligation_id": ids[req], "evidence": "done in another repo"})
+		if attested["obligation"].(map[string]any)["status"] != "attested" {
+			t.Errorf("tf_attest %s = %v", req, attested)
+		}
+	}
+
+	stop := callTool(t, "tf_stop", srv.handleStop, map[string]any{"session_id": sid, "status": "completed"})
+	if stop["status"] != "ok" || stop["session_id"] != sid || stop["new_status"] != "COMPLETED" {
+		t.Errorf("tf_stop = %v", stop)
+	}
+	if gate := stop["gate"].(map[string]any); gate["mode"] != "block" || gate["outcome"] != "passed" {
+		t.Errorf("tf_stop gate = %v", gate)
+	}
+	if _, ok := stop["completeness"].(map[string]any); !ok {
+		t.Errorf("tf_stop should carry the final report: %v", stop)
+	}
 }

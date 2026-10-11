@@ -129,7 +129,7 @@ func TestTaskflow_FullLifecycleIntegration(t *testing.T) {
 	}
 
 	// 4. Stop session
-	err = service.Stop(ctx, sessionID, "completed successfully", "COMPLETED", true)
+	_, err = service.Stop(ctx, sessionID, "completed successfully", "COMPLETED", true, false)
 	if err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}

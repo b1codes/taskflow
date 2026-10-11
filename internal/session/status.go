@@ -58,6 +58,9 @@ const (
 	RoleReopen StatusRole = "reopen"
 	// RoleComplete moves the task to the list's done (or closed) status.
 	RoleComplete StatusRole = "complete"
+	// RoleReview moves a task completed with required work still open to the
+	// list's review status, instead of complete (the review completion gate).
+	RoleReview StatusRole = "review"
 	// RoleArchive moves an abandoned task to a cancel-like closed status.
 	RoleArchive StatusRole = "archive"
 )

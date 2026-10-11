@@ -3,6 +3,7 @@ package internal_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -175,7 +176,7 @@ func TestCompleteness_EndToEnd_ReactScreen(t *testing.T) {
 	}
 
 	// 4. Stop: the finished comment carries the completeness table.
-	if err := srv.Stop(ctx, sid, "CheckoutPage done", "COMPLETED", true); err != nil {
+	if _, err := srv.Stop(ctx, sid, "CheckoutPage done", "COMPLETED", true, false); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	ops, err := st.DequeuePending(ctx, 100)
@@ -241,5 +242,208 @@ func TestCompleteness_EndToEnd_NoGit(t *testing.T) {
 	c := cp.Completeness
 	if c == nil || len(c.NewlyOpen) != 0 || len(c.Warnings) == 0 || !strings.Contains(c.Warnings[0], "not a git repository") {
 		t.Errorf("no-git checkpoint = %+v", c)
+	}
+}
+
+// newE2ERepo creates a git repo holding manifest, committed, and a service
+// over an in-memory store.
+func newE2ERepo(t *testing.T, manifest string) (string, store.Store, *session.Service) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "-b", "main").Run(); err != nil {
+		t.Skip("skipping: git init failed")
+	}
+	gitRun(t, dir, "config", "user.name", "Test")
+	gitRun(t, dir, "config", "user.email", "test@test.com")
+	gitRun(t, dir, "config", "commit.gpgsign", "false")
+	writeFile(t, dir, "package.json", `{"scripts": {"test": "vitest run"}}`)
+	writeFile(t, dir, ".taskflow/completeness.yaml", manifest)
+	gitRun(t, dir, "add", "-A")
+	gitRun(t, dir, "commit", "-q", "-m", "initial")
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return dir, st, session.NewService(st, adapters.NewGitCapturer(), nil).WithCompleteness(adapters.NewCompletenessEvaluator())
+}
+
+// queuedOps returns the pending sync ops by operation.
+func queuedOps(t *testing.T, st store.Store) map[string][]string {
+	t.Helper()
+	ops, err := st.DequeuePending(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("DequeuePending: %v", err)
+	}
+	out := map[string][]string{}
+	for _, op := range ops {
+		out[op.Operation] = append(out[op.Operation], op.Payload)
+	}
+	return out
+}
+
+func obligationByRequirement(t *testing.T, views []session.ObligationView, requirement string) session.ObligationView {
+	t.Helper()
+	for _, v := range views {
+		if v.Requirement == requirement {
+			return v
+		}
+	}
+	t.Fatalf("no %s obligation in %+v", requirement, views)
+	return session.ObligationView{}
+}
+
+func TestCompleteness_EndToEnd_PlanWaiveStop(t *testing.T) {
+	manifest := "gate: block\n" + strings.Replace(handWrittenManifest, "    describe: \"New screen\"\n", "    describe: \"New screen\"\n    plannable: true\n", 1)
+	dir, st, srv := newE2ERepo(t, manifest)
+	ctx := context.Background()
+
+	start, err := srv.Start(ctx, "task-enforce", dir, true)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sid := start.Session.ID
+	if cc := start.AgenticContract.Completeness; cc.Gate != session.GateBlock || len(cc.Rules) != 2 || !cc.Rules[0].Plannable {
+		t.Fatalf("contract = %+v", cc)
+	}
+
+	// 1. Plan the screen before it exists.
+	plan, err := srv.Plan(ctx, sid, []session.PlanItem{{RuleID: "react-screen", Vars: map[string]string{"feature": "payments", "name": "CheckoutPage"}}}, "")
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := describes(plan.Planned); !slices.Equal(got, []string{"Component test for CheckoutPage", "New screen: CheckoutPage.tsx", "Storybook stories for CheckoutPage"}) {
+		t.Fatalf("planned = %v", got)
+	}
+	if _, err := srv.Plan(ctx, sid, []session.PlanItem{{RuleID: "react-screen", Vars: map[string]string{"name": "X"}}}, ""); !errors.Is(err, session.ErrInvalidPlan) {
+		t.Errorf("a plan missing vars = %v", err)
+	}
+
+	// 2. The block gate refuses to complete while the plan is undone.
+	if _, err := srv.Stop(ctx, sid, "", "COMPLETED", true, false); !errors.Is(err, session.ErrIncompleteSession) {
+		t.Fatalf("Stop with planned work open = %v", err)
+	}
+
+	// 3. Build the screen and its story; the planned obligations follow.
+	writeFile(t, dir, "src/features/payments/pages/CheckoutPage.tsx", "export function CheckoutPage() {}")
+	writeFile(t, dir, "src/features/payments/pages/CheckoutPage.stories.tsx", "export default { component: CheckoutPage }")
+	cp, err := srv.Checkpoint(ctx, sid, "screen and story", nil, true)
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got := slices.Sorted(slices.Values(cp.Completeness.NewlySatisfied)); !slices.Equal(got, []string{"New screen: CheckoutPage.tsx", "Storybook stories for CheckoutPage"}) {
+		t.Errorf("newly_satisfied = %v", got)
+	}
+	report, err := srv.Completeness(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary != (session.CompletenessSummary{Open: 2, Satisfied: 2}) {
+		t.Fatalf("summary = %+v (%+v)", report.Summary, report.Obligations)
+	}
+
+	// 4. Waive the unit test and attest the suite.
+	unit := obligationByRequirement(t, report.Obligations, "unit-test")
+	waived, err := srv.Waive(ctx, sid, unit.ObligationID, "Pure layout; covered by the story's interaction test")
+	if err != nil {
+		t.Fatalf("Waive: %v", err)
+	}
+	if _, err := srv.Waive(ctx, sid, "not-an-id", "x"); !errors.Is(err, session.ErrUnknownObligation) {
+		t.Errorf("unknown obligation = %v", err)
+	}
+	decisions, err := st.ListDecisionsBySession(ctx, sid)
+	if err != nil || len(decisions) != 1 || decisions[0].ID != waived.DecisionID || decisions[0].Status != "rejected_alternative" {
+		t.Fatalf("decisions = %+v, %v", decisions, err)
+	}
+	suite := obligationByRequirement(t, report.Obligations, "suite")
+	attested, err := srv.Attest(ctx, sid, suite.ObligationID, "Test Files 12 passed (12)")
+	if err != nil {
+		t.Fatalf("Attest: %v", err)
+	}
+	if attested.Obligation.Status != session.ObligationSatisfied {
+		t.Errorf("an attest-only requirement is met once attested: %+v", attested.Obligation)
+	}
+
+	// 5. Nothing required is open: the stop completes.
+	res, err := srv.Stop(ctx, sid, "CheckoutPage done", "COMPLETED", true, false)
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if res.Gate == nil || res.Gate.Mode != session.GateBlock || res.Gate.Outcome != session.GatePassed {
+		t.Errorf("gate = %+v", res.Gate)
+	}
+	ops := queuedOps(t, st)
+	if len(ops["POST_DECISION"]) != 1 || !strings.Contains(ops["POST_DECISION"][0], "Completeness waiver: Component test for CheckoutPage") {
+		t.Errorf("waiver decision ops = %v", ops["POST_DECISION"])
+	}
+	if roles := ops["UPDATE_STATUS"]; len(roles) != 2 || !strings.Contains(roles[1], `"complete"`) {
+		t.Errorf("status ops = %v", roles)
+	}
+	finished := ops["POST_COMMENT"][len(ops["POST_COMMENT"])-1]
+	for _, want := range []string{
+		"### Completeness (4/4)",
+		"| Component test for CheckoutPage | `src/features/payments/pages/CheckoutPage.tsx` | required | waived | — | Pure layout; covered by the story's interaction test |",
+		"| Full web test suite passes | `web` | required | satisfied | attest ✓ | Test Files 12 passed (12) |",
+		"| New screen: CheckoutPage.tsx | `src/features/payments/pages/CheckoutPage.tsx` | required | satisfied | structural ✓ | — |",
+	} {
+		if !strings.Contains(finished, want) {
+			t.Errorf("finished comment missing %q:\n%s", want, finished)
+		}
+	}
+}
+
+func TestCompleteness_EndToEnd_InheritOnRestart(t *testing.T) {
+	dir, st, srv := newE2ERepo(t, "gate: report\n"+handWrittenManifest)
+	ctx := context.Background()
+
+	first, err := srv.Start(ctx, "task-rework", dir, true)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	writeFile(t, dir, "src/features/refunds/pages/RefundPage.tsx", "export function RefundPage() {}")
+	if _, err := srv.Checkpoint(ctx, first.Session.ID, "refund page", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "-A")
+	gitRun(t, dir, "commit", "-q", "-m", "refund page")
+	if _, err := srv.Stop(ctx, first.Session.ID, "", "COMPLETED", true, false); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Rework starts from the commit with the page in it, so the page isn't
+	// in the new session's diff; what it still owed is inherited.
+	second, err := srv.Start(ctx, "task-rework", dir, true)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	cc := second.AgenticContract.Completeness
+	if got := describes(cc.Inherited); !slices.Equal(got, []string{"Component test for RefundPage", "Full web test suite passes", "Storybook stories for RefundPage"}) {
+		t.Fatalf("inherited = %v", got)
+	}
+	for _, v := range cc.Inherited {
+		if v.FromSession != first.Session.ID {
+			t.Errorf("inherited %s from %q", v.Describe, v.FromSession)
+		}
+	}
+
+	// The story lands: the inherited obligation is checked by its subject,
+	// though RefundPage.tsx itself didn't change.
+	writeFile(t, dir, "src/features/refunds/pages/RefundPage.stories.tsx", "export default { component: RefundPage }")
+	cp, err := srv.Checkpoint(ctx, second.Session.ID, "refund story", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cp.Completeness.NewlySatisfied; !slices.Equal(got, []string{"Storybook stories for RefundPage"}) {
+		t.Errorf("newly_satisfied = %v", got)
+	}
+	obligations, err := st.ListObligations(ctx, second.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range obligations {
+		if o.InheritedFrom == "" {
+			t.Errorf("unexpected new obligation %s/%s for %s", o.RuleID, o.RequirementID, o.Subject)
+		}
 	}
 }

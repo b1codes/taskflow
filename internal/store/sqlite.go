@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/b1codes/taskflow/internal/session"
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
@@ -106,9 +107,13 @@ func jsonUnmarshal(s string, v interface{}) {
 
 // Sessions
 func (s *SQLiteStore) CreateSession(ctx context.Context, sess *session.Session) error {
-	query := `INSERT INTO sessions (id, task_id, task_name, project_path, status, git_branch, started_at, updated_at) 
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.ExecContext(ctx, query, sess.ID, sess.TaskID, sess.TaskName, sess.ProjectPath, string(sess.Status), sess.GitBranch, sess.StartedAt, sess.UpdatedAt)
+	planState := sess.PlanState
+	if planState == "" {
+		planState = session.PlanNone
+	}
+	query := `INSERT INTO sessions (id, task_id, task_name, project_path, status, git_branch, plan_state, started_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, query, sess.ID, sess.TaskID, sess.TaskName, sess.ProjectPath, string(sess.Status), sess.GitBranch, string(planState), sess.StartedAt, sess.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to create session: %w", err)
 	}
@@ -116,12 +121,12 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, sess *session.Session) 
 }
 
 func (s *SQLiteStore) GetSession(ctx context.Context, id string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE id = ?`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), plan_state, started_at, updated_at FROM sessions WHERE id = ?`
 	row := s.db.QueryRowContext(ctx, query, id)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.PlanState, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -133,12 +138,12 @@ func (s *SQLiteStore) GetSession(ctx context.Context, id string) (*session.Sessi
 }
 
 func (s *SQLiteStore) GetSessionByTaskID(ctx context.Context, taskID string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), plan_state, started_at, updated_at FROM sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1`
 	row := s.db.QueryRowContext(ctx, query, taskID)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.PlanState, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -150,12 +155,12 @@ func (s *SQLiteStore) GetSessionByTaskID(ctx context.Context, taskID string) (*s
 }
 
 func (s *SQLiteStore) GetActiveSessionByProject(ctx context.Context, projectPath string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE project_path = ? AND status = 'ACTIVE' LIMIT 1`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), plan_state, started_at, updated_at FROM sessions WHERE project_path = ? AND status = 'ACTIVE' LIMIT 1`
 	row := s.db.QueryRowContext(ctx, query, projectPath)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.PlanState, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -203,7 +208,7 @@ func (s *SQLiteStore) UpdateSessionUpdatedAt(ctx context.Context, id string, upd
 }
 
 func (s *SQLiteStore) ListSessions(ctx context.Context, filter session.SessionFilter) ([]*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), plan_state, started_at, updated_at FROM sessions`
 	var args []interface{}
 	var conds []string
 
@@ -237,7 +242,7 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, filter session.SessionFi
 	for rows.Next() {
 		var sess session.Session
 		var statusStr string
-		err := rows.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.PlanState, &sess.StartedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan session row: %w", err)
 		}
@@ -252,6 +257,14 @@ func (s *SQLiteStore) SetSessionBaseSHA(ctx context.Context, id string, sha stri
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET base_sha = ? WHERE id = ?`, sha, id)
 	if err != nil {
 		return fmt.Errorf("failed to set session base sha: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) SetSessionPlanState(ctx context.Context, id string, state session.PlanState) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET plan_state = ? WHERE id = ?`, string(state), id)
+	if err != nil {
+		return fmt.Errorf("failed to set session plan state: %w", err)
 	}
 	return nil
 }
@@ -496,6 +509,74 @@ func (s *SQLiteStore) IncrementObligationReminders(ctx context.Context, ids []st
 	_, err := s.db.ExecContext(ctx, `UPDATE obligations SET reminded_count = reminded_count + 1 WHERE id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return fmt.Errorf("failed to increment obligation reminders: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) AttestObligation(ctx context.Context, id string, evidence string, levels []string, status session.ObligationStatus, at time.Time) error {
+	query := `UPDATE obligations SET status = ?, evidence = ?, verified_levels = ?, updated_at = ?,
+		satisfied_at = CASE ? WHEN 'satisfied' THEN ? ELSE NULL END
+	WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, string(status), evidence, jsonMarshal(levels), at, string(status), at, id)
+	if err != nil {
+		return fmt.Errorf("failed to attest obligation: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) WaiveObligation(ctx context.Context, id string, decisionID string, rationale string, at time.Time) error {
+	query := `UPDATE obligations SET status = 'waived', waiver_decision_id = ?, evidence = ?, satisfied_at = NULL, updated_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, nullString(decisionID), rationale, at, id)
+	if err != nil {
+		return fmt.Errorf("failed to waive obligation: %w", err)
+	}
+	return nil
+}
+
+// InheritObligations copies in one transaction, so a new session never
+// starts with part of what it owes. Copies are new rows: the source
+// session's obligations stay as they were recorded.
+func (s *SQLiteStore) InheritObligations(ctx context.Context, fromSessionID, toSessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin inherit transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM obligations WHERE session_id = ? AND status IN ('open', 'attested', 'waived')
+	ORDER BY first_seen_at ASC, rule_id, subject, requirement_id`, fromSessionID)
+	if err != nil {
+		return fmt.Errorf("failed to list obligations to inherit: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan obligation to inherit: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to list obligations to inherit: %w", err)
+	}
+
+	now := time.Now()
+	for _, id := range ids {
+		_, err := tx.ExecContext(ctx, `INSERT INTO obligations (id, session_id, rule_id, requirement_id, subject, source, severity, describe, expected,
+			status, verified_levels, evidence, waiver_decision_id, planned, inherited_from, reminded_count, first_seen_at, satisfied_at, updated_at)
+		SELECT ?, ?, rule_id, requirement_id, subject, source, severity, describe, expected,
+			status, verified_levels, evidence, waiver_decision_id, planned, id, 0, ?, NULL, ?
+		FROM obligations WHERE id = ?
+		ON CONFLICT(session_id, rule_id, requirement_id, subject) DO NOTHING`,
+			uuid.New().String(), toSessionID, now, now, id)
+		if err != nil {
+			return fmt.Errorf("failed to inherit obligation %s: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit inherited obligations: %w", err)
 	}
 	return nil
 }

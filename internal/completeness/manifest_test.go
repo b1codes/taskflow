@@ -79,6 +79,7 @@ func TestParse_ValidationErrors(t *testing.T) {
 		{"root escapes project", minimalRule + "stacks:\n  - id: web\n    root: ../elsewhere\n", "must be a path inside the project"},
 		{"verify path escapes project", strings.Replace(minimalRule, `verify: { exists: "src/{name}.test.ts" }`, `verify: { contains_in: { file: "../secrets.txt", any: [x] } }`, 1), "must stay inside the project"},
 		{"condition path escapes project", minimalRule + "stacks:\n  - id: web\n    commands:\n      test:\n        - { if: { file_contains: { file: \"../../.ssh/config\", text: x } }, run: t }\n", "file_contains.file"},
+		{"reserved requirement id", strings.Replace(minimalRule, "id: q", "id: subject-file", 1), `"subject-file" is reserved`},
 		{"empty", "", "manifest is empty"},
 	}
 	for _, tt := range tests {

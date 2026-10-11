@@ -44,6 +44,7 @@ func (w *Worker) WithStatusMap(m config.StatusMapConfig) *Worker {
 		clickup.RoleStart:    m.Start,
 		clickup.RoleReopen:   m.Reopen,
 		clickup.RoleComplete: m.Complete,
+		clickup.RoleReview:   m.Review,
 		clickup.RoleArchive:  m.Archive,
 	}
 	return w

@@ -22,7 +22,10 @@ type StatusMapConfig struct {
 	// ClickUp; empty falls back to Start.
 	Reopen   string `toml:"reopen"`
 	Complete string `toml:"complete"`
-	Archive  string `toml:"archive"`
+	// Review is used when a session completes with required completeness
+	// obligations open under the review gate.
+	Review  string `toml:"review"`
+	Archive string `toml:"archive"`
 }
 
 type GitConfig struct {
@@ -35,15 +38,25 @@ type SyncConfig struct {
 	DrainTimeoutS int `toml:"drain_timeout_s"`
 }
 
+// CompletenessConfig configures completeness enforcement for projects with a
+// completeness manifest.
+type CompletenessConfig struct {
+	// Gate decides what stopping a session as completed does while required
+	// obligations are open: report, review, or block. A manifest's own gate
+	// overrides it.
+	Gate string `toml:"gate"`
+}
+
 type DatabaseConfig struct {
 	Path string `toml:"path"`
 }
 
 type Config struct {
-	ClickUp  ClickUpConfig  `toml:"clickup"`
-	Git      GitConfig      `toml:"git"`
-	Sync     SyncConfig     `toml:"sync"`
-	Database DatabaseConfig `toml:"database"`
+	ClickUp      ClickUpConfig      `toml:"clickup"`
+	Git          GitConfig          `toml:"git"`
+	Sync         SyncConfig         `toml:"sync"`
+	Completeness CompletenessConfig `toml:"completeness"`
+	Database     DatabaseConfig     `toml:"database"`
 }
 
 // DefaultConfigContent is the default configuration content.
@@ -52,7 +65,8 @@ api_key = ""
 
 # Optional: pin session lifecycle events to status names on your lists.
 # Unset roles use defaults: start = the "custom" status named like
-# "in progress", complete = first "done" (else "closed"), archive = first
+# "in progress", complete = first "done" (else "closed"), review = the
+# "custom" status named like "in review" (else unchanged), archive = first
 # "closed" named like "cancelled" (else unchanged). Reopening a finished task
 # uses reopen, else start. Taskflow never moves a task back from a status
 # someone else chose.
@@ -60,6 +74,7 @@ api_key = ""
 # start = "in progress"
 # reopen = "in progress"
 # complete = "complete"
+# review = "in review"
 # archive = "cancelled"
 
 [git]
@@ -69,6 +84,15 @@ auto_context = true
 max_retries = 5
 rate_limit_ms = 600
 drain_timeout_s = 5
+
+# Completion gate for projects with a completeness manifest, when a session
+# is stopped as completed with required obligations open:
+#   report = complete as usual; the stop comment lists what's open
+#   review = complete locally, move the ClickUp task to review (default)
+#   block  = refuse to complete until the work is done, attested, or waived
+# A manifest's own "gate:" overrides this.
+[completeness]
+gate = "review"
 
 [database]
 path = "~/.taskflow/sessions.db"
@@ -145,6 +169,9 @@ func LoadFrom(configPath string) (*Config, error) {
 			RateLimitMS:   600,
 			DrainTimeoutS: 5,
 		},
+		Completeness: CompletenessConfig{
+			Gate: "review",
+		},
 		Database: DatabaseConfig{
 			Path: "~/.taskflow/sessions.db",
 		},
@@ -158,6 +185,12 @@ func LoadFrom(configPath string) (*Config, error) {
 		if _, err := toml.DecodeFile(configPath, cfg); err != nil {
 			return nil, fmt.Errorf("failed to decode config TOML: %w", err)
 		}
+	}
+
+	switch cfg.Completeness.Gate {
+	case "report", "review", "block":
+	default:
+		return nil, fmt.Errorf("invalid config: completeness.gate must be report, review, or block, got %q", cfg.Completeness.Gate)
 	}
 
 	if apiKey := os.Getenv("CLICKUP_API_KEY"); apiKey != "" {

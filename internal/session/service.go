@@ -42,6 +42,7 @@ type Service struct {
 	git          GitCapturer
 	clickup      ClickUpClient         // nil-safe: check before use
 	completeness CompletenessEvaluator // nil-safe: nil turns completeness off
+	gate         GateMode              // configured completion gate; "" = DefaultGate
 }
 
 func NewService(store SessionStore, git GitCapturer, clickup ClickUpClient) *Service {
@@ -239,6 +240,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	var sessionID string
 	var isResumed bool
 	var sess *Session
+	var inheritedFrom string // the finished session a new one took over from
 
 	if existing != nil {
 		if existing.Status == StatusActive {
@@ -275,6 +277,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 				TaskName:    taskName,
 				ProjectPath: projectPath,
 				Status:      StatusActive,
+				PlanState:   PlanNone,
 				StartedAt:   time.Now(),
 				UpdatedAt:   time.Now(),
 			}
@@ -282,6 +285,8 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 				return nil, fmt.Errorf("failed to create new session: %w", err)
 			}
 			s.recordBaseSHA(ctx, sess)
+			s.inheritObligations(ctx, existing, sess)
+			inheritedFrom = existing.ID
 		}
 	} else {
 		// New session
@@ -292,6 +297,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 			TaskName:    taskName,
 			ProjectPath: projectPath,
 			Status:      StatusActive,
+			PlanState:   PlanNone,
 			StartedAt:   time.Now(),
 			UpdatedAt:   time.Now(),
 		}
@@ -329,7 +335,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	}
 	contract.Task.Description = taskDesc
 	if st := s.evaluateCompleteness(ctx, sess, true); st != nil {
-		contract.Completeness = st.contractView()
+		contract.Completeness = s.startCompleteness(ctx, sess, st, inheritedFrom, taskName, taskDesc)
 	}
 
 	return &StartResult{
@@ -360,9 +366,46 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 	res := &CheckpointResult{Checkpoint: cp}
 	if st != nil {
 		res.Completeness = st.checkpointView()
+		if sess.PlanState == PlanSuggested && st.errText() == "" {
+			res.Completeness.PlanReminder = planReminder(st.eval.Rules)
+		}
 		s.remind(ctx, st)
 	}
 	return res, nil
+}
+
+// startCompleteness builds the start contract's completeness section:
+// inherited obligations when the session took over from inheritedFrom, and a
+// suggested plan when the task names work a plannable rule covers and the
+// session has no plan yet.
+func (s *Service) startCompleteness(ctx context.Context, sess *Session, st *completenessState, inheritedFrom, taskName, taskDesc string) *ContractCompleteness {
+	cc := st.contractView(s.gateFor(st))
+	if inheritedFrom != "" {
+		var inherited []*Obligation
+		for _, o := range st.visible() {
+			if o.InheritedFrom != "" {
+				inherited = append(inherited, o)
+			}
+		}
+		cc.Inherited = st.views(inherited, true)
+		for i := range cc.Inherited {
+			cc.Inherited[i].FromSession = inheritedFrom
+		}
+	}
+	if st.errText() == "" && (sess.PlanState == PlanNone || sess.PlanState == PlanSuggested || sess.PlanState == "") {
+		if sp := suggestPlan(st.eval.Rules, taskName, taskDesc); sp != nil {
+			cc.SuggestedPlan = sp
+			if sess.PlanState != PlanSuggested {
+				if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanSuggested); err != nil {
+					fmt.Fprintf(os.Stderr, "[session] failed to save plan state for session %s: %v\n", sess.ID, err)
+				} else {
+					sess.PlanState = PlanSuggested
+				}
+			}
+		}
+	}
+	s.remind(ctx, st)
+	return cc
 }
 
 // createCheckpoint saves a checkpoint and queues its progress comment, with
@@ -525,10 +568,17 @@ func (s *Service) LogDecision(ctx context.Context, sessionID, topic, decision, r
 	if sess.Status != StatusActive {
 		return nil, fmt.Errorf("cannot log decision for non-active session (status: %s)", sess.Status)
 	}
+	return s.createDecision(ctx, sess, topic, decision, rationale, status, files)
+}
 
+// createDecision saves a decision for sess and queues its ClickUp comment.
+// Unlike LogDecision it doesn't require an active session, so stopping a
+// paused session can record a forced completion.
+func (s *Service) createDecision(ctx context.Context, sess *Session, topic, decision, rationale, status string, files []string) (*Decision, error) {
 	if status == "" {
 		status = "no_change"
 	}
+	sessionID := sess.ID
 
 	d := &Decision{
 		ID:        uuid.New().String(),
@@ -608,13 +658,18 @@ func (s *Service) List(ctx context.Context, filter SessionFilter) ([]*SessionSum
 	return summaries, nil
 }
 
-func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus string, autoGit bool) error {
+// Stop ends or pauses a session. Completing a session with required
+// completeness obligations open goes through the completion gate (see
+// GateMode): under block it returns an *IncompleteSessionError and changes
+// nothing, unless force is set (a human override, recorded as a decision).
+// Pausing and archiving are never gated.
+func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus string, autoGit, force bool) (*StopResult, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
-		return fmt.Errorf("failed to get session: %w", err)
+		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 	if sess == nil {
-		return fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
+		return nil, fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
 	}
 
 	tStatus := Status(targetStatus)
@@ -623,7 +678,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	if err := ValidateTransition(sess.Status, tStatus); err != nil {
-		return fmt.Errorf("invalid transition: %w", err)
+		return nil, fmt.Errorf("invalid transition: %w", err)
 	}
 
 	// A finished session's obligations are final; only evaluate work that
@@ -633,18 +688,33 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		st = s.evaluateCompleteness(ctx, sess, true)
 	}
 
+	fromStatus := sess.Status
+	role := stopStatusRole(fromStatus, tStatus)
+	res := &StopResult{SessionID: sessionID, Status: tStatus}
+	// The gate runs before anything is written, so a blocked stop leaves the
+	// session as it was.
+	if st != nil && tStatus == StatusCompleted {
+		gate, gateRole, err := s.applyGate(ctx, sess, st, force)
+		if err != nil {
+			return nil, err
+		}
+		res.Gate = gate
+		if gateRole != "" && role != "" {
+			role = gateRole
+		}
+	}
+
 	// The completeness table goes in the Session Finished comment below, so
 	// the stop checkpoint's comment leaves out its summary line.
 	if summary != "" {
 		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit, nil)
 		if err != nil {
-			return fmt.Errorf("failed to write stop checkpoint: %w", err)
+			return nil, fmt.Errorf("failed to write stop checkpoint: %w", err)
 		}
 	}
 
-	fromStatus := sess.Status
 	if err := s.store.UpdateSessionStatus(ctx, sessionID, tStatus); err != nil {
-		return fmt.Errorf("failed to update session status: %w", err)
+		return nil, fmt.Errorf("failed to update session status: %w", err)
 	}
 
 	if tStatus != StatusPaused {
@@ -652,7 +722,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	// 1. Enqueue status update
-	if role := stopStatusRole(fromStatus, tStatus); role != "" {
+	if role != "" {
 		s.enqueueStatus(ctx, sess.TaskID, role)
 	}
 
@@ -670,14 +740,20 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		len(dbSnags),
 		len(dbDecisions),
 	)
+	if res.Gate != nil {
+		if line := res.Gate.commentLine(); line != "" {
+			commentText += "\n" + line
+		}
+	}
 	if st != nil {
 		commentText += "\n\n" + st.reportTable()
+		res.Completeness = st.report(sessionID)
 	}
 	s.enqueueSync(ctx, sess.TaskID, "POST_COMMENT", struct {
 		CommentText string `json:"comment_text"`
 	}{CommentText: commentText})
 
-	return nil
+	return res, nil
 }
 
 func (s *Service) BuildAgenticContract(ctx context.Context, sess *Session, gitCtx *GitContext, resumed bool) (*AgenticContract, error) {

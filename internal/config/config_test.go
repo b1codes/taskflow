@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,7 @@ api_key = "k"
 [clickup.status_map]
 start = "in progress"
 complete = "complete"
+review = "in review"
 `
 	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -82,8 +84,37 @@ complete = "complete"
 		t.Fatalf("LoadFrom failed: %v", err)
 	}
 
-	want := StatusMapConfig{Start: "in progress", Complete: "complete"}
+	want := StatusMapConfig{Start: "in progress", Complete: "complete", Review: "in review"}
 	if got := cfg.ClickUp.StatusMap; got != want {
 		t.Errorf("expected status map %+v, got %+v", want, got)
+	}
+}
+
+func TestLoadCompletenessGate(t *testing.T) {
+	load := func(t *testing.T, content string) (*Config, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatalf("failed to write config: %v", err)
+		}
+		return LoadFrom(configPath)
+	}
+
+	cfg, err := load(t, "[git]\nauto_context = true\n")
+	if err != nil || cfg.Completeness.Gate != "review" {
+		t.Errorf("default gate = %q, %v; want review", cfg.Completeness.Gate, err)
+	}
+	cfg, err = load(t, "[completeness]\ngate = \"block\"\n")
+	if err != nil || cfg.Completeness.Gate != "block" {
+		t.Errorf("gate = %q, %v; want block", cfg.Completeness.Gate, err)
+	}
+	if _, err := load(t, "[completeness]\ngate = \"strict\"\n"); err == nil || !strings.Contains(err.Error(), "completeness.gate") {
+		t.Errorf("an unknown gate should fail to load, got %v", err)
+	}
+
+	// The default config file sets the default gate.
+	cfg, err = load(t, DefaultConfigContent)
+	if err != nil || cfg.Completeness.Gate != "review" {
+		t.Errorf("DefaultConfigContent gate = %q, %v", cfg.Completeness.Gate, err)
 	}
 }

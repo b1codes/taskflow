@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,8 @@ func resetFlags() {
 	listProject = ""
 	refreshFlag = false
 	resetCobraFlags(rootCmd)
+	// Set(DefValue) on a string array flag stores "[]" as a value.
+	planVars = nil
 }
 
 func runCLI(t *testing.T, args []string) (string, error) {
@@ -436,5 +439,75 @@ func TestCLI_Completeness(t *testing.T) {
 	var report session.CompletenessReport
 	if err := json.Unmarshal([]byte(out), &report); err != nil || !report.Enabled || len(report.Obligations) != 1 {
 		t.Errorf("report = %+v, %v", report, err)
+	}
+}
+
+func TestCLI_Enforcement(t *testing.T) {
+	tempHome := setupTestEnv(t)
+	projDir := filepath.Join(tempHome, "gate-project")
+	manifest := "version: 1\ngate: block\nrules:\n  - id: r\n    when: { added: \"{name}.go\" }\n    plannable: true\n    require:\n" +
+		"      - { id: test, describe: \"Test for {name}\", verify: { exists: \"{name}_test.go\" } }\n" +
+		"      - { id: docs, describe: \"Docs for {name}\", verify: { exists: \"docs/{name}.md\" } }\n"
+	if err := os.MkdirAll(filepath.Join(projDir, ".taskflow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, ".taskflow", "completeness.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", projDir, "init", "-b", "main").CombinedOutput(); err != nil {
+		t.Skipf("skipping: git init failed: %s", out)
+	}
+
+	out, err := runCLI(t, []string{"start", "task-cli-gate", projDir})
+	if err != nil || !strings.Contains(out, "Completeness: .taskflow/completeness.yaml (gate: block)") {
+		t.Fatalf("start = %v, output: %s", err, out)
+	}
+	out, _ = runCLI(t, []string{"list", "--json"})
+	var sessions []session.SessionSummary
+	if err := json.Unmarshal([]byte(out), &sessions); err != nil || len(sessions) != 1 {
+		t.Fatalf("list = %v\n%s", err, out)
+	}
+	sid := sessions[0].SessionID
+
+	if _, err := runCLI(t, []string{"plan", sid, "--var", "name=widget"}); err == nil || !strings.Contains(err.Error(), "--var needs --rule") {
+		t.Errorf("plan --var without --rule = %v", err)
+	}
+	if _, err := runCLI(t, []string{"plan", sid, "--rule", "r", "--var", "widget"}); err == nil || !strings.Contains(err.Error(), "key=value") {
+		t.Errorf("plan with a malformed --var = %v", err)
+	}
+	out, err = runCLI(t, []string{"plan", sid, "--rule", "r", "--var", "name=widget"})
+	if err != nil || !strings.Contains(out, "✓ Planned 3 obligation(s)") || !strings.Contains(out, "expected: widget_test.go") {
+		t.Fatalf("plan = %v, output: %s", err, out)
+	}
+
+	if _, err := runCLI(t, []string{"stop", sid}); !errors.Is(err, session.ErrIncompleteSession) || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("blocked stop = %v", err)
+	}
+
+	out, err = runCLI(t, []string{"completeness", sid, "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report session.CompletenessReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	var docsID string
+	for _, o := range report.Obligations {
+		if o.Requirement == "docs" {
+			docsID = o.ObligationID
+		}
+	}
+	if _, err := runCLI(t, []string{"waive", sid, docsID}); err == nil {
+		t.Error("waive without --rationale should fail")
+	}
+	out, err = runCLI(t, []string{"waive", sid, docsID, "--rationale", "Internal helper"})
+	if err != nil || !strings.Contains(out, "✓ Waived: Docs for widget") || !strings.Contains(out, "waived: 1") {
+		t.Fatalf("waive = %v, output: %s", err, out)
+	}
+
+	out, err = runCLI(t, []string{"stop", sid, "--force"})
+	if err != nil || !strings.Contains(out, "Completion forced with 2 required obligation(s) open") {
+		t.Fatalf("stop --force = %v, output: %s", err, out)
 	}
 }

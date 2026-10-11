@@ -3,6 +3,7 @@ package adapters
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/b1codes/taskflow/internal/completeness"
@@ -28,9 +29,21 @@ func (e *CompletenessEvaluator) BaseSHA(projectPath string) (string, error) {
 // Evaluate re-reads the project's manifest and checks the session's changes
 // since its base commit against it. It returns nil, nil when the project has
 // no manifest, and an Evaluation carrying Error when the manifest is invalid.
-// When the changed set is partial, stored open and satisfied obligations are
-// verified again, so work finished outside it is still noticed.
+// Planned and inherited obligations are checked by subject, whether or not it
+// changed. When the changed set is partial, the other stored open, satisfied,
+// and attested obligations are verified again too, so work finished outside it
+// is still noticed.
 func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Session, stored []*session.Obligation) (*session.Evaluation, error) {
+	return e.evaluate(sess, stored, nil)
+}
+
+// Plan is Evaluate with each plan item's subject checked too (see
+// completeness.PlanSubject), including the subject-file requirement.
+func (e *CompletenessEvaluator) Plan(ctx context.Context, sess *session.Session, stored []*session.Obligation, items []session.PlanItem) (*session.Evaluation, error) {
+	return e.evaluate(sess, stored, items)
+}
+
+func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*session.Obligation, items []session.PlanItem) (*session.Evaluation, error) {
 	m, err := completeness.Load(sess.ProjectPath)
 	if err != nil {
 		var me *completeness.ManifestError
@@ -43,7 +56,22 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 		return nil, nil
 	}
 
-	ev := &session.Evaluation{Manifest: m.Path}
+	ev := &session.Evaluation{Manifest: m.Path, Gate: m.Gate}
+	rechecks := newRechecks()
+	var problems []string
+	for i, item := range items {
+		ps, err := completeness.PlanSubject(m, item.RuleID, item.Vars)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("items[%d]: %v", i, err))
+			continue
+		}
+		ev.Planned = append(ev.Planned, session.PlannedSubject{RuleID: ps.RuleID, Subject: ps.Subject})
+		rechecks.add(completeness.Recheck{RuleID: ps.RuleID, Subject: ps.Subject, Declared: true, SubjectFile: true})
+	}
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("%w: %s", session.ErrInvalidPlan, strings.Join(problems, "; "))
+	}
+
 	overrides, err := completeness.LoadOverrides(sess.ProjectPath)
 	if err != nil {
 		ev.Warnings = append(ev.Warnings, "ignoring project overrides: "+err.Error())
@@ -67,15 +95,16 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 		}
 	}
 
-	var recheck []completeness.Recheck
-	if ev.Partial {
-		for _, o := range stored {
-			if o.Status == session.ObligationOpen || o.Status == session.ObligationSatisfied {
-				recheck = append(recheck, completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
-			}
+	for _, o := range stored {
+		switch {
+		case o.Status == session.ObligationVoid:
+		case o.Planned || o.InheritedFrom != "":
+			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject, Declared: true, SubjectFile: o.Planned})
+		case ev.Partial && o.Status != session.ObligationWaived:
+			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
 		}
 	}
-	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes, recheck)
+	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes, rechecks.list)
 	ev.Warnings = append(ev.Warnings, res.Warnings...)
 	for _, rs := range res.Stacks {
 		info := session.StackInfo{ID: rs.ID, Root: rs.Root, Commands: map[string]*string{}, Warning: strings.Join(rs.Warnings, "; ")}
@@ -89,7 +118,8 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 		ev.Stacks = append(ev.Stacks, info)
 	}
 	for _, r := range res.Rules {
-		ev.Rules = append(ev.Rules, session.RuleInfo{ID: r.ID, Describe: r.Describe, Stack: r.Stack, Plannable: r.Plannable, Requires: r.Requires})
+		ev.Rules = append(ev.Rules, session.RuleInfo{ID: r.ID, Describe: r.Describe, Stack: r.Stack, Plannable: r.Plannable, Requires: r.Requires,
+			PlanHints: r.PlanHints, PlanVars: r.PlanVars})
 	}
 	for _, f := range res.Findings {
 		ev.Findings = append(ev.Findings, session.CompletenessFinding{
@@ -101,9 +131,31 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 			Describe:      f.Describe,
 			Expected:      f.Expected,
 			Satisfied:     f.Satisfied,
+			ChecksPassed:  f.ChecksPassed,
 			Levels:        f.Levels,
 			AttestPrompt:  f.AttestPrompt,
 		})
 	}
 	return ev, nil
+}
+
+// rechecks collects one recheck per (rule, subject), merging their flags.
+type rechecks struct {
+	list  []completeness.Recheck
+	index map[string]int
+}
+
+func newRechecks() *rechecks {
+	return &rechecks{index: map[string]int{}}
+}
+
+func (r *rechecks) add(rc completeness.Recheck) {
+	k := rc.RuleID + "\x00" + rc.Subject
+	if i, ok := r.index[k]; ok {
+		r.list[i].Declared = r.list[i].Declared || rc.Declared
+		r.list[i].SubjectFile = r.list[i].SubjectFile || rc.SubjectFile
+		return
+	}
+	r.index[k] = len(r.list)
+	r.list = append(r.list, rc)
 }
