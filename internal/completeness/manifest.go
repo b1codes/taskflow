@@ -189,7 +189,7 @@ func (e *ManifestError) Error() string {
 // and a *ManifestError when one exists but is unreadable or invalid.
 func Load(projectPath string) (*Manifest, error) {
 	for _, rel := range ManifestPaths {
-		data, err := os.ReadFile(filepath.Join(projectPath, filepath.FromSlash(rel)))
+		data, err := readInRoot(projectPath, rel)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -232,7 +232,7 @@ func Parse(data []byte) (*Manifest, error) {
 // LoadOverrides reads the project override file; a missing file is empty.
 // Other keys in the file (b1's rule overrides) are ignored.
 func LoadOverrides(projectPath string) (*Overrides, error) {
-	data, err := os.ReadFile(filepath.Join(projectPath, filepath.FromSlash(OverridesPath)))
+	data, err := readInRoot(projectPath, OverridesPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return &Overrides{}, nil
 	}

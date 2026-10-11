@@ -3,7 +3,6 @@ package completeness
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -56,7 +55,7 @@ func resolveStack(projectPath string, s *Stack, o StackOverride) ResolvedStack {
 		Commands: map[string]string{},
 	}
 	root := filepath.Join(projectPath, filepath.FromSlash(s.Root))
-	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
+	if fi, err := statInRoot(projectPath, s.Root); err != nil || !fi.IsDir() {
 		rs.Missing = true
 		rs.Warnings = append(rs.Warnings, fmt.Sprintf("stack %s skipped: root %q does not exist", s.ID, s.Root))
 		return rs
@@ -153,7 +152,7 @@ func (e *conditionEnv) holds(c *Condition) bool {
 		}
 	}
 	if fc := c.FileContains; fc != nil {
-		data, err := os.ReadFile(filepath.Join(e.root, filepath.FromSlash(fc.File)))
+		data, err := readInRoot(e.root, fc.File)
 		if err != nil || !strings.Contains(string(data), fc.Text) {
 			return false
 		}
@@ -184,7 +183,7 @@ func (e *conditionEnv) packageScripts() map[string]any {
 		var pkg struct {
 			Scripts map[string]any `json:"scripts"`
 		}
-		if data, err := os.ReadFile(filepath.Join(e.root, "package.json")); err == nil {
+		if data, err := readInRoot(e.root, "package.json"); err == nil {
 			_ = json.Unmarshal(data, &pkg)
 		}
 		e.scripts = pkg.Scripts

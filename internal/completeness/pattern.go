@@ -190,12 +190,41 @@ func hasGlob(pattern string) bool {
 // a rule cares about.
 var skippedDirs = map[string]bool{".git": true, "node_modules": true, ".b1codes": true}
 
+// readInRoot reads rel ("/"-separated) from inside root. Paths rendered from
+// templates can pick up ".." from stack vars, and a cloned repo can hold
+// symlinks to anywhere, so reads go through os.Root, which refuses to leave
+// root either way.
+func readInRoot(root, rel string) ([]byte, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return r.ReadFile(filepath.FromSlash(rel))
+}
+
+// statInRoot is os.Stat confined to root, like readInRoot.
+func statInRoot(root, rel string) (fs.FileInfo, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return r.Stat(filepath.FromSlash(rel))
+}
+
 // globFS returns the paths under root (relative, "/"-separated, sorted) that
 // match pattern, including directories. Walking starts at the pattern's
 // literal prefix, so "src/features/*/pages/*.tsx" only reads src/features.
+// Like readInRoot, it never looks outside root.
 func globFS(root, pattern string) ([]string, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
 	if !hasGlob(pattern) {
-		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(pattern))); err != nil {
+		if _, err := r.Stat(filepath.FromSlash(pattern)); err != nil {
 			return nil, nil
 		}
 		return []string{pattern}, nil
@@ -212,24 +241,25 @@ func globFS(root, pattern string) ([]string, error) {
 		}
 		prefix = append(prefix, s)
 	}
-	start := filepath.Join(root, filepath.FromSlash(strings.Join(prefix, "/")))
+	start := "."
+	if len(prefix) > 0 {
+		start = strings.Join(prefix, "/")
+	}
 	explicit := map[string]bool{}
 	for _, s := range segs {
 		explicit[s] = true
 	}
 	var out []string
-	err = filepath.WalkDir(start, func(abs string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.FS(), start, func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if abs == start {
+			if rel == start {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		rel, rerr := filepath.Rel(root, abs)
-		if rerr != nil || rel == "." {
+		if rel == "." {
 			return nil
 		}
-		rel = filepath.ToSlash(rel)
 		if d.IsDir() && skippedDirs[d.Name()] && !explicit[d.Name()] {
 			return fs.SkipDir
 		}

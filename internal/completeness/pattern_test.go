@@ -126,3 +126,27 @@ func writeFiles(t *testing.T, root string, files map[string]string) {
 		}
 	}
 }
+
+func TestGlobFS_StaysInRoot(t *testing.T) {
+	outside := t.TempDir()
+	writeFiles(t, outside, map[string]string{"secret.txt": "s"})
+	root := filepath.Join(t.TempDir(), "proj")
+	writeFiles(t, root, map[string]string{"src/a.ts": ""})
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "secret.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, pattern := range []string{"link/secret.txt", "link/*.txt", "secret.txt", "../" + filepath.Base(outside) + "/secret.txt"} {
+		if got, _ := globFS(root, pattern); len(got) != 0 {
+			t.Errorf("globFS(%q) = %v, want nothing outside root", pattern, got)
+		}
+	}
+	for _, rel := range []string{"link/secret.txt", "secret.txt", "../proj/../../" + filepath.Base(outside) + "/secret.txt"} {
+		if _, err := readInRoot(root, rel); err == nil {
+			t.Errorf("readInRoot(%q) read a file outside root", rel)
+		}
+	}
+}

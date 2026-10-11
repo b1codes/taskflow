@@ -1,6 +1,7 @@
 package completeness
 
 import (
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -383,5 +384,41 @@ func TestEvaluate_RuleSummaries(t *testing.T) {
 	want := []string{"story (required)", "unit-test (required)", "e2e (required)", "visual-regression (recommended)", "contract (required, conditional)"}
 	if r := res.Rules[0]; r.ID != "react-screen" || !r.Plannable || !slices.Equal(r.Requires, want) {
 		t.Errorf("summary = %+v", r)
+	}
+}
+
+// A stack id is substituted after the manifest's paths are validated, so
+// "{stack}" set to ".." must still not reach outside the project.
+func TestEvaluate_RenderedPathsStayInProject(t *testing.T) {
+	parent := t.TempDir()
+	writeFiles(t, parent, map[string]string{"secret.txt": "token"})
+	root := filepath.Join(parent, "proj")
+	writeFiles(t, root, map[string]string{"src/Foo.ts": ""})
+	m, err := Parse([]byte(`
+version: 1
+stacks: [{ id: "..", root: "." }]
+rules:
+  - id: r
+    stack: ".."
+    when: { added: "src/{name}.ts" }
+    require:
+      - id: exists
+        describe: "d"
+        verify: { exists: "{stack}/secret.txt" }
+      - id: contains
+        describe: "d"
+        verify: { contains_in: { file: "{stack}/secret.txt", any: ["token"] } }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	res := Evaluate(root, m, &Overrides{}, []Change{{Path: "src/Foo.ts", Type: Added}})
+	if len(res.Findings) != 2 {
+		t.Fatalf("findings = %+v", res.Findings)
+	}
+	for _, f := range res.Findings {
+		if f.Satisfied {
+			t.Errorf("%s satisfied by a file outside the project", f.RequirementID)
+		}
 	}
 }

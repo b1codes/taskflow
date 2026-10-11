@@ -2,7 +2,6 @@ package completeness
 
 import (
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -451,7 +450,7 @@ func (c *checker) read(rel string) (string, bool) {
 		}
 		return *cached, true
 	}
-	data, err := os.ReadFile(filepath.Join(c.rootAbs, filepath.FromSlash(rel)))
+	data, err := readInRoot(c.rootAbs, rel)
 	if err != nil {
 		c.files[rel] = nil
 		return "", false
