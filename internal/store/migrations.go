@@ -123,6 +123,40 @@ DELETE FROM clickup_cache WHERE entity_type = 'status';
 DELETE FROM clickup_cache WHERE entity_type = 'task';
 `,
 	},
+	{
+		version: 6,
+		// Completeness: the commit a session's changes are measured from, its
+		// plan state (used from Phase 2), and the obligations it owes.
+		sql: `
+ALTER TABLE sessions ADD COLUMN base_sha TEXT;
+ALTER TABLE sessions ADD COLUMN plan_state TEXT NOT NULL DEFAULT 'none';
+
+CREATE TABLE IF NOT EXISTS obligations (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    rule_id TEXT NOT NULL,
+    requirement_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    source TEXT,
+    severity TEXT NOT NULL,
+    describe TEXT NOT NULL,
+    expected TEXT,
+    status TEXT NOT NULL,
+    verified_levels TEXT,
+    evidence TEXT,
+    waiver_decision_id TEXT REFERENCES decisions(id),
+    planned INTEGER NOT NULL DEFAULT 0,
+    inherited_from TEXT REFERENCES obligations(id),
+    reminded_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at DATETIME NOT NULL,
+    satisfied_at DATETIME,
+    updated_at DATETIME NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obligations_key ON obligations(session_id, rule_id, requirement_id, subject);
+CREATE INDEX IF NOT EXISTS idx_obligations_requirement ON obligations(rule_id, requirement_id);
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

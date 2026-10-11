@@ -68,6 +68,6 @@ func newSessionService(st store.Store, cfg *config.Config) *session.Service {
 	if cfg != nil && cfg.ClickUp.APIKey != "" {
 		cuClient = adapters.NewClickUpAdapter(clickup.New(cfg.ClickUp.APIKey))
 	}
-	return session.NewService(st, adapters.NewGitCapturer(), cuClient)
+	return session.NewService(st, adapters.NewGitCapturer(), cuClient).
+		WithCompleteness(adapters.NewCompletenessEvaluator())
 }
-

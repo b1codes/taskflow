@@ -595,7 +595,7 @@ New `clickup.Client` methods: `GetTaskChecklists`, `CreateChecklist`, `CreateChe
 
 ## 10. Data Model Changes
 
-All changes are a new migration entry in `internal/store/migrations.go` (version 5; version 4 was taken by the Phase 0 status-cache fix). Existing entries are never edited.
+All changes are a new migration entry in `internal/store/migrations.go` (version 6; Phase 0 used versions 4 and 5 for the status-cache and task-cache cleanups). Existing entries are never edited.
 
 ### `sessions` (altered)
 
@@ -652,7 +652,7 @@ internal/
 ├── gitctx/                # ChangedSince()
 ├── clickup/               # checklist endpoints; review-status resolution
 ├── sync/                  # SYNC_CHECKLIST op, coalescing
-├── store/                 # migration v4, obligation CRUD, aggregation
+├── store/                 # migration v6, obligation CRUD, aggregation
 ├── server/                # tf_completeness, tf_attest, tf_waive, tf_plan, tf_verify; updated tf_checkpoint/tf_stop
 └── cli/                   # completeness.go, waive.go, attest.go, plan.go, check.go; stop --force
 ```
@@ -753,7 +753,7 @@ As in the original spec, completeness never blocks local work because of ClickUp
 - **Command resolution:** fixture directories for every stack in the §3 defaults table: each lockfile → `{pm}`; `test:ci` beats `test`; uv/poetry/venv `{py}` prefixes; pytest config vs `manage.py test`; SwiftPM vs Xcode with and without vars. Also project-override pinning, an unresolved command → attestation fallback, and a monorepo with `frontend/` + `backend/` stacks where a backend-only diff creates only the `api` regression obligation.
 - **`internal/gitctx`:** `ChangedSince` against temp repos (following the existing `gitctx_test.go` pattern): committed vs. uncommitted vs. untracked, renames, empty-tree base, unreachable base.
 - **`internal/session`:** fake `CompletenessEvaluator`; merge semantics (sticky waivers, open ⇄ satisfied, void), `base_sha` kept on resume, each gate mode, `tf_waive` creating a Decision, reminder counting.
-- **`internal/store`:** migration v4 on a fresh DB and on a v3 DB; obligation upsert uniqueness; aggregation query.
+- **`internal/store`:** migration v6 on a fresh DB and on a v5 DB; obligation upsert uniqueness; aggregation query.
 - **`internal/clickup` status roles:** fixtures that use the real ClickUp types (`open`/`custom`/`done`/`closed`, including the 6-status list in §8); each role's default, overrides, an override missing from the list, and the legacy `status_type` payloads. Replace the existing `"type": "active"` fixtures in `status_test.go`, since that type doesn't exist in ClickUp.
 - **`internal/session` planning and inheritance:** `plan_hints` matching, `plan_state` transitions, reminders stopping after plan or decline; restart after `COMPLETED` copies open, attested, and waived obligations but not satisfied ones.
 - **`internal/sync`:** `SYNC_CHECKLIST` reconcile against an `httptest` ClickUp (create, update, idempotent re-run, coalescing).

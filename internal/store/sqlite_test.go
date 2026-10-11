@@ -37,7 +37,7 @@ func TestSQLiteStore_Init(t *testing.T) {
 		tables[name] = true
 	}
 
-	requiredTables := []string{"schema_version", "sessions", "checkpoints", "snags", "decisions", "sync_queue", "clickup_cache"}
+	requiredTables := []string{"schema_version", "sessions", "checkpoints", "snags", "decisions", "sync_queue", "clickup_cache", "obligations"}
 	for _, table := range requiredTables {
 		if !tables[table] {
 			t.Errorf("expected table %s to exist", table)
@@ -930,6 +930,8 @@ func TestSQLiteStore_Indexes(t *testing.T) {
 		"idx_decisions_session_id",
 		"idx_checkpoints_session_id",
 		"idx_snags_session_id",
+		"idx_obligations_key",
+		"idx_obligations_requirement",
 	}
 	for _, idx := range requiredIndexes {
 		if !indexes[idx] {

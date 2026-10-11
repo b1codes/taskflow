@@ -38,9 +38,10 @@ type GitCapturer interface {
 }
 
 type Service struct {
-	store   SessionStore
-	git     GitCapturer
-	clickup ClickUpClient // nil-safe: check before use
+	store        SessionStore
+	git          GitCapturer
+	clickup      ClickUpClient         // nil-safe: check before use
+	completeness CompletenessEvaluator // nil-safe: nil turns completeness off
 }
 
 func NewService(store SessionStore, git GitCapturer, clickup ClickUpClient) *Service {
@@ -49,6 +50,21 @@ func NewService(store SessionStore, git GitCapturer, clickup ClickUpClient) *Ser
 		git:     git,
 		clickup: clickup,
 	}
+}
+
+// WithCompleteness sets the evaluator that checks sessions against the
+// project's completeness manifest. Without one (or with nil), completeness is
+// off and sessions behave as if no project had a manifest.
+func (s *Service) WithCompleteness(e CompletenessEvaluator) *Service {
+	s.completeness = e
+	return s
+}
+
+// CheckpointResult is a checkpoint plus the completeness changes it found.
+// The checkpoint's fields stay at the top level of its JSON.
+type CheckpointResult struct {
+	*Checkpoint
+	Completeness *CheckpointCompleteness `json:"completeness,omitempty"`
 }
 
 type StartResult struct {
@@ -79,6 +95,8 @@ type AgenticContract struct {
 	Git       *GitContext      `json:"git"`
 	History   ContractHistory  `json:"history"`
 	Resumed   bool             `json:"resumed"`
+	// Completeness is omitted when the project has no manifest.
+	Completeness *ContractCompleteness `json:"completeness,omitempty"`
 }
 
 type TaskContractInfo struct {
@@ -263,6 +281,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 			if err := s.store.CreateSession(ctx, sess); err != nil {
 				return nil, fmt.Errorf("failed to create new session: %w", err)
 			}
+			s.recordBaseSHA(ctx, sess)
 		}
 	} else {
 		// New session
@@ -279,6 +298,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		if err := s.store.CreateSession(ctx, sess); err != nil {
 			return nil, fmt.Errorf("failed to create session: %w", err)
 		}
+		s.recordBaseSHA(ctx, sess)
 	}
 
 	// 4. Capture git context
@@ -308,6 +328,9 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		return nil, fmt.Errorf("failed to build agentic contract: %w", err)
 	}
 	contract.Task.Description = taskDesc
+	if st := s.evaluateCompleteness(ctx, sess, true); st != nil {
+		contract.Completeness = st.contractView()
+	}
 
 	return &StartResult{
 		Session:         sess,
@@ -316,7 +339,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 	}, nil
 }
 
-func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, files []string, autoGit bool) (*Checkpoint, error) {
+func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, files []string, autoGit bool) (*CheckpointResult, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session for checkpoint: %w", err)
@@ -329,10 +352,22 @@ func (s *Service) Checkpoint(ctx context.Context, sessionID, summary string, fil
 		return nil, fmt.Errorf("cannot create checkpoint for non-active session (status: %s)", sess.Status)
 	}
 
-	return s.createCheckpoint(ctx, sess, summary, files, autoGit)
+	st := s.evaluateCompleteness(ctx, sess, true)
+	cp, err := s.createCheckpoint(ctx, sess, summary, files, autoGit, st)
+	if err != nil {
+		return nil, err
+	}
+	res := &CheckpointResult{Checkpoint: cp}
+	if st != nil {
+		res.Completeness = st.checkpointView()
+		s.remind(ctx, st)
+	}
+	return res, nil
 }
 
-func (s *Service) createCheckpoint(ctx context.Context, sess *Session, summary string, files []string, autoGit bool) (*Checkpoint, error) {
+// createCheckpoint saves a checkpoint and queues its progress comment, with
+// a completeness line when st is non-nil.
+func (s *Service) createCheckpoint(ctx context.Context, sess *Session, summary string, files []string, autoGit bool, st *completenessState) (*Checkpoint, error) {
 	var gitCtx *GitContext
 	if autoGit && s.git != nil {
 		var err error
@@ -373,11 +408,34 @@ func (s *Service) createCheckpoint(ctx context.Context, sess *Session, summary s
 		cp.GitBranch,
 		cp.GitSHA,
 	)
+	if st != nil {
+		commentText += "\n" + st.commentLine()
+	}
 	s.enqueueSync(ctx, sess.TaskID, "POST_COMMENT", struct {
 		CommentText string `json:"comment_text"`
 	}{CommentText: commentText})
 
 	return cp, nil
+}
+
+// recordBaseSHA stores the commit a new session's changes are measured from.
+// It is only called when a session is created, so resuming never moves it.
+func (s *Service) recordBaseSHA(ctx context.Context, sess *Session) {
+	if s.completeness == nil {
+		return
+	}
+	sha, err := s.completeness.BaseSHA(sess.ProjectPath)
+	if err != nil {
+		if !errors.Is(err, ErrNotAGitRepository) {
+			fmt.Fprintf(os.Stderr, "[session] could not record base commit in %s: %v\n", sess.ProjectPath, err)
+		}
+		return
+	}
+	if err := s.store.SetSessionBaseSHA(ctx, sess.ID, sha); err != nil {
+		fmt.Fprintf(os.Stderr, "[session] failed to save base commit for session %s: %v\n", sess.ID, err)
+		return
+	}
+	sess.BaseSHA = sha
 }
 
 func (s *Service) LogSnag(ctx context.Context, sessionID, errorText, category, resolution string) (*SnagResult, error) {
@@ -568,8 +626,17 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		return fmt.Errorf("invalid transition: %w", err)
 	}
 
+	// A finished session's obligations are final; only evaluate work that
+	// was still in progress.
+	var st *completenessState
+	if sess.Status == StatusActive || sess.Status == StatusPaused {
+		st = s.evaluateCompleteness(ctx, sess, true)
+	}
+
+	// The completeness table goes in the Session Finished comment below, so
+	// the stop checkpoint's comment leaves out its summary line.
 	if summary != "" {
-		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit)
+		_, err := s.createCheckpoint(ctx, sess, summary, nil, autoGit, nil)
 		if err != nil {
 			return fmt.Errorf("failed to write stop checkpoint: %w", err)
 		}
@@ -603,6 +670,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		len(dbSnags),
 		len(dbDecisions),
 	)
+	if st != nil {
+		commentText += "\n\n" + st.reportTable()
+	}
 	s.enqueueSync(ctx, sess.TaskID, "POST_COMMENT", struct {
 		CommentText string `json:"comment_text"`
 	}{CommentText: commentText})

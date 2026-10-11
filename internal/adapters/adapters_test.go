@@ -137,3 +137,62 @@ func TestClickUpAdapter(t *testing.T) {
 		t.Errorf("expected error for nonexistent list, got nil")
 	}
 }
+
+// On the default branch with no recorded base, only uncommitted changes are
+// readable; a stored obligation whose trigger was already committed must
+// still be re-verified.
+func TestCompletenessEvaluator_PartialRechecksStored(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q", "-b", "main")
+	git("config", "user.name", "Test")
+	git("config", "user.email", "test@test.com")
+	git("config", "commit.gpgsign", "false")
+	write(".agents/completeness.yaml", `
+version: 1
+rules:
+  - id: unit
+    when: { added: "src/{name}.ts", exclude: ["**/*.test.ts"] }
+    require: [{ id: test, describe: "test for {name}", verify: { exists: "src/{name}.test.ts" } }]
+`)
+	write("src/Foo.ts", "")
+	git("add", "-A")
+	git("commit", "-q", "-m", "trigger committed")
+	write("src/Foo.test.ts", "") // the work, done after the trigger left the change set
+
+	e := NewCompletenessEvaluator()
+	sess := &session.Session{ID: "s1", ProjectPath: dir}
+	stored := []*session.Obligation{{ID: "o1", RuleID: "unit", RequirementID: "test", Subject: "src/Foo.ts", Status: session.ObligationOpen}}
+
+	ev, err := e.Evaluate(context.Background(), sess, stored)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !ev.Partial {
+		t.Fatalf("expected a partial evaluation on main without a base, warnings: %v", ev.Warnings)
+	}
+	if len(ev.Findings) != 1 || ev.Findings[0].Subject != "src/Foo.ts" || !ev.Findings[0].Satisfied {
+		t.Errorf("findings = %+v, want src/Foo.ts satisfied", ev.Findings)
+	}
+
+	ev, err = e.Evaluate(context.Background(), sess, nil)
+	if err != nil || len(ev.Findings) != 0 {
+		t.Errorf("without stored obligations: findings = %+v, %v", ev.Findings, err)
+	}
+}
