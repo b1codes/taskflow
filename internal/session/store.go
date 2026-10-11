@@ -36,4 +36,15 @@ type SessionStore interface {
 	ListDecisionsBySession(ctx context.Context, sessionID string) ([]*Decision, error)
 	CountPendingByTaskID(ctx context.Context, taskID string) (int, error)
 	EnqueueSync(ctx context.Context, op SyncOp) error
+
+	SetSessionBaseSHA(ctx context.Context, id string, sha string) error
+	// UpsertObligation inserts o, or updates the obligation with the same
+	// (session, rule, requirement, subject) key, keeping that one's ID,
+	// first_seen_at, reminder count, evidence, and waiver.
+	UpsertObligation(ctx context.Context, o *Obligation) error
+	ListObligations(ctx context.Context, sessionID string) ([]*Obligation, error)
+	// UpdateObligationStatus sets satisfied_at to at when status is
+	// satisfied, and clears it when status is open.
+	UpdateObligationStatus(ctx context.Context, id string, status ObligationStatus, at time.Time) error
+	IncrementObligationReminders(ctx context.Context, ids []string) error
 }

@@ -8,14 +8,17 @@ import (
 var ErrNotAGitRepository = errors.New("not a git repository")
 
 type Session struct {
-	ID          string    `json:"id"`
-	TaskID      string    `json:"task_id"`
-	TaskName    string    `json:"task_name"`
-	ProjectPath string    `json:"project_path"`
-	Status      Status    `json:"status"`
-	GitBranch   string    `json:"git_branch"`
-	StartedAt   time.Time `json:"started_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string `json:"id"`
+	TaskID      string `json:"task_id"`
+	TaskName    string `json:"task_name"`
+	ProjectPath string `json:"project_path"`
+	Status      Status `json:"status"`
+	GitBranch   string `json:"git_branch"`
+	// BaseSHA is the commit the session's changes are measured from, set
+	// when the session is created and kept on resume.
+	BaseSHA   string    `json:"base_sha,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Checkpoint struct {

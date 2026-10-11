@@ -47,6 +47,9 @@ var checkpointCmd = &cobra.Command{
 			}
 		} else {
 			fmt.Printf("✓ Checkpoint recorded: %s\n", cp.ID)
+			if c := cp.Completeness; c != nil {
+				printCheckpointCompleteness(c)
+			}
 		}
 
 		return nil

@@ -41,9 +41,10 @@ func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
 
 	srv := &Server{
 		mcpServer: s,
-		service:   session.NewService(st, adapters.NewGitCapturer(), cuClient),
-		store:     st,
-		config:    cfg,
+		service: session.NewService(st, adapters.NewGitCapturer(), cuClient).
+			WithCompleteness(adapters.NewCompletenessEvaluator()),
+		store:  st,
+		config: cfg,
 	}
 
 	srv.registerTools()
@@ -104,6 +105,11 @@ func (s *Server) registerTools() {
 		mcp.WithString("summary", mcp.Description("Optional final markdown summary of achievements")),
 		mcp.WithString("status", mcp.Description("Target status: completed, paused, archived (defaults to completed)")),
 	), s.handleStop)
+
+	s.mcpServer.AddTool(mcp.NewTool("tf_completeness",
+		mcp.WithDescription("Re-check the session's changes against the project's completeness manifest and report what is still owed (tests, stories, contracts)"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID")),
+	), s.handleCompleteness)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_init",
 		mcp.WithDescription("Initialize ClickUp workspace scan and return cached topology summary"),
@@ -268,6 +274,25 @@ func (s *Server) handleStop(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf(`{"status": "ok", "session_id": %q, "new_status": %q}`, sessionID, targetStatus)), nil
+}
+
+func (s *Server) handleCompleteness(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	report, err := s.service.Completeness(ctx, sessionID)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	return mcp.NewToolResultText(string(b)), nil
 }
 
 func (s *Server) handleInit(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {

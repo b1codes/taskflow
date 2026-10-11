@@ -116,12 +116,12 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, sess *session.Session) 
 }
 
 func (s *SQLiteStore) GetSession(ctx context.Context, id string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, started_at, updated_at FROM sessions WHERE id = ?`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE id = ?`
 	row := s.db.QueryRowContext(ctx, query, id)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -133,12 +133,12 @@ func (s *SQLiteStore) GetSession(ctx context.Context, id string) (*session.Sessi
 }
 
 func (s *SQLiteStore) GetSessionByTaskID(ctx context.Context, taskID string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, started_at, updated_at FROM sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1`
 	row := s.db.QueryRowContext(ctx, query, taskID)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -150,12 +150,12 @@ func (s *SQLiteStore) GetSessionByTaskID(ctx context.Context, taskID string) (*s
 }
 
 func (s *SQLiteStore) GetActiveSessionByProject(ctx context.Context, projectPath string) (*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, started_at, updated_at FROM sessions WHERE project_path = ? AND status = 'ACTIVE' LIMIT 1`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions WHERE project_path = ? AND status = 'ACTIVE' LIMIT 1`
 	row := s.db.QueryRowContext(ctx, query, projectPath)
 
 	var sess session.Session
 	var statusStr string
-	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, session.ErrSessionNotFound
@@ -203,7 +203,7 @@ func (s *SQLiteStore) UpdateSessionUpdatedAt(ctx context.Context, id string, upd
 }
 
 func (s *SQLiteStore) ListSessions(ctx context.Context, filter session.SessionFilter) ([]*session.Session, error) {
-	query := `SELECT id, task_id, task_name, project_path, status, git_branch, started_at, updated_at FROM sessions`
+	query := `SELECT id, task_id, task_name, project_path, status, git_branch, COALESCE(base_sha, ''), started_at, updated_at FROM sessions`
 	var args []interface{}
 	var conds []string
 
@@ -237,7 +237,7 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, filter session.SessionFi
 	for rows.Next() {
 		var sess session.Session
 		var statusStr string
-		err := rows.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.StartedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.TaskID, &sess.TaskName, &sess.ProjectPath, &statusStr, &sess.GitBranch, &sess.BaseSHA, &sess.StartedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan session row: %w", err)
 		}
@@ -246,6 +246,14 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, filter session.SessionFi
 	}
 
 	return sessions, nil
+}
+
+func (s *SQLiteStore) SetSessionBaseSHA(ctx context.Context, id string, sha string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET base_sha = ? WHERE id = ?`, sha, id)
+	if err != nil {
+		return fmt.Errorf("failed to set session base sha: %w", err)
+	}
+	return nil
 }
 
 // Checkpoints
@@ -400,6 +408,103 @@ func (s *SQLiteStore) ListDecisionsBySession(ctx context.Context, sessionID stri
 	}
 
 	return decisions, nil
+}
+
+// Obligations
+func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligation) error {
+	query := `INSERT INTO obligations (id, session_id, rule_id, requirement_id, subject, source, severity, describe, expected,
+		status, verified_levels, evidence, waiver_decision_id, planned, inherited_from, reminded_count, first_seen_at, satisfied_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(session_id, rule_id, requirement_id, subject) DO UPDATE SET
+		source = excluded.source,
+		severity = excluded.severity,
+		describe = excluded.describe,
+		expected = excluded.expected,
+		status = excluded.status,
+		verified_levels = excluded.verified_levels,
+		satisfied_at = excluded.satisfied_at,
+		updated_at = excluded.updated_at`
+	var planned int
+	if o.Planned {
+		planned = 1
+	}
+	_, err := s.db.ExecContext(ctx, query, o.ID, o.SessionID, o.RuleID, o.RequirementID, o.Subject, o.Source, o.Severity, o.Describe,
+		jsonMarshal(o.Expected), string(o.Status), jsonMarshal(o.VerifiedLevels), o.Evidence, nullString(o.WaiverDecisionID),
+		planned, nullString(o.InheritedFrom), o.RemindedCount, o.FirstSeenAt, o.SatisfiedAt, o.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to upsert obligation: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListObligations(ctx context.Context, sessionID string) ([]*session.Obligation, error) {
+	query := `SELECT id, session_id, rule_id, requirement_id, subject, COALESCE(source, ''), severity, describe, COALESCE(expected, ''),
+		status, COALESCE(verified_levels, ''), COALESCE(evidence, ''), COALESCE(waiver_decision_id, ''), planned,
+		COALESCE(inherited_from, ''), reminded_count, first_seen_at, satisfied_at, updated_at
+	FROM obligations WHERE session_id = ? ORDER BY first_seen_at ASC, rule_id, subject, requirement_id`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list obligations: %w", err)
+	}
+	defer rows.Close()
+
+	var obligations []*session.Obligation
+	for rows.Next() {
+		var o session.Obligation
+		var expected, levels, status string
+		var planned int
+		var satisfiedAt sql.NullTime
+		err := rows.Scan(&o.ID, &o.SessionID, &o.RuleID, &o.RequirementID, &o.Subject, &o.Source, &o.Severity, &o.Describe, &expected,
+			&status, &levels, &o.Evidence, &o.WaiverDecisionID, &planned,
+			&o.InheritedFrom, &o.RemindedCount, &o.FirstSeenAt, &satisfiedAt, &o.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan obligation row: %w", err)
+		}
+		o.Status = session.ObligationStatus(status)
+		o.Planned = planned != 0
+		jsonUnmarshal(expected, &o.Expected)
+		jsonUnmarshal(levels, &o.VerifiedLevels)
+		if satisfiedAt.Valid {
+			o.SatisfiedAt = &satisfiedAt.Time
+		}
+		obligations = append(obligations, &o)
+	}
+	return obligations, rows.Err()
+}
+
+func (s *SQLiteStore) UpdateObligationStatus(ctx context.Context, id string, status session.ObligationStatus, at time.Time) error {
+	query := `UPDATE obligations SET status = ?, updated_at = ?,
+		satisfied_at = CASE ? WHEN 'satisfied' THEN ? WHEN 'open' THEN NULL ELSE satisfied_at END
+	WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, string(status), at, string(status), at, id)
+	if err != nil {
+		return fmt.Errorf("failed to update obligation status: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) IncrementObligationReminders(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE obligations SET reminded_count = reminded_count + 1 WHERE id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("failed to increment obligation reminders: %w", err)
+	}
+	return nil
+}
+
+// nullString stores "" as NULL, for columns with foreign keys.
+func nullString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // ClickUp Cache

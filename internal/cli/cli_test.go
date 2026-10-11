@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,7 +30,11 @@ func setupTestEnv(t *testing.T) string {
 	return tempHome
 }
 
+// resetCobraFlags also resets each command's context: cobra keeps the last
+// one (e.g. the cancelled context from the serve test) and only passes the
+// root's down to a command that has none yet.
 func resetCobraFlags(cmd *cobra.Command) {
+	cmd.SetContext(context.Background())
 	cmd.Flags().VisitAll(func(f *pflag.Flag) {
 		_ = f.Value.Set(f.DefValue)
 		f.Changed = false
@@ -377,5 +382,59 @@ func TestCLI_Start_WithClickUpAPIKey(t *testing.T) {
 	}
 	if !strings.Contains(out, "ClickUp Real Task Name") {
 		t.Errorf("expected 'ClickUp Real Task Name' in output, got: %s", out)
+	}
+}
+
+func TestCLI_Completeness(t *testing.T) {
+	tempHome := setupTestEnv(t)
+	projDir := filepath.Join(tempHome, "dod-project")
+	manifest := "version: 1\nrules:\n  - id: r\n    when: { added: \"{name}.go\" }\n    require:\n      - { id: test, describe: \"Test for {name}\", verify: { exists: \"{name}_test.go\" } }\n"
+	if err := os.MkdirAll(filepath.Join(projDir, ".taskflow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, ".taskflow", "completeness.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", projDir, "init", "-b", "main").CombinedOutput(); err != nil {
+		t.Skipf("skipping: git init failed: %s", out)
+	}
+
+	out, err := runCLI(t, []string{"start", "task-cli-dod", projDir, "--json"})
+	if err != nil {
+		t.Fatalf("start failed: %v, output: %s", err, out)
+	}
+	var contract session.AgenticContract
+	if err := json.Unmarshal([]byte(out), &contract); err != nil {
+		t.Fatalf("invalid start JSON: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widget.go"), []byte("package x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err = runCLI(t, []string{"checkpoint", contract.SessionID, "--summary", "widget"})
+	if err != nil {
+		t.Fatalf("checkpoint failed: %v, output: %s", err, out)
+	}
+	if !strings.Contains(out, "○ new: Test for widget (expected: widget_test.go)") {
+		t.Errorf("checkpoint output should list the new obligation, got: %s", out)
+	}
+
+	out, err = runCLI(t, []string{"completeness", contract.SessionID})
+	if err != nil {
+		t.Fatalf("completeness failed: %v, output: %s", err, out)
+	}
+	for _, want := range []string{"open: 1 · satisfied: 0", "○ Test for widget [r/test, required]", "expected: widget_test.go"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("completeness output missing %q, got: %s", want, out)
+		}
+	}
+
+	out, err = runCLI(t, []string{"completeness", contract.SessionID, "--json"})
+	if err != nil {
+		t.Fatalf("completeness --json failed: %v, output: %s", err, out)
+	}
+	var report session.CompletenessReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil || !report.Enabled || len(report.Obligations) != 1 {
+		t.Errorf("report = %+v, %v", report, err)
 	}
 }

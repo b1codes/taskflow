@@ -16,6 +16,7 @@ type mockStore struct {
 	checkpoints map[string][]*Checkpoint
 	snags       map[string][]*Snag
 	decisions   map[string][]*Decision
+	obligations map[string][]*Obligation
 	syncOps     []SyncOp
 }
 
@@ -25,6 +26,7 @@ func newMockStore() *mockStore {
 		checkpoints: make(map[string][]*Checkpoint),
 		snags:       make(map[string][]*Snag),
 		decisions:   make(map[string][]*Decision),
+		obligations: make(map[string][]*Obligation),
 	}
 }
 
@@ -185,6 +187,75 @@ func (m *mockStore) CountPendingByTaskID(ctx context.Context, taskID string) (in
 
 func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
 	m.syncOps = append(m.syncOps, op)
+	return nil
+}
+
+func (m *mockStore) SetSessionBaseSHA(ctx context.Context, id string, sha string) error {
+	s, ok := m.sessions[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	s.BaseSHA = sha
+	return nil
+}
+
+// UpsertObligation and ListObligations copy rows in and out, like the SQLite
+// store, so tests can't pass by sharing pointers with the service.
+func (m *mockStore) UpsertObligation(ctx context.Context, o *Obligation) error {
+	for _, have := range m.obligations[o.SessionID] {
+		if have.key() == o.key() {
+			have.Source, have.Severity, have.Describe = o.Source, o.Severity, o.Describe
+			have.Expected, have.Status, have.VerifiedLevels = o.Expected, o.Status, o.VerifiedLevels
+			have.SatisfiedAt, have.UpdatedAt = o.SatisfiedAt, o.UpdatedAt
+			return nil
+		}
+	}
+	c := *o
+	m.obligations[o.SessionID] = append(m.obligations[o.SessionID], &c)
+	return nil
+}
+
+func (m *mockStore) ListObligations(ctx context.Context, sessionID string) ([]*Obligation, error) {
+	var out []*Obligation
+	for _, o := range m.obligations[sessionID] {
+		c := *o
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+func (m *mockStore) obligation(id string) *Obligation {
+	for _, list := range m.obligations {
+		for _, o := range list {
+			if o.ID == id {
+				return o
+			}
+		}
+	}
+	return nil
+}
+
+func (m *mockStore) UpdateObligationStatus(ctx context.Context, id string, status ObligationStatus, at time.Time) error {
+	o := m.obligation(id)
+	if o == nil {
+		return errors.New("not found")
+	}
+	o.Status, o.UpdatedAt = status, at
+	switch status {
+	case ObligationSatisfied:
+		o.SatisfiedAt = &at
+	case ObligationOpen:
+		o.SatisfiedAt = nil
+	}
+	return nil
+}
+
+func (m *mockStore) IncrementObligationReminders(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		if o := m.obligation(id); o != nil {
+			o.RemindedCount++
+		}
+	}
 	return nil
 }
 
