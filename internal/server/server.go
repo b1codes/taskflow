@@ -26,8 +26,13 @@ type Server struct {
 
 // New builds the MCP server. client may be nil (no ClickUp sync); serve passes
 // the same paced client it gives the sync worker, so both share one
-// rate-limit budget.
-func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
+// rate-limit budget. It fails on an invalid completion gate in cfg.
+func New(st store.Store, cfg *config.Config, client *clickup.Client) (*Server, error) {
+	gate, err := cfg.Completeness.GateMode()
+	if err != nil {
+		return nil, err
+	}
+
 	s := server.NewMCPServer(
 		"taskflow",
 		"1.0.0",
@@ -42,14 +47,15 @@ func New(st store.Store, cfg *config.Config, client *clickup.Client) *Server {
 	srv := &Server{
 		mcpServer: s,
 		service: session.NewService(st, adapters.NewGitCapturer(), cuClient).
-			WithCompleteness(adapters.NewCompletenessEvaluator()),
+			WithCompleteness(adapters.NewCompletenessEvaluator()).
+			WithGate(gate),
 		store:  st,
 		config: cfg,
 	}
 
 	srv.registerTools()
 
-	return srv
+	return srv, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -100,7 +106,7 @@ func (s *Server) registerTools() {
 	), s.handleList)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_stop",
-		mcp.WithDescription("Stop or pause the session"),
+		mcp.WithDescription("Stop or pause the session. Completing it with required completeness obligations open goes through the project's completion gate: it may move the ClickUp task to review, or (gate: block) refuse until each one is done, attested, or waived"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID to stop")),
 		mcp.WithString("summary", mcp.Description("Optional final markdown summary of achievements")),
 		mcp.WithString("status", mcp.Description("Target status: completed, paused, archived (defaults to completed)")),
@@ -110,6 +116,35 @@ func (s *Server) registerTools() {
 		mcp.WithDescription("Re-check the session's changes against the project's completeness manifest and report what is still owed (tests, stories, contracts)"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID")),
 	), s.handleCompleteness)
+
+	s.mcpServer.AddTool(mcp.NewTool("tf_waive",
+		mcp.WithDescription("Waive a completeness obligation that genuinely does not apply. The rationale is logged as a decision and posted to the ClickUp task"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
+		mcp.WithString("obligation_id", mcp.Required(), mcp.Description("The obligation_id from tf_checkpoint, tf_completeness, or the start contract")),
+		mcp.WithString("rationale", mcp.Required(), mcp.Description("Why the requirement doesn't apply to this change")),
+	), s.handleWaive)
+
+	s.mcpServer.AddTool(mcp.NewTool("tf_attest",
+		mcp.WithDescription("Attest that a completeness obligation is met, with evidence taskflow can't check from files (e.g. which spec and test cases cover a screen, or a test run's summary line). Only obligations whose requirement asks for an attestation (they carry an `attest` prompt) can be attested; one checked from files is refused: do the work, or tf_waive it with a rationale. Attestations are shown in ClickUp for human review"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
+		mcp.WithString("obligation_id", mcp.Required(), mcp.Description("The obligation_id from tf_checkpoint, tf_completeness, or the start contract")),
+		mcp.WithString("evidence", mcp.Required(), mcp.Description("What shows the obligation is met, answering its attest prompt")),
+	), s.handleAttest)
+
+	s.mcpServer.AddTool(mcp.NewTool("tf_plan",
+		mcp.WithDescription("Declare work you expect to do before its files exist (plannable rules only), so its completeness obligations are tracked from the start; or decline the suggested plan with decline_reason when none applies"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
+		mcp.WithArray("items", mcp.Description("Planned subjects: each names a plannable rule and the vars its file pattern takes, e.g. {\"rule_id\": \"react-screen\", \"vars\": {\"feature\": \"payments\", \"name\": \"CheckoutPage\"}}"),
+			mcp.Items(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"rule_id": map[string]any{"type": "string"},
+					"vars":    map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+				},
+				"required": []string{"rule_id"},
+			})),
+		mcp.WithString("decline_reason", mcp.Description("Instead of items: why no up-front plan applies to this task (logged as a decision)")),
+	), s.handlePlan)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_init",
 		mcp.WithDescription("Initialize ClickUp workspace scan and return cached topology summary"),
@@ -268,12 +303,92 @@ func (s *Server) handleStop(ctx context.Context, request mcp.CallToolRequest) (*
 		targetStatus = "COMPLETED"
 	}
 
-	err = s.service.Stop(ctx, sessionID, summary, targetStatus, s.config.Git.AutoContext)
+	// MCP has no override for the block gate: an agent gets past it only by
+	// doing, attesting, or waiving the work.
+	res, err := s.service.Stop(ctx, sessionID, summary, targetStatus, s.config.Git.AutoContext, false)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf(`{"status": "ok", "session_id": %q, "new_status": %q}`, sessionID, targetStatus)), nil
+	return jsonResult(struct {
+		Status string `json:"status"`
+		*session.StopResult
+	}{Status: "ok", StopResult: res})
+}
+
+func (s *Server) handleWaive(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	obligationID, err := request.RequireString("obligation_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	rationale, err := request.RequireString("rationale")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	res, err := s.service.Waive(ctx, sessionID, obligationID, rationale)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(res)
+}
+
+func (s *Server) handleAttest(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	obligationID, err := request.RequireString("obligation_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	evidence, err := request.RequireString("evidence")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	res, err := s.service.Attest(ctx, sessionID, obligationID, evidence)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(res)
+}
+
+func (s *Server) handlePlan(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var items []session.PlanItem
+	if raw, ok := request.GetArguments()["items"]; ok && raw != nil {
+		b, err := json.Marshal(raw)
+		if err == nil {
+			err = json.Unmarshal(b, &items)
+		}
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("items must be a list of {rule_id, vars} objects with string vars: %v", err)), nil
+		}
+	}
+	declineReason := request.GetString("decline_reason", "")
+
+	res, err := s.service.Plan(ctx, sessionID, items, declineReason)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(res)
+}
+
+// jsonResult returns v as an indented JSON tool result.
+func jsonResult(v any) (*mcp.CallToolResult, error) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(string(b)), nil
 }
 
 func (s *Server) handleCompleteness(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {

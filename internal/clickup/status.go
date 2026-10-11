@@ -27,6 +27,7 @@ const (
 	RoleStart    = session.RoleStart
 	RoleReopen   = session.RoleReopen
 	RoleComplete = session.RoleComplete
+	RoleReview   = session.RoleReview
 	RoleArchive  = session.RoleArchive
 )
 
@@ -41,7 +42,7 @@ var (
 // ParseStatusRole validates a role name from a sync payload.
 func ParseStatusRole(s string) (StatusRole, error) {
 	switch r := StatusRole(s); r {
-	case RoleStart, RoleReopen, RoleComplete, RoleArchive:
+	case RoleStart, RoleReopen, RoleComplete, RoleReview, RoleArchive:
 		return r, nil
 	}
 	return "", fmt.Errorf("%w: %q", ErrUnknownStatusRole, s)
@@ -291,6 +292,7 @@ func forgetOverrideMissing(listID string, key StatusRole, want string) {
 //	           puts it back to work; a task in progress or in review (custom)
 //	           is still being worked and is left alone
 //	complete → not from done or closed
+//	review   → not from done or closed: someone already finished the task
 //	archive  → not from done or closed, so a finished task is never cancelled
 func checkRoleApplies(role StatusRole, current TaskStatus) error {
 	var applies bool
@@ -299,7 +301,7 @@ func checkRoleApplies(role StatusRole, current TaskStatus) error {
 		applies = current.Type == "open"
 	case RoleReopen:
 		applies = current.Type == "open" || current.Type == "done" || current.Type == "closed"
-	case RoleComplete, RoleArchive:
+	case RoleComplete, RoleReview, RoleArchive:
 		applies = current.Type != "done" && current.Type != "closed"
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownStatusRole, role)
@@ -366,6 +368,9 @@ func isPreWork(words []string) bool {
 //
 //	start, reopen → see startStatus
 //	complete      → first done, else first closed
+//	review        → first custom status with the whole word "review" ("in
+//	                review", "Code Review"), else none: the task keeps its
+//	                status rather than being reported done
 //	archive       → first closed named like a cancellation ("cancelled",
 //	                "won't do", "duplicate"), else none: a list whose only
 //	                closed status means finished has nowhere to archive to
@@ -387,6 +392,10 @@ func defaultStatusForRole(statuses []*store.CacheEntry, role StatusRole) string 
 			return name
 		}
 		return firstOfType("closed", nil)
+	case RoleReview:
+		return firstOfType("custom", func(words []string) bool {
+			return slices.Contains(words, "review")
+		})
 	case RoleArchive:
 		return firstOfType("closed", func(words []string) bool {
 			return hasWordWithPrefix(words, archivePrefixes)

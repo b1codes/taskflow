@@ -260,6 +260,55 @@ func (m *mockStore) IncrementObligationReminders(ctx context.Context, ids []stri
 	return nil
 }
 
+func (m *mockStore) SetSessionPlanState(ctx context.Context, id string, state PlanState) error {
+	s, ok := m.sessions[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	s.PlanState = state
+	return nil
+}
+
+func (m *mockStore) AttestObligation(ctx context.Context, id string, evidence string, levels []string, status ObligationStatus, at time.Time) error {
+	o := m.obligation(id)
+	if o == nil {
+		return errors.New("not found")
+	}
+	o.Status, o.Evidence, o.VerifiedLevels, o.UpdatedAt = status, evidence, slices.Clone(levels), at
+	o.WaiverDecisionID, o.SatisfiedAt = "", nil
+	if status == ObligationSatisfied {
+		o.SatisfiedAt = &at
+	}
+	return nil
+}
+
+func (m *mockStore) WaiveObligation(ctx context.Context, id string, decisionID string, rationale string, at time.Time) error {
+	o := m.obligation(id)
+	if o == nil {
+		return errors.New("not found")
+	}
+	o.Status, o.WaiverDecisionID, o.Evidence, o.SatisfiedAt, o.UpdatedAt = ObligationWaived, decisionID, rationale, nil, at
+	return nil
+}
+
+func (m *mockStore) InheritObligations(ctx context.Context, fromSessionID, toSessionID string) error {
+	for _, o := range m.obligations[fromSessionID] {
+		switch o.Status {
+		case ObligationOpen, ObligationAttested, ObligationWaived:
+			c := *o
+			c.ID, c.SessionID, c.InheritedFrom = o.ID+"@"+toSessionID, toSessionID, o.ID
+			c.RemindedCount, c.SatisfiedAt = 0, nil
+			m.obligations[toSessionID] = append(m.obligations[toSessionID], &c)
+		}
+	}
+	return nil
+}
+
+// decisionsFor returns the session's logged decisions.
+func (m *mockStore) decisionsFor(sessionID string) []*Decision {
+	return m.decisions[sessionID]
+}
+
 // statusRoles returns the role of every queued UPDATE_STATUS op, in order.
 func (m *mockStore) statusRoles(t *testing.T) []StatusRole {
 	t.Helper()
@@ -354,7 +403,7 @@ func TestService_Start(t *testing.T) {
 		t.Errorf("expected error starting conflicting session in same project path")
 	}
 
-	err = srv.Stop(ctx, res.Session.ID, "paused for lunch", "PAUSED", true)
+	_, err = srv.Stop(ctx, res.Session.ID, "paused for lunch", "PAUSED", true, false)
 	if err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
@@ -462,7 +511,7 @@ func TestService_StopPausedWithSummary(t *testing.T) {
 	sessionID := res.Session.ID
 
 	// 2. Stop session as PAUSED with summary
-	err = srv.Stop(ctx, sessionID, "pausing for the day", "PAUSED", true)
+	_, err = srv.Stop(ctx, sessionID, "pausing for the day", "PAUSED", true, false)
 	if err != nil {
 		t.Fatalf("Stop (PAUSED) failed: %v", err)
 	}
@@ -482,7 +531,7 @@ func TestService_StopPausedWithSummary(t *testing.T) {
 	}
 
 	// 4. Stop session as COMPLETED with summary (was previously failing with 'cannot create checkpoint for non-active session')
-	err = srv.Stop(ctx, sessionID, "finished the feature", "COMPLETED", true)
+	_, err = srv.Stop(ctx, sessionID, "finished the feature", "COMPLETED", true, false)
 	if err != nil {
 		t.Fatalf("Stop (COMPLETED with summary on PAUSED session) failed: %v", err)
 	}
@@ -545,7 +594,7 @@ func TestService_UnknownSession_NoPanic(t *testing.T) {
 		t.Errorf("expected error on LogDecision with nonexistent session, got nil")
 	}
 
-	err = srv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false)
+	_, err = srv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false, false)
 	if err == nil {
 		t.Errorf("expected error on Stop with nonexistent session, got nil")
 	}
@@ -569,7 +618,7 @@ func TestService_UnknownSession_NoPanic(t *testing.T) {
 		t.Errorf("expected error on nilSrv.LogDecision, got nil")
 	}
 
-	err = nilSrv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false)
+	_, err = nilSrv.Stop(ctx, "nonexistent-id", "summary", "COMPLETED", false, false)
 	if err == nil {
 		t.Errorf("expected error on nilSrv.Stop, got nil")
 	}
@@ -685,7 +734,7 @@ func TestService_StatusRoles(t *testing.T) {
 		}
 		id := res.Session.ID
 		for _, target := range []string{"PAUSED", "COMPLETED", "ARCHIVED"} {
-			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+			if _, err := srv.Stop(ctx, id, "", target, false, false); err != nil {
 				t.Fatalf("Stop(%s) failed: %v", target, err)
 			}
 		}
@@ -710,7 +759,7 @@ func TestService_StatusRoles(t *testing.T) {
 		}
 		id := res.Session.ID
 		for _, target := range []string{"COMPLETED", "ARCHIVED", "ARCHIVED"} {
-			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+			if _, err := srv.Stop(ctx, id, "", target, false, false); err != nil {
 				t.Fatalf("Stop(%s) failed: %v", target, err)
 			}
 		}
@@ -731,7 +780,7 @@ func TestService_StatusRoles(t *testing.T) {
 		}
 		id := res.Session.ID
 		for _, target := range []string{"ARCHIVED", "ARCHIVED"} {
-			if err := srv.Stop(ctx, id, "", target, false); err != nil {
+			if _, err := srv.Stop(ctx, id, "", target, false, false); err != nil {
 				t.Fatalf("Stop(%s) failed: %v", target, err)
 			}
 		}
@@ -751,7 +800,7 @@ func TestService_StatusRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start failed: %v", err)
 		}
-		if err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false); err != nil {
+		if _, err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false, false); err != nil {
 			t.Fatalf("Stop(PAUSED) failed: %v", err)
 		}
 		resumed, err := srv.Start(ctx, "task-resume", dir, false)
@@ -777,7 +826,7 @@ func TestService_StatusRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start failed: %v", err)
 		}
-		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+		if _, err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false, false); err != nil {
 			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
 		}
 
@@ -830,7 +879,7 @@ func TestService_StatusRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start failed: %v", err)
 		}
-		if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+		if _, err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false, false); err != nil {
 			t.Fatalf("Stop(COMPLETED) failed: %v", err)
 		}
 		reopened, err := srv.Start(ctx, "task-reopen", dir, false)
@@ -861,7 +910,7 @@ func TestService_StatusRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start failed: %v", err)
 		}
-		if err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false); err != nil {
+		if _, err := srv.Stop(ctx, res.Session.ID, "", "ARCHIVED", false, false); err != nil {
 			t.Fatalf("Stop(ARCHIVED) failed: %v", err)
 		}
 		if _, err := srv.Start(ctx, "task-reabandoned", dir, false); err != nil {
@@ -901,7 +950,7 @@ func TestService_StatusRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start failed: %v", err)
 		}
-		if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+		if _, err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false, false); err != nil {
 			t.Fatalf("Stop(COMPLETED) failed: %v", err)
 		}
 		if _, err := srv.Start(ctx, "task-reopened-elsewhere", dir, false); err != nil {

@@ -265,6 +265,8 @@ func (m *Manifest) validate() []string {
 	if m.Version != 1 {
 		add("version: must be 1, got %d", m.Version)
 	}
+	// The gate names mirror session.GateMode; this package stays free of a
+	// session import, and session treats any name it doesn't know as block.
 	switch m.Gate {
 	case "", "report", "review", "block":
 	default:
@@ -368,6 +370,9 @@ func (m *Manifest) validate() []string {
 				qat = fmt.Sprintf("%s.require[%s]", at, q.ID)
 				if reqIDs[q.ID] {
 					add("%s: duplicate requirement id", qat)
+				}
+				if q.ID == SubjectFileRequirement {
+					add("%s.id: %q is reserved for planned subject files", qat, q.ID)
 				}
 			}
 			reqIDs[q.ID] = true

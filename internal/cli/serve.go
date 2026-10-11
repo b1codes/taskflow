@@ -38,7 +38,10 @@ var serveCmd = &cobra.Command{
 			cuClient = clickup.New(cfg.ClickUp.APIKey).
 				WithMinInterval(time.Duration(cfg.Sync.RateLimitMS) * time.Millisecond)
 		}
-		srv := server.New(st, cfg, cuClient)
+		srv, err := server.New(st, cfg, cuClient)
+		if err != nil {
+			return err
+		}
 
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

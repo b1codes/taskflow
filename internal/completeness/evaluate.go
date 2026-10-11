@@ -33,12 +33,17 @@ type Finding struct {
 	RequirementID string
 	// Subject is the trigger file (relative to the project), or for a
 	// stack-scoped rule the stack id ("*" when the rule has no stack).
-	Subject   string
-	Source    string
-	Severity  string
-	Describe  string
-	Expected  []string // rendered paths/globs, relative to the project
+	Subject  string
+	Source   string
+	Severity string
+	Describe string
+	Expected []string // rendered paths/globs, relative to the project
+	// Satisfied means the requirement is met: its checks passed and it needs
+	// no attestation.
 	Satisfied bool
+	// ChecksPassed means the checks taskflow can run passed (or there are
+	// none). With an attestation on record, that makes the requirement met.
+	ChecksPassed bool
 	// Levels lists the verify levels that passed ("structural").
 	Levels []string
 	// AttestPrompt is set when the requirement also needs an attestation,
@@ -52,6 +57,9 @@ type RuleSummary struct {
 	Describe  string
 	Stack     string
 	Plannable bool
+	PlanHints []string
+	// PlanVars are the vars tf_plan needs for the rule, when it is plannable.
+	PlanVars []string
 	// Requires reads like "story (required)" per requirement.
 	Requires []string
 }
@@ -61,17 +69,48 @@ type RuleSummary struct {
 type Recheck struct {
 	RuleID  string
 	Subject string
+	// Declared subjects (planned with tf_plan) are checked even when the file
+	// doesn't exist (yet). Others, inherited ones included, are checked only
+	// while it exists: their trigger fired on the file, so once it is gone the
+	// work they named is too.
+	Declared bool
+	// SubjectFile adds the subject-file requirement: the planned file itself
+	// must exist. File-scoped rules only.
+	SubjectFile bool
+}
+
+// DroppedRecheck is a recheck the manifest no longer applies to, so its
+// obligations can't be found again whatever changes.
+type DroppedRecheck struct {
+	Recheck
+	// Reason says why, for warnings.
+	Reason string
 }
 
 type Result struct {
 	Stacks   []ResolvedStack
 	Rules    []RuleSummary
 	Findings []Finding
+	// Dropped are the rechecks that can no longer apply: their rule left the
+	// manifest, its stack is missing, or the subject is outside the stack
+	// root or no longer fits the rule. It is decided by the manifest alone,
+	// never by the change set.
+	Dropped  []DroppedRecheck
 	Warnings []string
 }
 
 // noCommand fills {command} when no command resolved for the stack.
 const noCommand = "the project's test suite"
+
+// SubjectFileRequirement is the requirement id of the obligation tf_plan adds
+// for a planned subject itself: the file must come to exist. Manifests can't
+// use it.
+const SubjectFileRequirement = "subject-file"
+
+// commandsExecuted reports whether command checks (run:) are executed. They
+// aren't yet, so an attest_when: no_command attestation always stands in for
+// the command it can't run.
+const commandsExecuted = false
 
 // Evaluate checks changes against m. Paths in changes are relative to
 // projectPath. Command checks (run:) are not executed, so a requirement with
@@ -79,8 +118,11 @@ const noCommand = "the project's test suite"
 // the attestation stands in for the command it can't run yet.
 //
 // recheck lists earlier findings to verify again even when their subject
-// isn't in changes. Pass it only when changes may be incomplete (a partial
-// change set): a recheck counts as found, so it can't be voided.
+// isn't in changes; a recheck that still applies is reported as found, so the
+// caller won't void it. Declared subjects are checked even when the file
+// doesn't exist, others only while it does. A recheck the manifest can no
+// longer apply to at all is reported in Result.Dropped instead, so the caller
+// can void its obligations whatever the change set.
 func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck) *Result {
 	res := &Result{Stacks: ResolveStacks(projectPath, m, o)}
 	stacks := map[string]*ResolvedStack{}
@@ -91,9 +133,12 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 
 	sorted := append([]Change(nil), changes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
-	rechecks := map[string][]string{}
+	rechecks := map[string][]Recheck{}
 	for _, rc := range recheck {
-		rechecks[rc.RuleID] = append(rechecks[rc.RuleID], rc.Subject)
+		rechecks[rc.RuleID] = append(rechecks[rc.RuleID], rc)
+	}
+	drop := func(rc Recheck, reason string) {
+		res.Dropped = append(res.Dropped, DroppedRecheck{Recheck: rc, Reason: reason})
 	}
 	cache := newFSCache()
 
@@ -106,6 +151,9 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 		if r.Stack != "" {
 			rs = stacks[r.Stack]
 			if rs.Missing {
+				for _, rc := range rechecks[r.ID] {
+					drop(rc, fmt.Sprintf("stack %s is missing", r.Stack))
+				}
 				continue
 			}
 			root = rs.Root
@@ -124,7 +172,15 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			if subject == "" {
 				subject = "*"
 			}
-			fired := slices.Contains(rechecks[r.ID], subject)
+			fired := false
+			for _, rc := range rechecks[r.ID] {
+				if rc.Subject == subject {
+					fired = true
+				} else {
+					// The rule's stack, or its scope, changed since.
+					drop(rc, fmt.Sprintf("the rule now applies to %q", subject))
+				}
+			}
 			for _, ch := range c.changes {
 				if _, ok := r.match(ch); ok {
 					fired = true
@@ -154,18 +210,40 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			}
 		}
 		// A recheck's trigger fired in an earlier evaluation; it still applies
-		// while the file exists and fits the rule.
-		for _, subject := range rechecks[r.ID] {
-			rel, ok := c.rootRel(subject)
-			if !ok || checked[rel] {
+		// while the file fits the rule and, unless it was declared, exists.
+		for _, rc := range rechecks[r.ID] {
+			rel, ok := c.rootRel(rc.Subject)
+			if !ok {
+				drop(rc, fmt.Sprintf("it is outside stack %s's root %q", r.Stack, root))
 				continue
 			}
-			if _, err := statInRoot(c.rootAbs, rel); err != nil {
+			caps, ok := r.matchPath(rel)
+			if !ok {
+				drop(rc, "it no longer fits the rule's triggers")
 				continue
 			}
-			if caps, ok := r.matchPath(rel); ok {
-				fileFindings(rel, caps)
+			if rc.SubjectFile {
+				res.Findings = append(res.Findings, c.subjectFile(r, rc.Subject, rel, caps, base))
 			}
+			if checked[rel] {
+				continue
+			}
+			// No trigger fires on a deleted file (deleted: is parsed but not
+			// acted on, and changed: skips deletions), so an undeclared
+			// subject existed when it was found, and once it's gone so is the
+			// work. Acting on deleted: triggers would need their subjects
+			// checked without the file.
+			if !rc.Declared {
+				if _, err := statInRoot(c.rootAbs, rel); err != nil {
+					continue
+				}
+			}
+			fileFindings(rel, caps)
+		}
+	}
+	for _, rc := range recheck {
+		if !slices.ContainsFunc(res.Rules, func(r RuleSummary) bool { return r.ID == rc.RuleID }) {
+			drop(rc, "the rule is no longer in the manifest")
 		}
 	}
 	return res
@@ -220,7 +298,10 @@ func (r *Rule) matchPath(p string) (map[string]string, bool) {
 }
 
 func summarize(r *Rule) RuleSummary {
-	s := RuleSummary{ID: r.ID, Describe: r.Describe, Stack: r.Stack, Plannable: r.Plannable}
+	s := RuleSummary{ID: r.ID, Describe: r.Describe, Stack: r.Stack, Plannable: r.Plannable, PlanHints: r.PlanHints}
+	if p := r.planPattern(); r.Plannable && p != nil {
+		s.PlanVars = p.Vars()
+	}
 	for _, q := range r.Require {
 		label := q.Severity
 		if q.OnlyIf != nil {
@@ -306,13 +387,53 @@ func (c *checker) check(r *Rule, rs *ResolvedStack, subject, subjectPath string,
 				f.Satisfied = false
 			}
 		}
-		if q.Attest != "" {
+		f.ChecksPassed = f.Satisfied
+		if needsAttestation(q, rs) {
 			f.AttestPrompt, _ = render(q.Attest, qvars)
 			f.Satisfied = false
 		}
 		out = append(out, f)
 	}
 	return out
+}
+
+// subjectFile is the subject-file finding for a planned subject: the file
+// itself must exist. rel is the subject relative to the checker's root.
+func (c *checker) subjectFile(r *Rule, subject, rel string, caps, base map[string]string) Finding {
+	vars := builtinVars(rel)
+	for k, v := range base {
+		vars[k] = v
+	}
+	for k, v := range caps {
+		vars[k] = v
+	}
+	describe, _ := render(r.Describe, vars)
+	f := Finding{
+		RuleID:        r.ID,
+		RequirementID: SubjectFileRequirement,
+		Subject:       subject,
+		Source:        r.Source,
+		Severity:      SeverityRequired,
+		Describe:      describe + ": " + path.Base(rel),
+		Expected:      []string{subject},
+	}
+	if _, err := statInRoot(c.rootAbs, rel); err == nil {
+		f.Satisfied, f.ChecksPassed, f.Levels = true, true, []string{"structural"}
+	}
+	return f
+}
+
+// needsAttestation reports whether q needs an attestation to be met:
+// always for attest_when: always, and for no_command while its command check
+// can't run (commands aren't executed, or none resolved for the stack).
+func needsAttestation(q *Requirement, rs *ResolvedStack) bool {
+	if q.Attest == "" {
+		return false
+	}
+	if q.AttestWhen != AttestNoCommand {
+		return true
+	}
+	return !commandsExecuted || q.Run == nil || commandFor(q, rs, nil) == noCommand
 }
 
 // commandFor renders {command}: the requirement's run command (with its

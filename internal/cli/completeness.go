@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/b1codes/taskflow/internal/session"
 	"github.com/b1codes/taskflow/internal/store"
@@ -77,6 +78,25 @@ var completenessCmd = &cobra.Command{
 	},
 }
 
+func printContractCompleteness(c *session.ContractCompleteness) {
+	if c.Error != "" {
+		fmt.Printf("  ✗ completeness manifest error: %s\n", c.Error)
+		return
+	}
+	sum := c.Summary
+	fmt.Printf("  Completeness: %s (gate: %s) · open: %d · satisfied: %d · attested: %d · waived: %d\n",
+		c.Manifest, c.Gate, sum.Open, sum.Satisfied, sum.Attested, sum.Waived)
+	for _, o := range c.Inherited {
+		fmt.Printf("  %s inherited: %s (%s) [%s]\n", statusMark(o.Status), o.Describe, o.Status, o.ObligationID)
+	}
+	for _, o := range c.Open {
+		fmt.Printf("  ○ %s [%s]\n", o.Describe, o.ObligationID)
+	}
+	if p := c.SuggestedPlan; p != nil {
+		fmt.Printf("  ? %s: consider `taskflow plan` for %s, or decline with --decline\n", p.Reason, strings.Join(p.Rules, ", "))
+	}
+}
+
 func printCheckpointCompleteness(c *session.CheckpointCompleteness) {
 	if c.Error != "" {
 		fmt.Printf("  ✗ completeness manifest error: %s\n", c.Error)
@@ -93,6 +113,9 @@ func printCheckpointCompleteness(c *session.CheckpointCompleteness) {
 	}
 	for _, d := range c.StillOpen {
 		fmt.Printf("  ○ still open: %s\n", d)
+	}
+	if c.PlanReminder != "" {
+		fmt.Printf("  ? %s\n", c.PlanReminder)
 	}
 }
 

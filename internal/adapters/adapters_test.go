@@ -196,3 +196,81 @@ rules:
 		t.Errorf("without stored obligations: findings = %+v, %v", ev.Findings, err)
 	}
 }
+
+// Inherited obligations are rechecked only while their file exists, and
+// rechecks the manifest no longer applies to (a renamed rule) are dropped.
+func TestCompletenessEvaluator_InheritedAndDropped(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q", "-b", "main")
+	git("config", "user.name", "Test")
+	git("config", "user.email", "test@test.com")
+	git("config", "commit.gpgsign", "false")
+	write(".agents/completeness.yaml", `
+version: 1
+rules:
+  - id: unit
+    when: { added: "src/{name}.ts", exclude: ["**/*.test.ts"] }
+    plannable: true
+    require: [{ id: test, describe: "test for {name}", verify: { exists: "src/{name}.test.ts" } }]
+`)
+	write("src/Kept.ts", "")
+	write("src/Deleted.ts", "")
+	git("add", "-A")
+	git("commit", "-q", "-m", "earlier session's work")
+
+	e := NewCompletenessEvaluator()
+	base, err := e.BaseSHA(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "src/Deleted.ts")); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := &session.Session{ID: "s2", ProjectPath: dir, BaseSHA: base}
+	stored := []*session.Obligation{
+		{ID: "o1", RuleID: "unit", RequirementID: "test", Subject: "src/Kept.ts", Status: session.ObligationOpen, InheritedFrom: "p1"},
+		{ID: "o2", RuleID: "unit", RequirementID: "test", Subject: "src/Deleted.ts", Status: session.ObligationWaived, InheritedFrom: "p2"},
+		{ID: "o3", RuleID: "unit", RequirementID: "test", Subject: "src/Planned.ts", Status: session.ObligationOpen, Planned: true},
+		{ID: "o4", RuleID: "old-unit", RequirementID: "test", Subject: "src/Renamed.ts", Status: session.ObligationOpen, Planned: true},
+	}
+	ev, err := e.Evaluate(context.Background(), sess, stored)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if ev.Partial {
+		t.Fatalf("expected a full evaluation, warnings: %v", ev.Warnings)
+	}
+	subjects := map[string]bool{}
+	for _, f := range ev.Findings {
+		subjects[f.RuleID+"/"+f.RequirementID+"/"+f.Subject] = true
+	}
+	for _, k := range []string{"unit/test/src/Kept.ts", "unit/test/src/Planned.ts", "unit/subject-file/src/Planned.ts"} {
+		if !subjects[k] {
+			t.Errorf("missing finding %s in %v", k, subjects)
+		}
+	}
+	if subjects["unit/test/src/Deleted.ts"] {
+		t.Error("an inherited obligation whose file was deleted must not be found")
+	}
+	if len(ev.Dropped) != 1 || ev.Dropped[0].RuleID != "old-unit" || ev.Dropped[0].Subject != "src/Renamed.ts" {
+		t.Errorf("dropped = %+v, want old-unit/src/Renamed.ts", ev.Dropped)
+	}
+}

@@ -98,7 +98,7 @@ New dependency: `gopkg.in/yaml.v3`.
 
 ```yaml
 version: 1
-gate: review                 # optional; overrides global config (report | review | block)
+gate: review                 # optional; can raise the global config's gate, never lower it (report | review | block)
 sources:                     # informational; which b1 modules contributed (used by the drift report)
   - framework/react-web@1.0.0
   - testing/storybook@1.0.0
@@ -498,7 +498,9 @@ On a fresh start, `rules` puts the definition of done in front of the agent at t
 
 ### Modes
 
-Set by `[completeness] gate` in `config.toml`, overridden by the manifest's `gate:`. The project's own rules win.
+Set by `[completeness] gate` in `config.toml`, which is a **floor**: the manifest's `gate:` can make it stricter (`report` < `review` < `block`) but never looser. The manifest lives in the repo the agent edits, so if it could lower the gate, an agent could get past `block` by editing (or breaking) the manifest. A project that wants `report` needs `report` in the user's config.
+
+**When completeness can't be checked** (the manifest is invalid, the stored obligations can't be read, or the evaluation fails), the gate acts as if required work may be open. `block` refuses with `ErrCompletenessUnchecked` and changes nothing (a human can still use `--force`). `review` moves the task to review. `report` completes. An invalid manifest's own `gate:` can't be read, so the config gate applies.
 
 | Mode | `Stop(completed)` with required obligations open |
 |---|---|
@@ -734,7 +736,7 @@ Because both outputs come from one source, the agent's instructions and taskflow
 | Situation | Behavior |
 |---|---|
 | Manifest missing | Completeness off; no warnings |
-| Manifest invalid (YAML or schema) | `Start` succeeds; contract carries `completeness.error`; checkpoint responses repeat it; gate treated as `report` |
+| Manifest invalid (YAML or schema) | `Start` succeeds; contract carries `completeness.error`; checkpoint responses repeat it; the config gate applies, acting as if work may be open (§8): `block` refuses, `review` moves the task to review |
 | Git unavailable / not a repo | Evaluate with structural `exists` checks only, against planned obligations; warning in report |
 | `base_sha` unreachable | Merge-base fallback (§5); warning in report |
 | Command check times out or fails | Obligation stays `open` with truncated output as evidence; never crashes `Stop` |

@@ -49,6 +49,9 @@ var startCmd = &cobra.Command{
 			if res.Session.GitBranch != "" {
 				fmt.Printf("  Git Branch:   %s\n", res.Session.GitBranch)
 			}
+			if c := res.AgenticContract.Completeness; c != nil {
+				printContractCompleteness(c)
+			}
 		}
 
 		return nil

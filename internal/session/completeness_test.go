@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +15,11 @@ type fakeEvaluator struct {
 	baseSHA string
 	eval    *Evaluation // nil = no manifest
 	calls   int
+	// plan resolves a plan item to its subject and the findings for it;
+	// nil rejects every item.
+	plan func(item PlanItem) (PlannedSubject, []CompletenessFinding, error)
+	// err fails every evaluation.
+	err error
 }
 
 func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
@@ -22,11 +28,34 @@ func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
 
 func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error) {
 	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	if f.eval == nil {
 		return nil, nil
 	}
 	c := *f.eval
 	return &c, nil
+}
+
+func (f *fakeEvaluator) Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error) {
+	ev, err := f.Evaluate(ctx, sess, stored)
+	if ev == nil || err != nil {
+		return ev, err
+	}
+	ev.Findings = slices.Clone(ev.Findings)
+	for _, item := range items {
+		if f.plan == nil {
+			return nil, fmt.Errorf("%w: rule %q is not plannable", ErrInvalidPlan, item.RuleID)
+		}
+		ps, findings, err := f.plan(item)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
+		}
+		ev.Planned = append(ev.Planned, ps)
+		ev.Findings = append(ev.Findings, findings...)
+	}
+	return ev, nil
 }
 
 func finding(rule, req, subject string, satisfied bool) CompletenessFinding {
@@ -104,11 +133,16 @@ func TestMergeObligations(t *testing.T) {
 		inherited := stored("r", "story", "Inherited", ObligationOpen)
 		inherited.InheritedFrom = "older"
 		mr := mergeObligations("s", []*Obligation{gone, kept, planned, inherited}, evalWith(finding("r", "story", "A", false)), now)
-		if gone.Status != ObligationVoid || len(mr.voided) != 1 || mr.voided[0] != gone {
+		if gone.Status != ObligationVoid || len(mr.voided) != 2 || mr.voided[0] != gone {
 			t.Errorf("reverted file should void its obligation: %+v voided=%v", gone, mr.voided)
 		}
-		if planned.Status != ObligationOpen || inherited.Status != ObligationOpen {
-			t.Errorf("planned/inherited obligations must not be voided")
+		if planned.Status != ObligationOpen {
+			t.Errorf("planned obligations must not be voided, got %s", planned.Status)
+		}
+		// An inherited obligation is rechecked while its file exists; not
+		// finding it means the file is gone.
+		if inherited.Status != ObligationVoid {
+			t.Errorf("an inherited obligation not found again must be voided, got %s", inherited.Status)
 		}
 		if len(mr.upserts) != 0 {
 			t.Errorf("an unchanged obligation must not be rewritten, got %d upserts", len(mr.upserts))
@@ -122,6 +156,71 @@ func TestMergeObligations(t *testing.T) {
 		mr := mergeObligations("s", []*Obligation{o}, ev, now)
 		if o.Status != ObligationSatisfied || len(mr.voided) != 0 {
 			t.Errorf("partial evaluation voided %+v", o)
+		}
+	})
+
+	t.Run("inherited obligations not found are voided whatever their status", func(t *testing.T) {
+		var all []*Obligation
+		for _, st := range []ObligationStatus{ObligationOpen, ObligationSatisfied, ObligationAttested, ObligationWaived} {
+			o := stored("r", string(st), "Deleted", st)
+			o.InheritedFrom = "older-" + string(st)
+			all = append(all, o)
+		}
+		// Waived and attested ones that originated here stay sticky.
+		ownWaived, ownAttested := stored("r", "story", "Mine", ObligationWaived), stored("r", "e2e", "Mine", ObligationAttested)
+		foundInherited := stored("r", "story", "Kept", ObligationWaived)
+		foundInherited.InheritedFrom = "older"
+		mr := mergeObligations("s", append(all, ownWaived, ownAttested, foundInherited), evalWith(finding("r", "story", "Kept", false)), now)
+		for _, o := range all {
+			if o.Status != ObligationVoid {
+				t.Errorf("inherited %s obligation = %s, want void", o.RequirementID, o.Status)
+			}
+		}
+		if ownWaived.Status != ObligationWaived || ownAttested.Status != ObligationAttested || foundInherited.Status != ObligationWaived {
+			t.Errorf("sticky statuses changed: %s, %s, %s", ownWaived.Status, ownAttested.Status, foundInherited.Status)
+		}
+		if len(mr.voided) != len(all) {
+			t.Errorf("voided %d, want %d", len(mr.voided), len(all))
+		}
+	})
+
+	t.Run("a partial evaluation keeps inherited obligations it didn't find", func(t *testing.T) {
+		o := stored("r", "story", "A", ObligationOpen)
+		o.InheritedFrom = "older"
+		ev := evalWith()
+		ev.Partial = true
+		ev.Dropped = []DroppedSubject{{RuleID: "r", Subject: "Other"}}
+		mr := mergeObligations("s", []*Obligation{o}, ev, now)
+		if o.Status != ObligationOpen || len(mr.voided) != 0 {
+			t.Errorf("partial evaluation voided %+v", o)
+		}
+	})
+
+	t.Run("dropped subjects are voided whatever their status, even when partial", func(t *testing.T) {
+		planned := stored("react-screen", "story", "Checkout.tsx", ObligationOpen)
+		planned.Planned = true
+		subjectFile := stored("react-screen", "subject-file", "Checkout.tsx", ObligationSatisfied)
+		subjectFile.Planned = true
+		waived := stored("react-screen", "e2e", "Checkout.tsx", ObligationWaived)
+		inherited := stored("react-screen", "unit-test", "Checkout.tsx", ObligationAttested)
+		inherited.InheritedFrom = "older"
+		other := stored("react-screen", "story", "Other.tsx", ObligationOpen)
+		other.Planned = true
+		already := stored("react-screen", "contract", "Checkout.tsx", ObligationVoid)
+		ev := evalWith()
+		ev.Partial = true
+		ev.Dropped = []DroppedSubject{{RuleID: "react-screen", Subject: "Checkout.tsx", Reason: "the rule is no longer in the manifest"}}
+		mr := mergeObligations("s", []*Obligation{planned, subjectFile, waived, inherited, other, already}, ev, now)
+		for _, o := range []*Obligation{planned, subjectFile, waived, inherited} {
+			if o.Status != ObligationVoid {
+				t.Errorf("dropped %s = %s, want void", o.RequirementID, o.Status)
+			}
+		}
+		if other.Status != ObligationOpen {
+			t.Errorf("an obligation for another subject must be kept, got %s", other.Status)
+		}
+		if len(mr.voided) != 4 || slices.Contains(mr.voided, already) {
+			t.Errorf("voided = %d, want the 4 live ones only", len(mr.voided))
 		}
 	})
 
@@ -184,7 +283,7 @@ func TestService_BaseSHA(t *testing.T) {
 	}
 
 	// Commits made while paused must not move the base on resume.
-	if err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false); err != nil {
+	if _, err := srv.Stop(ctx, res.Session.ID, "", "PAUSED", false, false); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	ev.baseSHA = "base-2"
@@ -197,7 +296,7 @@ func TestService_BaseSHA(t *testing.T) {
 	}
 
 	// A restart after completion is a new session with its own base.
-	if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+	if _, err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false, false); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	restarted, err := srv.Start(ctx, "task-1", dir, false)
@@ -226,8 +325,15 @@ func TestService_CheckpointCompleteness(t *testing.T) {
 	if n := len(store.obligations[sid]); n != 2 {
 		t.Fatalf("Start should record obligations, got %d", n)
 	}
+	// The contract shows what's open from the start.
+	if len(cc.Open) != 1 || cc.Open[0].Describe != "story for Page.tsx" || cc.Open[0].Expected != "Page.tsx.story" || cc.Open[0].Rule != "react-screen" {
+		t.Errorf("contract open = %+v", cc.Open)
+	}
+	if cc.Summary != (CompletenessSummary{Open: 1, Satisfied: 1}) || cc.Gate != GateReview || cc.Protocol == "" {
+		t.Errorf("contract summary=%+v gate=%q protocol=%q", cc.Summary, cc.Gate, cc.Protocol)
+	}
 
-	// First checkpoint: the open obligation found at start hasn't been shown yet.
+	// First checkpoint: the agent saw the open obligation in the contract.
 	cp, err := srv.Checkpoint(ctx, sid, "built the page", []string{"Page.tsx"}, false)
 	if err != nil {
 		t.Fatalf("Checkpoint: %v", err)
@@ -236,26 +342,35 @@ func TestService_CheckpointCompleteness(t *testing.T) {
 	if c == nil || c.Summary != (CompletenessSummary{Open: 1, Satisfied: 1}) {
 		t.Fatalf("summary = %+v", c)
 	}
-	if len(c.NewlyOpen) != 1 || c.NewlyOpen[0].Describe != "story for Page.tsx" || c.NewlyOpen[0].Expected != "Page.tsx.story" || c.NewlyOpen[0].Rule != "react-screen" {
-		t.Errorf("newly_open = %+v", c.NewlyOpen)
+	if len(c.NewlyOpen) != 0 || !slices.Equal(c.StillOpen, []string{"story for Page.tsx"}) || len(c.NewlySatisfied) != 0 {
+		t.Errorf("newly_open=%+v still_open=%v newly_satisfied=%v", c.NewlyOpen, c.StillOpen, c.NewlySatisfied)
 	}
-	if len(c.StillOpen) != 0 || len(c.NewlySatisfied) != 0 {
-		t.Errorf("still_open=%v newly_satisfied=%v", c.StillOpen, c.NewlySatisfied)
-	}
+
 	comments := store.comments(t)
 	if last := comments[len(comments)-1]; !strings.HasSuffix(last, "\n**Completeness:** 1/2 · open: story") {
 		t.Errorf("checkpoint comment = %q", last)
 	}
 
-	// Second checkpoint: same state, so it's a reminder.
+	// A requirement found mid-session is new to the agent.
+	ev.eval = evalWith(finding("react-screen", "story", "Page.tsx", false), finding("react-screen", "unit-test", "Page.tsx", true), finding("react-screen", "e2e", "Page.tsx", false))
+	cp, _ = srv.Checkpoint(ctx, sid, "routing", nil, false)
+	if c := cp.Completeness; len(c.NewlyOpen) != 1 || c.NewlyOpen[0].Requirement != "e2e" || c.NewlyOpen[0].Expected != "Page.tsx.e2e" {
+		t.Errorf("newly_open = %+v", c.NewlyOpen)
+	}
+	ev.eval = evalWith(finding("react-screen", "story", "Page.tsx", false), finding("react-screen", "unit-test", "Page.tsx", true))
+
+	// Next checkpoint: same state, so it's a reminder.
 	cp, _ = srv.Checkpoint(ctx, sid, "styling", nil, false)
 	if c := cp.Completeness; len(c.NewlyOpen) != 0 || !slices.Equal(c.StillOpen, []string{"story for Page.tsx"}) {
 		t.Errorf("second checkpoint = %+v", c)
 	}
 	for _, o := range store.obligations[sid] {
 		want := 0
-		if o.RequirementID == "story" {
-			want = 2
+		switch {
+		case o.RequirementID == "story":
+			want = 4 // start + three checkpoints
+		case o.RequirementID == "e2e":
+			want = 1 // voided once its finding went away
 		}
 		if o.RemindedCount != want {
 			t.Errorf("%s reminded %d times, want %d", o.RequirementID, o.RemindedCount, want)
@@ -311,7 +426,7 @@ func TestService_NoManifestChangesNothing(t *testing.T) {
 			if cp.Completeness != nil || strings.Contains(string(b), "completeness") {
 				t.Errorf("checkpoint JSON mentions completeness: %s", b)
 			}
-			if err := srv.Stop(ctx, res.Session.ID, "done", "COMPLETED", false); err != nil {
+			if _, err := srv.Stop(ctx, res.Session.ID, "done", "COMPLETED", false, false); err != nil {
 				t.Fatalf("Stop: %v", err)
 			}
 			for _, c := range store.comments(t) {
@@ -373,7 +488,7 @@ func TestService_StopReport(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	ev.eval.Findings[1].Levels = []string{"structural"}
-	if err := srv.Stop(ctx, res.Session.ID, "wrapping up", "COMPLETED", false); err != nil {
+	if _, err := srv.Stop(ctx, res.Session.ID, "wrapping up", "COMPLETED", false, false); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	comments := store.comments(t)
@@ -403,12 +518,16 @@ func TestService_StopReport(t *testing.T) {
 	// so it survives the manifest going away.
 	calls := ev.calls
 	ev.eval = nil
+	reminded := map[string]int{}
+	for _, o := range store.obligations[res.Session.ID] {
+		reminded[o.ID] = o.RemindedCount
+	}
 	report, err := srv.Completeness(ctx, res.Session.ID)
 	if err != nil || !report.Enabled || len(report.Obligations) != 2 || ev.calls != calls {
 		t.Fatalf("report = %+v, %v (evaluations: %d)", report, err, ev.calls-calls)
 	}
 	for _, o := range store.obligations[res.Session.ID] {
-		if o.Status == ObligationVoid || o.RemindedCount != 0 {
+		if o.Status == ObligationVoid || o.RemindedCount != reminded[o.ID] {
 			t.Errorf("a finished session's obligations changed: %+v", o)
 		}
 	}
@@ -440,8 +559,8 @@ func TestService_CompletenessReport(t *testing.T) {
 		t.Errorf("warnings = %v", report.Warnings)
 	}
 	for _, o := range store.obligations[res.Session.ID] {
-		if o.RequirementID == "test" && o.RemindedCount != 1 {
-			t.Errorf("tf_completeness should count as a reminder, got %d", o.RemindedCount)
+		if o.RequirementID == "test" && o.RemindedCount != 2 {
+			t.Errorf("the start contract and tf_completeness should each count as a reminder, got %d", o.RemindedCount)
 		}
 	}
 }
@@ -487,7 +606,8 @@ func TestService_ConcurrentInsertKeepsStoredID(t *testing.T) {
 	if c == nil || len(c.NewlyOpen) != 1 || c.NewlyOpen[0].ObligationID != stored[0].ID {
 		t.Fatalf("newly_open = %+v, want the stored ID %s", c, stored[0].ID)
 	}
-	if got := store.obligation(stored[0].ID).RemindedCount; got != 1 {
+	// One reminder from the start contract, one from the checkpoint.
+	if got := store.obligation(stored[0].ID).RemindedCount; got != 2 {
 		t.Errorf("reminder counted on a phantom ID: stored reminded_count = %d", got)
 	}
 }
@@ -517,7 +637,7 @@ func TestService_ObligationsUnreadable(t *testing.T) {
 	if cp.Completeness == nil || !strings.Contains(cp.Completeness.Error, "database is locked") {
 		t.Errorf("checkpoint completeness = %+v, want the read error", cp.Completeness)
 	}
-	if err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false); err != nil {
+	if _, err := srv.Stop(ctx, res.Session.ID, "", "COMPLETED", false, false); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	comments := store.comments(t)

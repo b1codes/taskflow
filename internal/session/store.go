@@ -48,4 +48,18 @@ type SessionStore interface {
 	// satisfied, and clears it when status is open.
 	UpdateObligationStatus(ctx context.Context, id string, status ObligationStatus, at time.Time) error
 	IncrementObligationReminders(ctx context.Context, ids []string) error
+
+	SetSessionPlanState(ctx context.Context, id string, state PlanState) error
+	// AttestObligation records an attestation: the evidence, the verified
+	// levels (which include "attest"), and the resulting status. It clears
+	// any waiver link, since an attestation takes the waiver back.
+	AttestObligation(ctx context.Context, id string, evidence string, levels []string, status ObligationStatus, at time.Time) error
+	// WaiveObligation marks the obligation waived, linking the decision that
+	// records why, and keeps the rationale as its evidence.
+	WaiveObligation(ctx context.Context, id string, decisionID string, rationale string, at time.Time) error
+	// InheritObligations copies fromSessionID's open, attested, and waived
+	// obligations into toSessionID with new IDs and inherited_from set to the
+	// source obligation, keeping status, verified levels, evidence, and
+	// waiver links.
+	InheritObligations(ctx context.Context, fromSessionID, toSessionID string) error
 }

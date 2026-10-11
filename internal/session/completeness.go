@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -12,8 +13,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// ObligationStatus is the state of one obligation. Attested and waived are
-// set by tf_attest/tf_waive (Phase 2); evaluation never changes them.
+// ObligationStatus is the state of one obligation. Waived is set by tf_waive
+// and evaluation never changes it. Attested is set by tf_attest; evaluation
+// then moves the obligation between attested (the claim stands alone) and
+// satisfied (the claim plus passing checks meet the requirement), never back
+// to open.
 type ObligationStatus string
 
 const (
@@ -23,6 +27,9 @@ const (
 	ObligationWaived    ObligationStatus = "waived"
 	ObligationVoid      ObligationStatus = "void"
 )
+
+// levelAttest is the verified level an attestation adds.
+const levelAttest = "attest"
 
 // Obligation is one requirement applied to one subject in one session.
 type Obligation struct {
@@ -51,6 +58,28 @@ func (o *Obligation) key() string {
 	return o.RuleID + "\x00" + o.RequirementID + "\x00" + o.Subject
 }
 
+func (o *Obligation) subjectKey() string {
+	return subjectKey(o.RuleID, o.Subject)
+}
+
+func subjectKey(ruleID, subject string) string {
+	return ruleID + "\x00" + subject
+}
+
+// attested reports whether the agent has attested the obligation; it keeps
+// the attestation when its checks later pass and it becomes satisfied.
+func (o *Obligation) attested() bool {
+	return o.Status == ObligationAttested || slices.Contains(o.VerifiedLevels, levelAttest)
+}
+
+// withAttest returns levels plus the attest level.
+func withAttest(levels []string) []string {
+	if slices.Contains(levels, levelAttest) {
+		return levels
+	}
+	return append(slices.Clone(levels), levelAttest)
+}
+
 // CompletenessFinding is one requirement checked against one subject.
 type CompletenessFinding struct {
 	RuleID        string
@@ -60,8 +89,12 @@ type CompletenessFinding struct {
 	Severity      string
 	Describe      string
 	Expected      []string
-	Satisfied     bool
-	Levels        []string
+	// Satisfied means the requirement is met without an attestation.
+	Satisfied bool
+	// ChecksPassed means its checks passed; with an attestation on record,
+	// the requirement is met.
+	ChecksPassed bool
+	Levels       []string
 	// AttestPrompt is set when the requirement needs an attestation.
 	AttestPrompt string
 }
@@ -86,6 +119,33 @@ type RuleInfo struct {
 	Stack     string   `json:"stack,omitempty"`
 	Plannable bool     `json:"plannable,omitempty"`
 	Requires  []string `json:"requires"`
+	// PlanHints are task keywords that suggest planning the rule.
+	PlanHints []string `json:"-"`
+	// PlanVars are the vars a tf_plan item for the rule takes.
+	PlanVars []string `json:"-"`
+}
+
+// PlanItem is one subject the agent expects to create, declared with
+// tf_plan: a plannable rule and the vars that name its file.
+type PlanItem struct {
+	RuleID string            `json:"rule_id"`
+	Vars   map[string]string `json:"vars"`
+}
+
+// PlannedSubject is a plan item resolved against the manifest.
+type PlannedSubject struct {
+	RuleID  string
+	Subject string
+}
+
+// DroppedSubject is a stored obligation's rule and subject that the manifest
+// no longer applies to.
+type DroppedSubject struct {
+	RuleID  string
+	Subject string
+	// Reason says why (the rule left the manifest, its stack is missing, or
+	// the subject no longer fits the rule).
+	Reason string
 }
 
 // Evaluation is the result of checking a session's changes against the
@@ -101,10 +161,25 @@ type Evaluation struct {
 	Findings []CompletenessFinding
 	// Partial means the changed set may be incomplete (no git, only
 	// uncommitted changes readable, or capped), so stored obligations that
-	// weren't found are kept rather than voided.
+	// weren't found are kept rather than voided. Dropped ones are voided
+	// regardless.
 	Partial  bool
 	Warnings []string
+	// Gate is the manifest's completion gate, "" when it sets none.
+	Gate string
+	// Planned are the subjects of the plan items passed to Plan.
+	Planned []PlannedSubject
+	// Dropped are rechecked (rule, subject) pairs the manifest can no longer
+	// apply to: the rule was removed or renamed, its stack is missing, or the
+	// subject is outside the stack root or no longer fits the rule. Their
+	// obligations, planned and inherited ones included, are voided whatever
+	// their status, even in a partial evaluation: dropping is decided by the
+	// manifest, not by the change set.
+	Dropped []DroppedSubject
 }
+
+// ErrInvalidPlan is returned by Plan for items the manifest can't plan.
+var ErrInvalidPlan = errors.New("invalid plan")
 
 // CompletenessEvaluator checks a session's project against its completeness
 // manifest. A nil evaluator turns completeness off.
@@ -112,9 +187,16 @@ type CompletenessEvaluator interface {
 	// BaseSHA returns the commit a new session's changes are measured from.
 	BaseSHA(projectPath string) (string, error)
 	// Evaluate returns nil, nil when the project has no manifest. stored are
-	// the session's obligations: when the changed set is partial, open and
-	// satisfied ones are verified again even if their subject isn't in it.
+	// the session's obligations: planned and inherited ones are verified
+	// again even if their subject isn't in the changed set, and when it is
+	// partial, open, satisfied, and attested ones too. Those the manifest can
+	// no longer apply to are reported in Evaluation.Dropped.
 	Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error)
+	// Plan is Evaluate with the plan items' subjects checked too, whether or
+	// not their files exist yet; their findings include the subject-file
+	// requirement. Items the manifest can't plan return an error wrapping
+	// ErrInvalidPlan. Like Evaluate, it returns nil, nil with no manifest.
+	Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error)
 }
 
 // CompletenessSummary counts obligations by status (void ones aren't counted).
@@ -138,6 +220,10 @@ type ObligationView struct {
 	// Attest is what the agent will be asked to attest, when the
 	// requirement needs an attestation.
 	Attest string `json:"attest,omitempty"`
+	// Evidence is the attestation, or a waiver's rationale.
+	Evidence string `json:"evidence,omitempty"`
+	// FromSession is the session an inherited obligation was copied from.
+	FromSession string `json:"from_session,omitempty"`
 }
 
 // CheckpointCompleteness is what changed since the agent last heard about
@@ -147,18 +233,30 @@ type CheckpointCompleteness struct {
 	NewlyOpen      []ObligationView    `json:"newly_open"`
 	NewlySatisfied []string            `json:"newly_satisfied"`
 	StillOpen      []string            `json:"still_open"`
-	Error          string              `json:"error,omitempty"`
-	Warnings       []string            `json:"warnings,omitempty"`
+	// PlanReminder repeats until the agent plans or declines a suggested
+	// plan.
+	PlanReminder string   `json:"plan_reminder,omitempty"`
+	Error        string   `json:"error,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
 }
 
-// ContractCompleteness is the start contract's completeness section. Phase 1
-// carries the manifest and resolved stacks; open obligations, rules, and
-// plan suggestions come with enforcement.
+// ContractCompleteness is the start contract's completeness section: the
+// definition of done for the project, what the session owes, and how to
+// resolve it.
 type ContractCompleteness struct {
-	Manifest string      `json:"manifest"`
-	Error    string      `json:"error,omitempty"`
-	Stacks   []StackInfo `json:"stacks"`
-	Warnings []string    `json:"warnings,omitempty"`
+	Manifest string              `json:"manifest"`
+	Error    string              `json:"error,omitempty"`
+	Gate     GateMode            `json:"gate"`
+	Stacks   []StackInfo         `json:"stacks"`
+	Rules    []RuleInfo          `json:"rules"`
+	Summary  CompletenessSummary `json:"summary"`
+	Open     []ObligationView    `json:"open"`
+	// Inherited are the obligations a new session took over from the task's
+	// finished one.
+	Inherited     []ObligationView `json:"inherited,omitempty"`
+	SuggestedPlan *SuggestedPlan   `json:"suggested_plan,omitempty"`
+	Protocol      string           `json:"protocol"`
+	Warnings      []string         `json:"warnings,omitempty"`
 }
 
 // CompletenessReport is the full report for tf_completeness.
@@ -186,18 +284,39 @@ type mergeResult struct {
 
 // mergeObligations folds an evaluation's findings into the stored
 // obligations:
-//   - a new key is inserted as open or satisfied;
-//   - waived and attested obligations are left alone (sticky);
+//   - a new key is inserted as open or satisfied, and as planned when its
+//     subject was planned;
+//   - waived obligations are left alone (sticky);
+//   - attested ones are recomputed attested ⇄ satisfied: the attestation
+//     stands, and passing checks complete it;
 //   - other existing ones are recomputed open ⇄ satisfied (a void one that
 //     is found again comes back);
 //   - stored keys that weren't found are voided (e.g. the file was reverted),
-//     unless they were planned or inherited, or the evaluation is partial.
+//     unless they were planned, or the evaluation is partial, or they
+//     originated in this session and were waived or attested. An inherited
+//     obligation that isn't found is voided whatever its status: it is
+//     rechecked only while its file exists, so the work it named is gone;
+//   - stored keys whose (rule, subject) the manifest dropped (ev.Dropped)
+//     are voided whatever their status, planned or not, even when the
+//     evaluation is partial, since the manifest decides that, not the
+//     change set.
 func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, now time.Time) *mergeResult {
 	mr := &mergeResult{newlyOpen: map[string]bool{}, attest: map[string]string{}}
 	byKey := make(map[string]*Obligation, len(stored))
+	dropped := make(map[string]bool, len(ev.Dropped))
+	for _, d := range ev.Dropped {
+		dropped[subjectKey(d.RuleID, d.Subject)] = true
+	}
+	planned := map[string]bool{}
 	for _, o := range stored {
 		byKey[o.key()] = o
 		mr.obligations = append(mr.obligations, o)
+		if o.Planned {
+			planned[o.subjectKey()] = true
+		}
+	}
+	for _, p := range ev.Planned {
+		planned[subjectKey(p.RuleID, p.Subject)] = true
 	}
 
 	found := map[string]bool{}
@@ -227,6 +346,7 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 				Expected:       f.Expected,
 				Status:         status,
 				VerifiedLevels: f.Levels,
+				Planned:        planned[subjectKey(f.RuleID, f.Subject)],
 				FirstSeenAt:    now,
 				UpdatedAt:      now,
 			}
@@ -248,7 +368,27 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 
 		changed := o.Source != f.Source || o.Severity != f.Severity || o.Describe != f.Describe || !slices.Equal(o.Expected, f.Expected)
 		o.Source, o.Severity, o.Describe, o.Expected = f.Source, f.Severity, f.Describe, f.Expected
-		if o.Status != ObligationWaived && o.Status != ObligationAttested {
+		switch {
+		case o.Status == ObligationWaived:
+		case o.attested():
+			levels, next := withAttest(f.Levels), ObligationAttested
+			if f.ChecksPassed {
+				next = ObligationSatisfied
+			}
+			if !slices.Equal(o.VerifiedLevels, levels) {
+				o.VerifiedLevels = levels
+				changed = true
+			}
+			if o.Status != next {
+				o.Status = next
+				changed = true
+				if next == ObligationSatisfied {
+					o.SatisfiedAt = &now
+				} else {
+					o.SatisfiedAt = nil
+				}
+			}
+		default:
 			prev := o.Status
 			if !slices.Equal(o.VerifiedLevels, f.Levels) {
 				o.VerifiedLevels = f.Levels
@@ -274,17 +414,21 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 		}
 	}
 
-	if !ev.Partial {
-		for _, o := range stored {
-			if found[o.key()] || o.Planned || o.InheritedFrom != "" {
+	for _, o := range stored {
+		if o.Status == ObligationVoid || found[o.key()] {
+			continue
+		}
+		if !dropped[o.subjectKey()] {
+			if ev.Partial || o.Planned {
 				continue
 			}
-			if o.Status == ObligationOpen || o.Status == ObligationSatisfied {
-				o.Status = ObligationVoid
-				o.UpdatedAt = now
-				mr.voided = append(mr.voided, o)
+			if o.InheritedFrom == "" && (o.Status == ObligationWaived || o.attested()) {
+				continue
 			}
 		}
+		o.Status = ObligationVoid
+		o.UpdatedAt = now
+		mr.voided = append(mr.voided, o)
 	}
 	return mr
 }
@@ -299,6 +443,9 @@ type completenessState struct {
 	// readErr is set when the stored obligations couldn't be read; the state
 	// then can't say what is owed, and must not claim nothing is.
 	readErr string
+	// unsaved are the IDs of obligations merged in memory but not written
+	// yet (see mergeEvaluation); they aren't known to the store.
+	unsaved map[string]bool
 }
 
 // evaluateCompleteness evaluates sess and, when merge is set and the
@@ -306,8 +453,20 @@ type completenessState struct {
 // when completeness is off for the session (no evaluator or no manifest).
 // Failures are logged and never fail the caller.
 func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge bool) *completenessState {
-	if s.completeness == nil {
+	st, err := s.tryEvaluateCompleteness(ctx, sess, merge)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, err)
 		return nil
+	}
+	return st
+}
+
+// tryEvaluateCompleteness is evaluateCompleteness, returning the evaluator's
+// error rather than logging it, for callers that must not treat a failed
+// evaluation as "completeness is off" (the completion gate).
+func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, merge bool) (*completenessState, error) {
+	if s.completeness == nil {
+		return nil, nil
 	}
 	stored, listErr := s.store.ListObligations(ctx, sess.ID)
 	if listErr != nil {
@@ -315,51 +474,106 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	}
 	ev, err := s.completeness.Evaluate(ctx, sess, stored)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, err)
-		return nil
+		return nil, err
 	}
 	if ev == nil {
-		return nil
+		return nil, nil
 	}
 	if listErr != nil {
-		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}
+		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}, nil
 	}
-	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
-	if ev.Error != "" || !merge {
-		return st
+	if !merge {
+		return &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}, nil
 	}
+	return s.applyEvaluation(ctx, sess, stored, ev), nil
+}
 
-	now := time.Now()
-	mr := mergeObligations(sess.ID, stored, ev, now)
+// applyEvaluation merges ev into the session's stored obligations and writes
+// the result, unless the manifest is invalid. Failed writes are logged and
+// never fail the caller; callers that must know use mergeEvaluation and
+// persistMerge.
+func (s *Service) applyEvaluation(ctx context.Context, sess *Session, stored []*Obligation, ev *Evaluation) *completenessState {
+	st, mr := mergeEvaluation(sess, stored, ev)
+	_ = s.persistMerge(ctx, st, mr)
+	return st
+}
+
+// mergeEvaluation merges ev into the session's stored obligations in memory,
+// writing nothing. The merge to write is nil when the manifest is invalid
+// (stored obligations are then left as they are); persistMerge writes it.
+// Until then, obligations the merge inserted are marked unsaved in the state.
+func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*completenessState, *mergeResult) {
+	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
+	if ev.Error != "" {
+		return st, nil
+	}
+	have := make(map[string]bool, len(stored))
+	for _, o := range stored {
+		have[o.ID] = true
+	}
+	mr := mergeObligations(sess.ID, stored, ev, time.Now())
+	st.obligations = mr.obligations
+	st.newlyOpen = mr.newlyOpen
+	st.newlySatisfied = mr.newlySatisfied
+	st.attest = mr.attest
+	st.unsaved = map[string]bool{}
+	for _, o := range mr.upserts {
+		if !have[o.ID] {
+			st.unsaved[o.ID] = true
+		}
+	}
+	return st, mr
+}
+
+// persistMerge writes a merge from mergeEvaluation: its upserts, then its
+// voids. A failed write is logged and the others still go ahead; the
+// returned error joins every failure, nil when all were written.
+func (s *Service) persistMerge(ctx context.Context, st *completenessState, mr *mergeResult) error {
+	if mr == nil {
+		return nil
+	}
+	var errs []error
 	for _, o := range mr.upserts {
 		id := o.ID
 		if err := s.store.UpsertObligation(ctx, o); err != nil {
 			fmt.Fprintf(os.Stderr, "[session] failed to save obligation %s/%s for %s: %v\n", o.RuleID, o.RequirementID, o.Subject, err)
+			errs = append(errs, fmt.Errorf("obligation %s/%s for %s: %w", o.RuleID, o.RequirementID, o.Subject, err))
 			continue
 		}
 		// Another evaluation (the MCP server and the CLI) inserted the key
 		// first; the upsert kept its ID, so follow it.
 		if o.ID != id {
-			if mr.newlyOpen[id] {
-				delete(mr.newlyOpen, id)
-				mr.newlyOpen[o.ID] = true
+			if st.newlyOpen[id] {
+				delete(st.newlyOpen, id)
+				st.newlyOpen[o.ID] = true
 			}
-			if prompt, ok := mr.attest[id]; ok {
-				delete(mr.attest, id)
-				mr.attest[o.ID] = prompt
+			if prompt, ok := st.attest[id]; ok {
+				delete(st.attest, id)
+				st.attest[o.ID] = prompt
 			}
 		}
 	}
 	for _, o := range mr.voided {
-		if err := s.store.UpdateObligationStatus(ctx, o.ID, ObligationVoid, now); err != nil {
+		if err := s.store.UpdateObligationStatus(ctx, o.ID, ObligationVoid, o.UpdatedAt); err != nil {
 			fmt.Fprintf(os.Stderr, "[session] failed to void obligation %s: %v\n", o.ID, err)
+			errs = append(errs, fmt.Errorf("voiding obligation %s: %w", o.ID, err))
 		}
 	}
-	st.obligations = mr.obligations
-	st.newlyOpen = mr.newlyOpen
-	st.newlySatisfied = mr.newlySatisfied
-	st.attest = mr.attest
-	return st
+	st.unsaved = nil
+	return errors.Join(errs...)
+}
+
+// evaluateUnsaved is tryEvaluateCompleteness merging in memory only: it
+// returns the merge for persistMerge to write once the caller decides to go
+// ahead (Stop, after the completion gate). The merge is nil when there is
+// nothing to write.
+func (s *Service) evaluateUnsaved(ctx context.Context, sess *Session) (*completenessState, *mergeResult, error) {
+	st, err := s.tryEvaluateCompleteness(ctx, sess, false)
+	if st == nil || err != nil || st.readErr != "" {
+		return st, nil, err
+	}
+	merged, mr := mergeEvaluation(sess, st.obligations, st.eval)
+	return merged, mr, nil
 }
 
 // errText is the evaluation's manifest error, or why the obligations
@@ -401,8 +615,27 @@ func (st *completenessState) view(o *Obligation, withStatus bool) ObligationView
 	}
 	if withStatus {
 		v.Status = o.Status
+		v.Evidence = o.Evidence
 	}
 	return v
+}
+
+func (st *completenessState) views(obligations []*Obligation, withStatus bool) []ObligationView {
+	out := []ObligationView{}
+	for _, o := range obligations {
+		out = append(out, st.view(o, withStatus))
+	}
+	return out
+}
+
+// find returns the session's obligation with id, or nil.
+func (st *completenessState) find(id string) *Obligation {
+	for _, o := range st.obligations {
+		if o.ID == id {
+			return o
+		}
+	}
+	return nil
 }
 
 // open returns the open obligations, required ones first.
@@ -416,6 +649,17 @@ func (st *completenessState) open() []*Obligation {
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Severity == "required" && out[j].Severity != "required"
 	})
+	return out
+}
+
+// openRequired returns the open obligations that hold up completion.
+func (st *completenessState) openRequired() []*Obligation {
+	var out []*Obligation
+	for _, o := range st.open() {
+		if o.Severity == "required" {
+			out = append(out, o)
+		}
+	}
 	return out
 }
 
@@ -460,18 +704,35 @@ func (st *completenessState) checkpointView() *CheckpointCompleteness {
 	return cc
 }
 
-func (st *completenessState) contractView() *ContractCompleteness {
+// contractView is the start contract's completeness section. Call it before
+// remind.
+func (st *completenessState) contractView(gate GateMode) *ContractCompleteness {
 	stacks := st.eval.Stacks
 	if stacks == nil {
 		stacks = []StackInfo{}
 	}
+	rules := st.eval.Rules
+	if rules == nil {
+		rules = []RuleInfo{}
+	}
 	return &ContractCompleteness{
 		Manifest: st.eval.Manifest,
-		Error:    st.eval.Error,
+		Error:    st.errText(),
+		Gate:     gate,
 		Stacks:   stacks,
+		Rules:    rules,
+		Summary:  st.summary(),
+		Open:     st.views(st.open(), false),
+		Protocol: completenessProtocol,
 		Warnings: st.eval.Warnings,
 	}
 }
+
+// completenessProtocol tells the agent how obligations are checked and
+// resolved.
+const completenessProtocol = "Taskflow checks these at every tf_checkpoint and before tf_stop. " +
+	"Do the work, or call tf_attest with evidence when it can't be checked from files (e.g. which tests cover it). " +
+	"If a requirement genuinely does not apply, call tf_waive with a rationale; it will be posted to the ClickUp task as a decision."
 
 var statusRank = map[ObligationStatus]int{ObligationOpen: 0, ObligationAttested: 1, ObligationWaived: 2, ObligationSatisfied: 3}
 

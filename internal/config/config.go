@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/b1codes/taskflow/internal/session"
 )
 
 type ClickUpConfig struct {
@@ -22,7 +23,10 @@ type StatusMapConfig struct {
 	// ClickUp; empty falls back to Start.
 	Reopen   string `toml:"reopen"`
 	Complete string `toml:"complete"`
-	Archive  string `toml:"archive"`
+	// Review is used when a session completes with required completeness
+	// obligations open under the review gate.
+	Review  string `toml:"review"`
+	Archive string `toml:"archive"`
 }
 
 type GitConfig struct {
@@ -35,15 +39,36 @@ type SyncConfig struct {
 	DrainTimeoutS int `toml:"drain_timeout_s"`
 }
 
+// CompletenessConfig configures completeness enforcement for projects with a
+// completeness manifest.
+type CompletenessConfig struct {
+	// Gate decides what stopping a session as completed does while required
+	// obligations are open: report, review, or block. It is a floor: a
+	// manifest's gate can make it stricter, never looser.
+	Gate string `toml:"gate"`
+}
+
+// GateMode parses Gate with session.ParseGateMode, the one check of gate
+// names, so a typo is an error rather than a gate that fails open. "" is the
+// default gate.
+func (c CompletenessConfig) GateMode() (session.GateMode, error) {
+	g, err := session.ParseGateMode(c.Gate)
+	if err != nil {
+		return "", fmt.Errorf("invalid config: completeness.gate: %w", err)
+	}
+	return g, nil
+}
+
 type DatabaseConfig struct {
 	Path string `toml:"path"`
 }
 
 type Config struct {
-	ClickUp  ClickUpConfig  `toml:"clickup"`
-	Git      GitConfig      `toml:"git"`
-	Sync     SyncConfig     `toml:"sync"`
-	Database DatabaseConfig `toml:"database"`
+	ClickUp      ClickUpConfig      `toml:"clickup"`
+	Git          GitConfig          `toml:"git"`
+	Sync         SyncConfig         `toml:"sync"`
+	Completeness CompletenessConfig `toml:"completeness"`
+	Database     DatabaseConfig     `toml:"database"`
 }
 
 // DefaultConfigContent is the default configuration content.
@@ -52,7 +77,8 @@ api_key = ""
 
 # Optional: pin session lifecycle events to status names on your lists.
 # Unset roles use defaults: start = the "custom" status named like
-# "in progress", complete = first "done" (else "closed"), archive = first
+# "in progress", complete = first "done" (else "closed"), review = the
+# "custom" status named like "in review" (else unchanged), archive = first
 # "closed" named like "cancelled" (else unchanged). Reopening a finished task
 # uses reopen, else start. Taskflow never moves a task back from a status
 # someone else chose.
@@ -60,6 +86,7 @@ api_key = ""
 # start = "in progress"
 # reopen = "in progress"
 # complete = "complete"
+# review = "in review"
 # archive = "cancelled"
 
 [git]
@@ -69,6 +96,16 @@ auto_context = true
 max_retries = 5
 rate_limit_ms = 600
 drain_timeout_s = 5
+
+# Completion gate for projects with a completeness manifest, when a session
+# is stopped as completed with required obligations open:
+#   report = complete as usual; the stop comment lists what's open
+#   review = complete locally, move the ClickUp task to review (default)
+#   block  = refuse to complete until the work is done, attested, or waived
+# This is a floor: a project manifest's "gate:" can make it stricter, never
+# looser, so an agent can't lower it by editing the repo.
+[completeness]
+gate = "review"
 
 [database]
 path = "~/.taskflow/sessions.db"
@@ -145,6 +182,9 @@ func LoadFrom(configPath string) (*Config, error) {
 			RateLimitMS:   600,
 			DrainTimeoutS: 5,
 		},
+		Completeness: CompletenessConfig{
+			Gate: string(session.DefaultGate),
+		},
 		Database: DatabaseConfig{
 			Path: "~/.taskflow/sessions.db",
 		},
@@ -159,6 +199,12 @@ func LoadFrom(configPath string) (*Config, error) {
 			return nil, fmt.Errorf("failed to decode config TOML: %w", err)
 		}
 	}
+
+	gate, err := cfg.Completeness.GateMode()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Completeness.Gate = string(gate)
 
 	if apiKey := os.Getenv("CLICKUP_API_KEY"); apiKey != "" {
 		cfg.ClickUp.APIKey = apiKey

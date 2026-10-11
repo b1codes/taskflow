@@ -16,10 +16,25 @@ type Session struct {
 	GitBranch   string `json:"git_branch"`
 	// BaseSHA is the commit the session's changes are measured from, set
 	// when the session is created and kept on resume.
-	BaseSHA   string    `json:"base_sha,omitempty"`
+	BaseSHA string `json:"base_sha,omitempty"`
+	// PlanState tracks the session's up-front completeness plan.
+	PlanState PlanState `json:"plan_state,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// PlanState is where a session stands on declaring its expected work up
+// front with tf_plan.
+type PlanState string
+
+const (
+	PlanNone PlanState = "none"
+	// PlanSuggested means the start contract suggested a plan; checkpoints
+	// remind the agent until it plans or declines.
+	PlanSuggested PlanState = "suggested"
+	PlanPlanned   PlanState = "planned"
+	PlanDeclined  PlanState = "declined"
+)
 
 type Checkpoint struct {
 	ID        string    `json:"id"`

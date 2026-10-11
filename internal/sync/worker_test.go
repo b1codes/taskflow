@@ -698,6 +698,8 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 		{"legacy closed payload from an archived session maps to archive", SyncPayload{StatusType: "closed"}, config.StatusMapConfig{}, session.StatusArchived, "cancelled"},
 		{"status_map override", SyncPayload{Role: "start"}, config.StatusMapConfig{Start: "testing/qa"}, "", "testing/qa"},
 		{"status_map reopen override", SyncPayload{Role: "reopen"}, config.StatusMapConfig{Start: "in progress", Reopen: "testing/qa"}, "", "testing/qa"},
+		{"review", SyncPayload{Role: "review"}, config.StatusMapConfig{}, "", "in review"},
+		{"status_map review override", SyncPayload{Role: "review"}, config.StatusMapConfig{Review: "testing/qa"}, "", "testing/qa"},
 	}
 
 	for i, tt := range tests {
@@ -788,7 +790,7 @@ func TestWorker_UpdateStatus_PermanentFailures(t *testing.T) {
 		},
 		{
 			name:     "unknown role",
-			payload:  SyncPayload{Role: "review"},
+			payload:  SyncPayload{Role: "deploy"},
 			statuses: workerTestStatuses,
 		},
 		{
