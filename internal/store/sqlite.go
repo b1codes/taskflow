@@ -899,6 +899,16 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 	return ops, nil
 }
 
+func (s *SQLiteStore) HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error) {
+	query := `SELECT EXISTS (SELECT 1 FROM sync_queue WHERE task_id = ? AND operation = ? AND id > ?
+	AND (status IN ('PENDING', 'IN_FLIGHT') OR (status = 'FAILED' AND retries < max_retries)))`
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, query, op.TaskID, op.Operation, op.ID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check for newer sync items: %w", err)
+	}
+	return exists, nil
+}
+
 func (s *SQLiteStore) RequeueRateLimited(ctx context.Context, id int64, errMsg string) error {
 	query := `UPDATE sync_queue SET status = 'PENDING', error_msg = ?, last_attempted_at = ? WHERE id = ?`
 	_, err := s.db.ExecContext(ctx, query, errMsg, time.Now(), id)

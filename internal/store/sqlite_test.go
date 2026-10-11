@@ -1150,3 +1150,64 @@ func TestReplaceListStatuses(t *testing.T) {
 		t.Fatalf("expected the previous 2 statuses after a failed replace, got %d", len(got))
 	}
 }
+
+func TestHasNewerOp(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	enqueue := func(operation, taskID string) *session.SyncOp {
+		t.Helper()
+		op := session.SyncOp{Operation: operation, TaskID: taskID, Payload: `{}`, MaxRetries: 3, CreatedAt: time.Now()}
+		if err := st.EnqueueSync(ctx, op); err != nil {
+			t.Fatalf("EnqueueSync failed: %v", err)
+		}
+		var id int64
+		if err := st.db.QueryRowContext(ctx, "SELECT MAX(id) FROM sync_queue").Scan(&id); err != nil {
+			t.Fatalf("reading op id: %v", err)
+		}
+		op.ID = id
+		return &op
+	}
+	hasNewer := func(op *session.SyncOp) bool {
+		t.Helper()
+		got, err := st.HasNewerOp(ctx, op)
+		if err != nil {
+			t.Fatalf("HasNewerOp failed: %v", err)
+		}
+		return got
+	}
+
+	older := enqueue(session.OpSyncChecklist, "task-a")
+	enqueue("POST_COMMENT", "task-a")
+	enqueue(session.OpSyncChecklist, "task-b")
+	if hasNewer(older) {
+		t.Error("only a later op of the same operation for the same task counts")
+	}
+
+	newer := enqueue(session.OpSyncChecklist, "task-a")
+	if !hasNewer(older) {
+		t.Error("a pending newer op must be found")
+	}
+	if hasNewer(newer) {
+		t.Error("the newest op has nothing newer")
+	}
+
+	if err := st.MarkFailed(ctx, newer.ID, "network error"); err != nil {
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+	if !hasNewer(older) {
+		t.Error("a newer op that will be retried still counts")
+	}
+	if err := st.MarkFailedPermanent(ctx, newer.ID, "rejected"); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+	if hasNewer(older) {
+		t.Error("a newer op that will never run must not hold back an older one")
+	}
+}

@@ -280,6 +280,9 @@ type mergeResult struct {
 	newlyOpen      map[string]bool
 	newlySatisfied []*Obligation
 	attest         map[string]string // obligation ID → attest prompt
+	// checklistChanged is set by mergeEvaluation when the merge changes the
+	// session's Definition of Done checklist.
+	checklistChanged bool
 }
 
 // mergeObligations folds an evaluation's findings into the stored
@@ -494,7 +497,7 @@ func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, me
 // persistMerge.
 func (s *Service) applyEvaluation(ctx context.Context, sess *Session, stored []*Obligation, ev *Evaluation) *completenessState {
 	st, mr := mergeEvaluation(sess, stored, ev)
-	_ = s.persistMerge(ctx, st, mr)
+	_ = s.persistMerge(ctx, sess, st, mr)
 	return st
 }
 
@@ -511,7 +514,10 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 	for _, o := range stored {
 		have[o.ID] = true
 	}
+	// mergeObligations updates stored in place, so take the checklist first.
+	before := checklistItems(stored)
 	mr := mergeObligations(sess.ID, stored, ev, time.Now())
+	mr.checklistChanged = !slices.Equal(before, checklistItems(mr.obligations))
 	st.obligations = mr.obligations
 	st.newlyOpen = mr.newlyOpen
 	st.newlySatisfied = mr.newlySatisfied
@@ -527,8 +533,11 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 
 // persistMerge writes a merge from mergeEvaluation: its upserts, then its
 // voids. A failed write is logged and the others still go ahead; the
-// returned error joins every failure, nil when all were written.
-func (s *Service) persistMerge(ctx context.Context, st *completenessState, mr *mergeResult) error {
+// returned error joins every failure, nil when all were written. When every
+// write succeeds and the merge changed the checklist, the new checklist is
+// queued for ClickUp. After a failure it isn't: the stored obligations still
+// differ from the merge, so the next evaluation finds the change again.
+func (s *Service) persistMerge(ctx context.Context, sess *Session, st *completenessState, mr *mergeResult) error {
 	if mr == nil {
 		return nil
 	}
@@ -560,6 +569,9 @@ func (s *Service) persistMerge(ctx context.Context, st *completenessState, mr *m
 		}
 	}
 	st.unsaved = nil
+	if len(errs) == 0 && mr.checklistChanged {
+		s.enqueueChecklist(ctx, sess, st.obligations)
+	}
 	return errors.Join(errs...)
 }
 

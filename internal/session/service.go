@@ -746,7 +746,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	// The stop goes ahead: record its evaluation. An obligation another
 	// writer inserted first keeps the stored ID, so list the gate's open
 	// obligations again by the IDs written.
-	_ = s.persistMerge(ctx, st, pending)
+	_ = s.persistMerge(ctx, sess, st, pending)
 	if g := res.Gate; g != nil && g.Unchecked == "" && len(g.OpenRequired) > 0 {
 		g.OpenRequired = st.views(st.openRequired(), false)
 	}

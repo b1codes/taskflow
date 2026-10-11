@@ -192,6 +192,8 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 		}
 	case "UPDATE_STATUS":
 		opErr = w.updateStatus(ctx, op.TaskID, payload)
+	case session.OpSyncChecklist:
+		opErr = w.syncChecklist(ctx, op)
 	default:
 		opErr = fmt.Errorf("%w: %s", errUnknownOperation, op.Operation)
 	}
@@ -223,6 +225,10 @@ var (
 	// errCommentRejected is a 400 to posting the op's comment: the same
 	// comment would be rejected again.
 	errCommentRejected = errors.New("comment rejected")
+	// errChecklistRejected is a 400 to one of a SYNC_CHECKLIST op's writes
+	// (creating the checklist, or creating or updating an item).
+	errChecklistRejected = errors.New("checklist change rejected")
+	errInvalidPayload    = errors.New("invalid payload")
 )
 
 // isPermanent reports whether an op error will recur on every retry, so the op
@@ -234,6 +240,8 @@ func isPermanent(err error) bool {
 		errors.Is(err, clickup.ErrUnknownStatusRole) ||
 		errors.Is(err, clickup.ErrNoMatchingStatus) ||
 		errors.Is(err, errCommentRejected) ||
+		errors.Is(err, errChecklistRejected) ||
+		errors.Is(err, errInvalidPayload) ||
 		// ApplyStatusRole already refreshed the status cache and retried.
 		errors.Is(err, clickup.ErrStatusRejected)
 }
@@ -264,4 +272,116 @@ func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPa
 func (w *Worker) latestSessionCompleted(ctx context.Context, taskID string) bool {
 	sess, err := w.store.GetSessionByTaskID(ctx, taskID)
 	return err == nil && sess != nil && sess.Status == session.StatusCompleted
+}
+
+// syncChecklist reconciles the task's Definition of Done checklist with the
+// op's payload, the checklist's full desired state: it finds the checklist by
+// name (creating it if missing), creates missing items, and renames or
+// (un)resolves items that differ. Items are never deleted, and void items
+// are only renamed, never created. The op is skipped when a newer one for
+// the task will apply a later state anyway.
+func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
+	var p session.ChecklistPayload
+	if err := json.Unmarshal([]byte(op.Payload), &p); err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPayload, err)
+	}
+	newer, err := w.store.HasNewerOp(ctx, op)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] couldn't check for a newer checklist op than %d: %v\n", op.ID, err)
+	}
+	if newer {
+		return nil
+	}
+
+	checklists, err := w.clickup.GetTaskChecklists(ctx, op.TaskID)
+	if err != nil {
+		return fmt.Errorf("fetching checklists: %w", err)
+	}
+	var cl *clickup.Checklist
+	for i := range checklists {
+		if checklists[i].Name == p.ChecklistName {
+			cl = &checklists[i]
+			break
+		}
+	}
+	if cl == nil {
+		if cl, err = w.clickup.CreateChecklist(ctx, op.TaskID, p.ChecklistName); err != nil {
+			return checklistWriteError("creating checklist", err)
+		}
+	}
+
+	matched := matchChecklistItems(cl.Items, p.Items)
+	for i, it := range p.Items {
+		ex, ok := matched[i]
+		if !ok {
+			if it.Void {
+				continue
+			}
+			known := map[string]bool{}
+			for _, ci := range cl.Items {
+				known[ci.ID] = true
+			}
+			updated, err := w.clickup.CreateChecklistItem(ctx, cl.ID, it.Name)
+			if err != nil {
+				return checklistWriteError(fmt.Sprintf("creating checklist item %q", it.Name), err)
+			}
+			if len(updated.Items) > 0 {
+				cl.Items = updated.Items
+			}
+			if !it.Resolved {
+				continue
+			}
+			// New items start unresolved; find this one to resolve it.
+			for _, ci := range cl.Items {
+				if !known[ci.ID] && ci.Name == it.Name {
+					ex, ok = ci, true
+					break
+				}
+			}
+			if !ok {
+				// A retry finds the item by name and resolves it.
+				return fmt.Errorf("created checklist item %q is missing from ClickUp's response", it.Name)
+			}
+		}
+		if ex.Name != it.Name || ex.Resolved != it.Resolved {
+			if err := w.clickup.UpdateChecklistItem(ctx, cl.ID, ex.ID, it.Name, it.Resolved); err != nil {
+				return checklistWriteError(fmt.Sprintf("updating checklist item %q", it.Name), err)
+			}
+		}
+	}
+	return nil
+}
+
+// matchChecklistItems pairs each wanted item with an existing ClickUp item,
+// each existing item used at most once: first by exact name, then by the
+// wanted item's stable part (session.ChecklistItemMatches), so an item whose
+// status text changed is updated rather than duplicated.
+func matchChecklistItems(existing []clickup.ChecklistItem, want []session.ChecklistItem) map[int]clickup.ChecklistItem {
+	matched := map[int]clickup.ChecklistItem{}
+	used := map[string]bool{}
+	pass := func(match func(name string, it session.ChecklistItem) bool) {
+		for i, it := range want {
+			if _, ok := matched[i]; ok {
+				continue
+			}
+			for _, ci := range existing {
+				if !used[ci.ID] && match(ci.Name, it) {
+					matched[i], used[ci.ID] = ci, true
+					break
+				}
+			}
+		}
+	}
+	pass(func(name string, it session.ChecklistItem) bool { return name == it.Name })
+	pass(func(name string, it session.ChecklistItem) bool { return session.ChecklistItemMatches(name, it.Match) })
+	return matched
+}
+
+// checklistWriteError wraps a failed checklist write; a 400 is permanent,
+// since the same write would be rejected again.
+func checklistWriteError(what string, err error) error {
+	if errors.Is(err, clickup.ErrBadRequest) {
+		return fmt.Errorf("%w: %s: %w", errChecklistRejected, what, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }

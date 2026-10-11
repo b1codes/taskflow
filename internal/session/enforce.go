@@ -333,7 +333,9 @@ func (s *Service) Waive(ctx context.Context, sessionID, obligationID, rationale 
 	if err := s.store.WaiveObligation(ctx, o.ID, d.ID, rationale, time.Now()); err != nil {
 		return nil, fmt.Errorf("failed to waive obligation: %w", err)
 	}
+	before := checklistItem(o)
 	o.Status, o.WaiverDecisionID, o.Evidence = ObligationWaived, d.ID, rationale
+	s.syncChecklistItem(ctx, sess, st, before, o)
 	res := s.obligationResult(ctx, st, o)
 	res.DecisionID = d.ID
 	return res, nil
@@ -411,13 +413,24 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if err := s.store.AttestObligation(ctx, o.ID, evidence, levels, status, now); err != nil {
 		return nil, fmt.Errorf("failed to attest obligation: %w", err)
 	}
+	before := checklistItem(o)
 	o.Status, o.Evidence, o.VerifiedLevels, o.UpdatedAt = status, evidence, levels, now
 	o.WaiverDecisionID = "" // an attestation takes back a waiver
 	o.SatisfiedAt = nil
 	if status == ObligationSatisfied {
 		o.SatisfiedAt = &now
 	}
+	s.syncChecklistItem(ctx, sess, st, before, o)
 	return s.obligationResult(ctx, st, o), nil
+}
+
+// syncChecklistItem queues the session's checklist when o's item changed
+// from before (e.g. it is now waived or attested). Evidence isn't part of the
+// item, so replacing an attestation's evidence pushes nothing.
+func (s *Service) syncChecklistItem(ctx context.Context, sess *Session, st *completenessState, before ChecklistItem, o *Obligation) {
+	if checklistItem(o) != before {
+		s.enqueueChecklist(ctx, sess, st.obligations)
+	}
 }
 
 // finding returns the evaluation's finding for o, or nil when o wasn't
@@ -567,8 +580,11 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	}
 	// The plan is only recorded once all of its obligations are: a plan
 	// state with obligations missing would claim work is tracked that isn't.
+	// The checklist is pushed whether or not the plan changed it, so it shows
+	// the planned work as soon as the plan is made.
 	st, mr := mergeEvaluation(sess, stored, ev)
-	if err := s.persistMerge(ctx, st, mr); err != nil {
+	mr.checklistChanged = true
+	if err := s.persistMerge(ctx, sess, st, mr); err != nil {
 		return nil, fmt.Errorf("failed to save the plan's obligations, so the plan wasn't recorded; call tf_plan again: %w", err)
 	}
 	if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanPlanned); err != nil {

@@ -380,6 +380,33 @@ func TestCompleteness_EndToEnd_PlanWaiveStop(t *testing.T) {
 	if roles := ops["UPDATE_STATUS"]; len(roles) != 2 || !strings.Contains(roles[1], `"complete"`) {
 		t.Errorf("status ops = %v", roles)
 	}
+	// The last checklist sync holds the definition of done as it stands:
+	// every item resolved, each showing how.
+	cls := ops[session.OpSyncChecklist]
+	if len(cls) == 0 {
+		t.Fatal("no checklist sync was queued")
+	}
+	var checklist session.ChecklistPayload
+	if err := json.Unmarshal([]byte(cls[len(cls)-1]), &checklist); err != nil {
+		t.Fatalf("checklist payload: %v", err)
+	}
+	var names []string
+	for _, it := range checklist.Items {
+		if !it.Resolved {
+			t.Errorf("item %q is unresolved", it.Name)
+		}
+		names = append(names, it.Name)
+	}
+	slices.Sort(names)
+	if want := []string{
+		"[story] Storybook stories for CheckoutPage — structural ✓",
+		"[subject-file] New screen: CheckoutPage.tsx — structural ✓",
+		"[suite] Full web test suite passes — attested",
+		"[unit-test] Component test for CheckoutPage — waived",
+	}; checklist.ChecklistName != session.ChecklistName || !slices.Equal(names, want) {
+		t.Errorf("checklist %q = %q, want %q", checklist.ChecklistName, names, want)
+	}
+
 	finished := ops["POST_COMMENT"][len(ops["POST_COMMENT"])-1]
 	for _, want := range []string{
 		"### Completeness (4/4)",
