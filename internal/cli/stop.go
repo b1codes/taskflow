@@ -44,7 +44,7 @@ var stopCmd = &cobra.Command{
 		}
 
 		res, err := srv.Stop(cmd.Context(), sessionID, stopSummary, targetStatus, cfg.Git.AutoContext, stopForce)
-		if errors.Is(err, session.ErrIncompleteSession) {
+		if errors.Is(err, session.ErrIncompleteSession) || errors.Is(err, session.ErrCompletenessUnchecked) {
 			return fmt.Errorf("%w\nA human can complete it anyway with --force (recorded as a decision on the task)", err)
 		}
 		if err != nil {
@@ -69,7 +69,11 @@ var stopCmd = &cobra.Command{
 			case session.GateMovedToReview:
 				fmt.Printf("  ! %d required obligation(s) open: the ClickUp task goes to review instead of complete\n", len(g.OpenRequired))
 			case session.GateForced:
-				fmt.Printf("  ! Completion forced with %d required obligation(s) open (decision %s)\n", len(g.OpenRequired), g.DecisionID)
+				if g.Unchecked != "" {
+					fmt.Printf("  ! Completion forced without a completeness check: %s (decision %s)\n", g.Unchecked, g.DecisionID)
+				} else {
+					fmt.Printf("  ! Completion forced with %d required obligation(s) open (decision %s)\n", len(g.OpenRequired), g.DecisionID)
+				}
 			default:
 				fmt.Printf("  ! Completed with %d required obligation(s) open\n", len(g.OpenRequired))
 			}

@@ -594,3 +594,117 @@ func TestService_InheritOnRestart(t *testing.T) {
 		t.Errorf("source obligation changed: %+v", o)
 	}
 }
+
+// TestService_GateFailsClosed: under block, a stop that can't check
+// completeness must not complete, since nothing shows the work is done.
+func TestService_GateFailsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	// unreadable starts a session whose obligations can't be read at stop.
+	unreadable := func(t *testing.T, ev *Evaluation, gate GateMode) (*Service, *mockStore, string) {
+		t.Helper()
+		store := newMockStore()
+		failing := false
+		hook := &listHook{mockStore: store, list: func(id string) ([]*Obligation, error) {
+			if failing {
+				return nil, errors.New("database is locked")
+			}
+			return store.ListObligations(context.Background(), id)
+		}}
+		srv := NewService(hook, &mockGit{ctx: &GitContext{}}, nil).WithCompleteness(&fakeEvaluator{eval: ev}).WithGate(gate)
+		res, err := srv.Start(ctx, "task-1", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		failing = true
+		return srv, store, res.Session.ID
+	}
+
+	t.Run("unreadable obligations block", func(t *testing.T) {
+		srv, store, sid := unreadable(t, screenEval(), GateBlock)
+		opsBefore := len(store.syncOps)
+		res, err := srv.Stop(ctx, sid, "done", "COMPLETED", false, false)
+		if res != nil || !errors.Is(err, ErrCompletenessUnchecked) || !strings.Contains(err.Error(), "database is locked") {
+			t.Fatalf("Stop = %+v, %v; want ErrCompletenessUnchecked", res, err)
+		}
+		if store.sessions[sid].Status != StatusActive || len(store.syncOps) != opsBefore {
+			t.Errorf("a refused stop changed the session: status=%s ops=%v", store.sessions[sid].Status, store.ops())
+		}
+	})
+
+	t.Run("the manifest's block gate holds with unreadable obligations", func(t *testing.T) {
+		ev := screenEval()
+		ev.Gate = "block"
+		srv, _, sid := unreadable(t, ev, GateReview)
+		if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrCompletenessUnchecked) {
+			t.Errorf("Stop = %v; want ErrCompletenessUnchecked", err)
+		}
+	})
+
+	t.Run("a human can force it, recorded as a decision", func(t *testing.T) {
+		srv, store, sid := unreadable(t, screenEval(), GateBlock)
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, true)
+		if err != nil || res.Gate.Outcome != GateForced || !strings.Contains(res.Gate.Unchecked, "database is locked") {
+			t.Fatalf("forced Stop = %+v, %v", res, err)
+		}
+		ds := store.decisionsFor(sid)
+		if len(ds) != 1 || ds[0].ID != res.Gate.DecisionID || ds[0].Decision != "Completion forced by human without a completeness check" {
+			t.Errorf("decision = %+v", ds)
+		}
+		comments := store.comments(t)
+		if c := comments[len(comments)-1]; !strings.Contains(c, "**Completion gate (block):** completion forced by human; completeness couldn't be checked: stored obligations couldn't be read") {
+			t.Errorf("finished comment = %q", c)
+		}
+	})
+
+	t.Run("other gates still complete with unreadable obligations", func(t *testing.T) {
+		srv, store, sid := unreadable(t, screenEval(), GateReview)
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
+		if err != nil || res.Gate.Mode != GateReport || store.sessions[sid].Status != StatusCompleted {
+			t.Errorf("Stop = %+v, %v", res, err)
+		}
+	})
+
+	// failing starts a session whose evaluation fails at stop.
+	failing := func(t *testing.T, gate GateMode) (*Service, *mockStore, string) {
+		t.Helper()
+		ev := &fakeEvaluator{eval: screenEval()}
+		srv, store, dir := newCompletenessService(t, ev)
+		srv.WithGate(gate)
+		res, err := srv.Start(ctx, "task-1", dir, false)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		ev.err = errors.New("permission denied")
+		return srv, store, res.Session.ID
+	}
+
+	t.Run("a failed evaluation blocks under the configured block gate", func(t *testing.T) {
+		srv, store, sid := failing(t, GateBlock)
+		if _, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false); !errors.Is(err, ErrCompletenessUnchecked) || !strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("Stop = %v; want ErrCompletenessUnchecked", err)
+		}
+		if store.sessions[sid].Status != StatusActive {
+			t.Errorf("status = %s", store.sessions[sid].Status)
+		}
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, true)
+		if err != nil || res.Gate.Outcome != GateForced || len(store.decisionsFor(sid)) != 1 {
+			t.Errorf("forced Stop = %+v, %v", res, err)
+		}
+	})
+
+	t.Run("a failed evaluation doesn't gate otherwise", func(t *testing.T) {
+		srv, store, sid := failing(t, GateReview)
+		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)
+		if err != nil || res.Gate != nil || store.sessions[sid].Status != StatusCompleted {
+			t.Errorf("Stop = %+v, %v", res, err)
+		}
+	})
+
+	t.Run("pausing is never gated", func(t *testing.T) {
+		srv, _, sid := failing(t, GateBlock)
+		if _, err := srv.Stop(ctx, sid, "", "PAUSED", false, false); err != nil {
+			t.Errorf("pause = %v", err)
+		}
+	})
+}

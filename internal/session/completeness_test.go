@@ -18,6 +18,8 @@ type fakeEvaluator struct {
 	// plan resolves a plan item to its subject and the findings for it;
 	// nil rejects every item.
 	plan func(item PlanItem) (PlannedSubject, []CompletenessFinding, error)
+	// err fails every evaluation.
+	err error
 }
 
 func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
@@ -26,6 +28,9 @@ func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
 
 func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error) {
 	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	if f.eval == nil {
 		return nil, nil
 	}

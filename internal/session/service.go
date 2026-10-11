@@ -684,8 +684,12 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	// A finished session's obligations are final; only evaluate work that
 	// was still in progress.
 	var st *completenessState
+	var evalErr error
 	if sess.Status == StatusActive || sess.Status == StatusPaused {
-		st = s.evaluateCompleteness(ctx, sess, true)
+		st, evalErr = s.tryEvaluateCompleteness(ctx, sess, true)
+		if evalErr != nil {
+			fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, evalErr)
+		}
 	}
 
 	fromStatus := sess.Status
@@ -693,8 +697,18 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	res := &StopResult{SessionID: sessionID, Status: tStatus}
 	// The gate runs before anything is written, so a blocked stop leaves the
 	// session as it was.
-	if st != nil && tStatus == StatusCompleted {
-		gate, gateRole, err := s.applyGate(ctx, sess, st, force)
+	if tStatus == StatusCompleted {
+		var gate *GateResult
+		var gateRole StatusRole
+		var err error
+		switch {
+		case st != nil:
+			gate, gateRole, err = s.applyGate(ctx, sess, st, force)
+		case evalErr != nil && s.configuredGate() == GateBlock:
+			// The manifest (and any gate it sets) couldn't be read, so the
+			// configured gate decides, and block fails closed.
+			gate, gateRole, err = s.blockUnchecked(ctx, sess, "evaluation failed: "+evalErr.Error(), force)
+		}
 		if err != nil {
 			return nil, err
 		}

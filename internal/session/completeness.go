@@ -416,8 +416,20 @@ type completenessState struct {
 // when completeness is off for the session (no evaluator or no manifest).
 // Failures are logged and never fail the caller.
 func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge bool) *completenessState {
-	if s.completeness == nil {
+	st, err := s.tryEvaluateCompleteness(ctx, sess, merge)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, err)
 		return nil
+	}
+	return st
+}
+
+// tryEvaluateCompleteness is evaluateCompleteness, returning the evaluator's
+// error rather than logging it, for callers that must not treat a failed
+// evaluation as "completeness is off" (the block gate).
+func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, merge bool) (*completenessState, error) {
+	if s.completeness == nil {
+		return nil, nil
 	}
 	stored, listErr := s.store.ListObligations(ctx, sess.ID)
 	if listErr != nil {
@@ -425,19 +437,18 @@ func (s *Service) evaluateCompleteness(ctx context.Context, sess *Session, merge
 	}
 	ev, err := s.completeness.Evaluate(ctx, sess, stored)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, err)
-		return nil
+		return nil, err
 	}
 	if ev == nil {
-		return nil
+		return nil, nil
 	}
 	if listErr != nil {
-		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}
+		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}, nil
 	}
 	if !merge {
-		return &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
+		return &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}, nil
 	}
-	return s.applyEvaluation(ctx, sess, stored, ev)
+	return s.applyEvaluation(ctx, sess, stored, ev), nil
 }
 
 // applyEvaluation merges ev into the session's stored obligations and writes
