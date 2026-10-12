@@ -828,6 +828,18 @@ func (s *SQLiteStore) ReplaceListStatuses(ctx context.Context, listID string, en
 }
 
 // Sync Queue
+
+// retryableSyncOp matches failed ops with retries left.
+const retryableSyncOp = `(status = 'FAILED' AND retries < max_retries)`
+
+// waitingSyncOp matches ops waiting to run: pending, or failed with retries
+// left. An op that isn't waiting is in flight or finished (finished_at set).
+const waitingSyncOp = `(status = 'PENDING' OR ` + retryableSyncOp + `)`
+
+// MaxSyncHistory is how many applied checklist ops sync_history keeps per
+// task: the most the worker reads to match items.
+const MaxSyncHistory = 50
+
 func (s *SQLiteStore) CoalesceSyncOp(ctx context.Context, op session.SyncOp) error {
 	// One statement, so the worker can't claim the op between finding it and
 	// replacing its payload: a claimed op is IN_FLIGHT and no longer matches.
@@ -835,7 +847,7 @@ func (s *SQLiteStore) CoalesceSyncOp(ctx context.Context, op session.SyncOp) err
 	// so it still runs after the ops queued before this state (a decision's
 	// comment before the checklist showing the waiver).
 	query := `UPDATE sync_queue SET payload = ?, created_at = ? WHERE id = (SELECT MAX(id) FROM sync_queue WHERE task_id = ? AND operation = ?)
-	AND (status = 'PENDING' OR (status = 'FAILED' AND retries < max_retries))`
+	AND ` + waitingSyncOp
 	res, err := s.db.ExecContext(ctx, query, op.Payload, op.CreatedAt, op.TaskID, op.Operation)
 	if err != nil {
 		return fmt.Errorf("failed to coalesce sync operation: %w", err)
@@ -867,7 +879,7 @@ func (s *SQLiteStore) DequeuePending(ctx context.Context, limit int) ([]*session
 }
 
 func (s *SQLiteStore) MarkInFlight(ctx context.Context, id int64) (*session.SyncOp, error) {
-	query := `UPDATE sync_queue SET status = 'IN_FLIGHT', last_attempted_at = ? WHERE id = ? AND (status = 'PENDING' OR (status = 'FAILED' AND retries < max_retries))
+	query := `UPDATE sync_queue SET status = 'IN_FLIGHT', last_attempted_at = ? WHERE id = ? AND ` + waitingSyncOp + `
 	RETURNING ` + syncOpColumns
 	rows, err := s.db.QueryContext(ctx, query, time.Now(), id)
 	if err != nil {
@@ -882,26 +894,56 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, id int64) (*session.Sync
 }
 
 func (s *SQLiteStore) MarkDone(ctx context.Context, id int64, note string) error {
-	query := `UPDATE sync_queue SET status = 'DONE', error_msg = COALESCE(NULLIF(?, ''), error_msg) WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, note, id)
-	if err != nil {
+	if err := s.markApplied(ctx, id, `status = 'DONE', error_msg = COALESCE(NULLIF(?, ''), error_msg)`, note); err != nil {
 		return fmt.Errorf("failed to mark sync item done: %w", err)
 	}
 	return nil
 }
 
 func (s *SQLiteStore) MarkPartial(ctx context.Context, id int64, note string) error {
-	query := `UPDATE sync_queue SET status = 'PARTIAL', error_msg = ? WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, note, id)
-	if err != nil {
+	if err := s.markApplied(ctx, id, `status = 'PARTIAL', error_msg = ?`, note); err != nil {
 		return fmt.Errorf("failed to mark sync item partial: %w", err)
 	}
 	return nil
 }
 
+// markApplied finishes the op with set (an assignment list taking note) and,
+// for a checklist op, records it in sync_history in the same transaction,
+// trimming the task's history to its newest MaxSyncHistory ops.
+func (s *SQLiteStore) markApplied(ctx context.Context, id int64, set, note string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	query := `UPDATE sync_queue SET ` + set + `, finished_at = ? WHERE id = ?
+	RETURNING task_id, operation, payload, status, created_at`
+	var taskID, operation, payload, status string
+	var createdAt time.Time
+	err = tx.QueryRowContext(ctx, query, note, time.Now().Unix(), id).Scan(&taskID, &operation, &payload, &status, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if operation == session.OpSyncChecklist {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO sync_history (op_id, task_id, operation, payload, status, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			id, taskID, operation, payload, status, createdAt); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sync_history WHERE task_id = ? AND operation = ? AND op_id NOT IN (
+			SELECT op_id FROM sync_history WHERE task_id = ? AND operation = ? ORDER BY op_id DESC LIMIT ?)`,
+			taskID, operation, taskID, operation, MaxSyncHistory); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) MarkSkipped(ctx context.Context, id int64, reason string) error {
-	query := `UPDATE sync_queue SET status = 'SKIPPED', error_msg = ? WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, reason, id)
+	query := `UPDATE sync_queue SET status = 'SKIPPED', error_msg = ?, finished_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, reason, time.Now().Unix(), id)
 	if err != nil {
 		return fmt.Errorf("failed to mark sync item skipped: %w", err)
 	}
@@ -921,9 +963,14 @@ func (s *SQLiteStore) MarkFailed(ctx context.Context, id int64, errMsg string) e
 		newRetries = maxRetries
 	}
 	status := "FAILED"
+	// Out of retries, the op has failed for good.
+	var finishedAt sql.NullInt64
+	if newRetries >= maxRetries {
+		finishedAt = sql.NullInt64{Int64: time.Now().Unix(), Valid: true}
+	}
 
-	query := `UPDATE sync_queue SET status = ?, retries = ?, error_msg = ?, last_attempted_at = ? WHERE id = ?`
-	_, err = s.db.ExecContext(ctx, query, status, newRetries, errMsg, time.Now(), id)
+	query := `UPDATE sync_queue SET status = ?, retries = ?, error_msg = ?, last_attempted_at = ?, finished_at = ? WHERE id = ?`
+	_, err = s.db.ExecContext(ctx, query, status, newRetries, errMsg, time.Now(), finishedAt, id)
 	if err != nil {
 		return fmt.Errorf("failed to mark sync item failed: %w", err)
 	}
@@ -931,8 +978,9 @@ func (s *SQLiteStore) MarkFailed(ctx context.Context, id int64, errMsg string) e
 }
 
 func (s *SQLiteStore) MarkFailedPermanent(ctx context.Context, id int64, errMsg string) error {
-	query := `UPDATE sync_queue SET status = 'FAILED', retries = max_retries, error_msg = ?, last_attempted_at = ? WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, errMsg, time.Now(), id)
+	now := time.Now()
+	query := `UPDATE sync_queue SET status = 'FAILED', retries = max_retries, error_msg = ?, last_attempted_at = ?, finished_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, errMsg, now, now.Unix(), id)
 	if err != nil {
 		return fmt.Errorf("failed to mark sync item permanently failed: %w", err)
 	}
@@ -950,7 +998,7 @@ func (s *SQLiteStore) CountPendingByTaskID(ctx context.Context, taskID string) (
 }
 
 func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, error) {
-	query := `SELECT ` + syncOpColumns + ` FROM sync_queue WHERE status = 'FAILED' AND retries < max_retries ORDER BY created_at ASC`
+	query := `SELECT ` + syncOpColumns + ` FROM sync_queue WHERE ` + retryableSyncOp + ` ORDER BY created_at ASC`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list retryable sync items: %w", err)
@@ -979,11 +1027,13 @@ func (s *SQLiteStore) ListRetryable(ctx context.Context) ([]*session.SyncOp, err
 func (s *SQLiteStore) HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error) {
 	// Only ops that applied their state or still will count. A SKIPPED op
 	// applied nothing, and the op it was skipped for may since have failed
-	// for good, so counting it could leave no op to apply any state.
+	// for good, so counting it could leave no op to apply any state. Applied
+	// ops are read from sync_history, which pruning the queue leaves alone.
 	query := `SELECT EXISTS (SELECT 1 FROM sync_queue WHERE task_id = ? AND operation = ? AND id > ?
-	AND (status IN ('PENDING', 'IN_FLIGHT', 'DONE', 'PARTIAL') OR (status = 'FAILED' AND retries < max_retries)))`
+		AND (status = 'IN_FLIGHT' OR ` + waitingSyncOp + `))
+	OR EXISTS (SELECT 1 FROM sync_history WHERE task_id = ? AND operation = ? AND op_id > ?)`
 	var exists bool
-	if err := s.db.QueryRowContext(ctx, query, op.TaskID, op.Operation, op.ID).Scan(&exists); err != nil {
+	if err := s.db.QueryRowContext(ctx, query, op.TaskID, op.Operation, op.ID, op.TaskID, op.Operation, op.ID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("failed to check for newer sync items: %w", err)
 	}
 	return exists, nil
@@ -1013,11 +1063,36 @@ func scanSyncOps(rows *sql.Rows) ([]*session.SyncOp, error) {
 }
 
 func (s *SQLiteStore) LatestSyncOp(ctx context.Context, taskID, operation string) (*session.SyncOp, error) {
-	ops, err := s.ListSyncOps(ctx, taskID, operation, 0, 1)
+	// The queue's row of an op wins over its copy in sync_history; the copy
+	// stands in once the row is pruned.
+	query := `SELECT ` + syncOpColumns + ` FROM (
+		SELECT ` + syncOpColumns + `, 0 AS src FROM sync_queue WHERE task_id = ? AND operation = ?
+		UNION ALL
+		SELECT ` + syncHistoryColumns + `, 1 FROM sync_history WHERE task_id = ? AND operation = ?
+	) ORDER BY id DESC, src LIMIT 1`
+	rows, err := s.db.QueryContext(ctx, query, taskID, operation, taskID, operation)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the latest sync operation: %w", err)
+	}
+	defer rows.Close()
+	ops, err := scanSyncOps(rows)
 	if err != nil || len(ops) == 0 {
 		return nil, err
 	}
 	return ops[0], nil
+}
+
+// syncHistoryColumns reads a sync_history row as syncOpColumns.
+const syncHistoryColumns = `op_id, operation, task_id, payload, status, 0, 0, created_at, NULL, NULL`
+
+func (s *SQLiteStore) ListSyncHistory(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error) {
+	query := `SELECT ` + syncHistoryColumns + ` FROM sync_history WHERE task_id = ? AND operation = ? AND (? = 0 OR op_id < ?) ORDER BY op_id DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, taskID, operation, beforeID, beforeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sync history: %w", err)
+	}
+	defer rows.Close()
+	return scanSyncOps(rows)
 }
 
 func (s *SQLiteStore) ListSyncOps(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error) {
@@ -1045,6 +1120,14 @@ func (s *SQLiteStore) ResetStaleInFlight(ctx context.Context, olderThan time.Dur
 	res, err := s.db.ExecContext(ctx, query, threshold)
 	if err != nil {
 		return 0, fmt.Errorf("failed to reset stale in-flight items: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+func (s *SQLiteStore) PruneSyncQueue(ctx context.Context, olderThan time.Duration) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sync_queue WHERE finished_at < ?`, time.Now().Add(-olderThan).Unix())
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune sync items: %w", err)
 	}
 	return res.RowsAffected()
 }

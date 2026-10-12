@@ -936,3 +936,115 @@ func TestWorker_LookupBadRequest_IsRetried(t *testing.T) {
 		t.Fatalf("expected the op to be retryable after one attempt, got %+v", ops)
 	}
 }
+
+// pruneRecorder records the PruneSyncQueue calls and claims made on a store.
+type pruneRecorder struct {
+	store.Store
+	mu     gosync.Mutex
+	events []string
+	ages   []time.Duration
+}
+
+func (r *pruneRecorder) PruneSyncQueue(ctx context.Context, olderThan time.Duration) (int64, error) {
+	r.mu.Lock()
+	r.events, r.ages = append(r.events, "prune"), append(r.ages, olderThan)
+	r.mu.Unlock()
+	return r.Store.PruneSyncQueue(ctx, olderThan)
+}
+
+func (r *pruneRecorder) MarkInFlight(ctx context.Context, id int64) (*session.SyncOp, error) {
+	r.mu.Lock()
+	r.events = append(r.events, "claim")
+	r.mu.Unlock()
+	return r.Store.MarkInFlight(ctx, id)
+}
+
+func (r *pruneRecorder) snapshot() ([]string, []time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.events...), append([]time.Duration(nil), r.ages...)
+}
+
+func newPruneRecorder(t *testing.T) *pruneRecorder {
+	t.Helper()
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return &pruneRecorder{Store: st}
+}
+
+func TestWorker_Prune(t *testing.T) {
+	t.Parallel()
+	rec := newPruneRecorder(t)
+	ctx := context.Background()
+
+	// Retention 0 keeps finished ops forever: the store isn't asked.
+	if n, err := NewWorker(rec, nil, &config.SyncConfig{}).Prune(ctx); err != nil || n != 0 {
+		t.Errorf("Prune with no retention = %d, %v; want 0", n, err)
+	}
+	if _, err := NewWorker(rec, nil, &config.SyncConfig{RetentionDays: 30}).Prune(ctx); err != nil {
+		t.Errorf("Prune failed: %v", err)
+	}
+	if _, ages := rec.snapshot(); len(ages) != 1 || ages[0] != 30*24*time.Hour {
+		t.Errorf("prunes = %v, want one of 30 days", ages)
+	}
+}
+
+func TestWorker_Run_NilClient_PrunesPeriodically(t *testing.T) {
+	t.Parallel()
+	rec := newPruneRecorder(t)
+	w := NewWorker(rec, nil, &config.SyncConfig{RetentionDays: 30})
+	w.pruneEvery = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if events, _ := rec.snapshot(); len(events) >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Run without a client stopped pruning after startup")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+func TestWorker_Run_PrunesOnlyOnceIdle(t *testing.T) {
+	t.Parallel()
+	rec := newPruneRecorder(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rec.EnqueueSync(ctx, session.SyncOp{Operation: "POST_COMMENT", TaskID: "task-1", Payload: `{"comment_text":"hi"}`, MaxRetries: 5, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"c1"}`))
+	}))
+	defer server.Close()
+	w := NewWorker(rec, clickup.New("my-key").WithBaseURL(server.URL), &config.SyncConfig{RetentionDays: 30})
+
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if events, _ := rec.snapshot(); len(events) >= 2 {
+			if events[0] != "claim" || events[1] != "prune" {
+				t.Errorf("events = %v; want the pending op claimed before the first prune", events)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Run never pruned")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}

@@ -20,6 +20,8 @@ type Worker struct {
 	clickup   *clickup.Client
 	config    *config.SyncConfig
 	statusMap map[clickup.StatusRole]string
+	// pruneEvery is how often Run prunes the sync queue.
+	pruneEvery time.Duration
 }
 
 type SyncPayload struct {
@@ -33,9 +35,10 @@ type SyncPayload struct {
 
 func NewWorker(st store.Store, client *clickup.Client, cfg *config.SyncConfig) *Worker {
 	return &Worker{
-		store:   st,
-		clickup: client,
-		config:  cfg,
+		store:      st,
+		clickup:    client,
+		config:     cfg,
+		pruneEvery: pruneInterval,
 	}
 }
 
@@ -51,11 +54,40 @@ func (w *Worker) WithStatusMap(m config.StatusMapConfig) *Worker {
 	return w
 }
 
+// pruneInterval is how often Run prunes finished ops from the sync queue.
+const pruneInterval = 24 * time.Hour
+
+// Prune deletes ops that finished longer ago than the configured retention
+// from the sync queue; with no retention it deletes nothing. The checklist
+// history earlierMatches reads is kept apart, so it isn't pruned.
+func (w *Worker) Prune(ctx context.Context) (int64, error) {
+	if w.config == nil || w.config.Retention() <= 0 {
+		return 0, nil
+	}
+	return w.store.PruneSyncQueue(ctx, w.config.Retention())
+}
+
+func (w *Worker) prune(ctx context.Context) {
+	if _, err := w.Prune(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] prune error: %v\n", err)
+	}
+}
+
 func (w *Worker) Run(ctx context.Context) error {
 	if w.clickup == nil {
-		// With no ClickUp client configured, wait for shutdown without spinning
-		<-ctx.Done()
-		return ctx.Err()
+		// With no ClickUp client configured nothing syncs, so wait for
+		// shutdown without spinning; still prune, since a queue filled before
+		// the key was removed would otherwise never shrink.
+		prune := time.NewTicker(w.pruneEvery)
+		defer prune.Stop()
+		for {
+			w.prune(ctx)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-prune.C:
+			}
+		}
 	}
 
 	// Reset any stale in-flight ops on worker startup
@@ -63,6 +95,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	var lastPrune time.Time
 
 	for {
 		select {
@@ -78,6 +111,12 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 
 			if processed == 0 {
+				// Pruning waits for an idle pass, so it never holds back
+				// ops waiting to sync (the first one, at startup, included).
+				if time.Since(lastPrune) >= w.pruneEvery {
+					w.prune(ctx)
+					lastPrune = time.Now()
+				}
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -493,18 +532,18 @@ func sameChecklistName(a, b string) bool {
 }
 
 // maxEarlierChecklistOps caps how many of a task's earlier SYNC_CHECKLIST ops
-// are read for the Match values its items had before.
-const maxEarlierChecklistOps = 50
+// are read for the Match values its items had before: all the history keeps.
+const maxEarlierChecklistOps = store.MaxSyncHistory
 
 // earlierMatches maps each obligation Key to the Match values its item had in
 // the task's earlier checklist ops, most recent first, so an item whose
 // describe text changed in the manifest is still found without storing
-// ClickUp IDs. Only ops that applied (DONE, PARTIAL) count: a skipped,
-// failed, or still-waiting op may have written nothing, so it is no evidence
-// of whose an item is. A failed lookup only loses that matching pass, so it
-// is logged rather than failing the sync.
+// ClickUp IDs. Only ops that applied (DONE, PARTIAL, the sync history) count:
+// a skipped, failed, or still-waiting op may have written nothing, so it is
+// no evidence of whose an item is. A failed lookup only loses that matching
+// pass, so it is logged rather than failing the sync.
 func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[string][]string {
-	ops, err := w.store.ListSyncOps(ctx, op.TaskID, op.Operation, op.ID, maxEarlierChecklistOps)
+	ops, err := w.store.ListSyncHistory(ctx, op.TaskID, op.Operation, op.ID, maxEarlierChecklistOps)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sync] couldn't list earlier checklist ops for task %s: %v\n", op.TaskID, err)
 		return nil
@@ -513,7 +552,7 @@ func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[str
 	seen := map[[2]string]bool{}
 	for _, o := range ops { // newest first
 		var p session.ChecklistPayload
-		if (o.Status != "DONE" && o.Status != "PARTIAL") || json.Unmarshal([]byte(o.Payload), &p) != nil {
+		if json.Unmarshal([]byte(o.Payload), &p) != nil {
 			continue
 		}
 		for _, it := range p.Items {

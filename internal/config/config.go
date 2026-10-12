@@ -38,6 +38,23 @@ type SyncConfig struct {
 	MaxRetries    int `toml:"max_retries"`
 	RateLimitMS   int `toml:"rate_limit_ms"`
 	DrainTimeoutS int `toml:"drain_timeout_s"`
+	// RetentionDays is how long finished sync ops are kept before the worker
+	// prunes them; 0 keeps them forever.
+	RetentionDays int `toml:"retention_days"`
+}
+
+// DefaultRetentionDays is how long finished sync ops are kept when config
+// sets no retention.
+const DefaultRetentionDays = 30
+
+// MaxRetentionDays bounds retention_days, well inside what a time.Duration
+// holds (about 292 years).
+const MaxRetentionDays = 36500
+
+// Retention is how long finished sync ops are kept; 0 means forever. Days
+// past MaxRetentionDays count as MaxRetentionDays, so it never overflows.
+func (c SyncConfig) Retention() time.Duration {
+	return time.Duration(min(c.RetentionDays, MaxRetentionDays)) * 24 * time.Hour
 }
 
 // CompletenessConfig configures completeness enforcement for projects with a
@@ -115,6 +132,9 @@ auto_context = true
 max_retries = 5
 rate_limit_ms = 600
 drain_timeout_s = 5
+# Finished sync ops (applied, skipped, or failed for good) older than this
+# many days are deleted from the local queue; 0 keeps them forever.
+retention_days = 30
 
 # Completion gate for projects with a completeness manifest, when a session
 # is stopped as completed with required obligations open:
@@ -208,6 +228,7 @@ func LoadFrom(configPath string) (*Config, error) {
 			MaxRetries:    5,
 			RateLimitMS:   600,
 			DrainTimeoutS: 5,
+			RetentionDays: DefaultRetentionDays,
 		},
 		Completeness: CompletenessConfig{
 			Gate:            string(session.DefaultGate),
@@ -233,6 +254,9 @@ func LoadFrom(configPath string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Completeness.Gate = string(gate)
+	if cfg.Sync.RetentionDays < 0 || cfg.Sync.RetentionDays > MaxRetentionDays {
+		return nil, fmt.Errorf("invalid config: sync.retention_days must be between 0 and %d, got %d", MaxRetentionDays, cfg.Sync.RetentionDays)
+	}
 	if cfg.Completeness.CommandTimeoutS < 0 {
 		return nil, fmt.Errorf("invalid config: completeness.command_timeout_s must be positive, got %d", cfg.Completeness.CommandTimeoutS)
 	}

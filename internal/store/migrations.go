@@ -173,6 +173,46 @@ CREATE INDEX IF NOT EXISTS idx_sync_queue_task_op ON sync_queue(task_id, operati
 ALTER TABLE obligations ADD COLUMN command_check TEXT;
 `,
 	},
+	{
+		version: 9,
+		// Pruning the sync queue. finished_at is when an op finished (DONE,
+		// PARTIAL, SKIPPED, or failed for good), in unix seconds so ages
+		// compare in SQL; NULL while it may still run. Finished rows are
+		// backfilled from their last touch, parsed from the text Go's
+		// time.Time.String() stored ("2006-01-02 15:04:05.999 -0700 MST"),
+		// or the upgrade time when that doesn't parse.
+		//
+		// sync_history keeps each task's applied (DONE, PARTIAL) checklist
+		// ops apart from the queue, newest MaxSyncHistory per task: the
+		// worker matches items against them and HasNewerOp and LatestSyncOp
+		// read them, so the queue itself can be pruned by status and age.
+		sql: `
+ALTER TABLE sync_queue ADD COLUMN finished_at INTEGER;
+UPDATE sync_queue SET finished_at = COALESCE(
+	unixepoch(substr(COALESCE(last_attempted_at, created_at), 1, 19)
+		|| substr(substr(COALESCE(last_attempted_at, created_at), 20), instr(substr(COALESCE(last_attempted_at, created_at), 20), ' ') + 1, 3)
+		|| ':' || substr(substr(COALESCE(last_attempted_at, created_at), 20), instr(substr(COALESCE(last_attempted_at, created_at), 20), ' ') + 4, 2)),
+	unixepoch('now'))
+WHERE status IN ('DONE', 'PARTIAL', 'SKIPPED') OR (status = 'FAILED' AND retries >= max_retries);
+CREATE INDEX IF NOT EXISTS idx_sync_queue_finished_at ON sync_queue(finished_at) WHERE finished_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS sync_history (
+    op_id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sync_history_task_op ON sync_history(task_id, operation, op_id);
+INSERT INTO sync_history (op_id, task_id, operation, payload, status, created_at)
+SELECT id, task_id, operation, payload, status, created_at FROM sync_queue
+WHERE operation = 'SYNC_CHECKLIST' AND status IN ('DONE', 'PARTIAL');
+DELETE FROM sync_history WHERE op_id IN (
+	SELECT op_id FROM (SELECT op_id, ROW_NUMBER() OVER (PARTITION BY task_id, operation ORDER BY op_id DESC) AS rank FROM sync_history)
+	WHERE rank > 50);
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

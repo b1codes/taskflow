@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
@@ -43,6 +44,15 @@ var syncCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Sync completed: %d items processed.\n", count)
+
+		// The sync itself succeeded; pruning (e.g. busy while serve holds the
+		// database) is retried by the next sync or serve's daily prune.
+		pruned, err := worker.Prune(cmd.Context())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to prune sync queue: %v\n", err)
+		} else if pruned > 0 {
+			fmt.Printf("Pruned %d finished items older than %d days.\n", pruned, cfg.Sync.RetentionDays)
+		}
 		return nil
 	},
 }

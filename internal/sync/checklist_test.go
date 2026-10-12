@@ -602,10 +602,10 @@ func TestWorker_SyncChecklist_MatchesByEarlierMatchOfKey(t *testing.T) {
 	}
 }
 
-// listFailingStore fails ListSyncOps.
+// listFailingStore fails ListSyncHistory.
 type listFailingStore struct{ store.Store }
 
-func (listFailingStore) ListSyncOps(context.Context, string, string, int64, int) ([]*session.SyncOp, error) {
+func (listFailingStore) ListSyncHistory(context.Context, string, string, int64, int) ([]*session.SyncOp, error) {
 	return nil, errors.New("disk on fire")
 }
 
@@ -623,6 +623,28 @@ func TestWorker_SyncChecklist_EarlierOpsUnreadable_StillSyncs(t *testing.T) {
 	}
 	if cls, _ := fake.state(); len(cls[0].Items) != 2 {
 		t.Errorf("without earlier ops the item can only be created: %+v", cls[0].Items)
+	}
+}
+
+func TestWorker_SyncChecklist_EarlierOpsPruned_StillRenames(t *testing.T) {
+	t.Parallel()
+	const task = "task-cl-describe-pruned"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
+	drain(t, st, client)
+	// Prune every finished op from the queue: the history the rename needs
+	// is kept apart from it.
+	if n, err := st.PruneSyncQueue(context.Background(), -time.Hour); err != nil || n != 1 {
+		t.Fatalf("PruneSyncQueue = %d, %v; want the applied op pruned", n, err)
+	}
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for module A", "", false))
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected the op to sync, got %d processed", n)
+	}
+	if cls, _ := fake.state(); len(cls[0].Items) != 1 || cls[0].Items[0].Name != "[story] Stories for module A" {
+		t.Errorf("items = %+v, want the one item renamed", cls[0].Items)
 	}
 }
 
