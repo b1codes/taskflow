@@ -171,9 +171,27 @@ func TestCLI_Verify(t *testing.T) {
 	if err != nil || json.Unmarshal([]byte(out), &report) != nil || report.Summary.Satisfied != 1 || len(report.Commands) != 1 || !report.Commands[0].Passed {
 		t.Errorf("verify --json = %s, %v", out, err)
 	}
-	// The recorded pass counts for check, which runs nothing.
+	// The recorded pass counts for check, which runs nothing...
 	if out, err := runCLI(t, []string{"check", "--session", sid}); err != nil {
 		t.Errorf("check after a passing verify: %v\n%s", err, out)
+	}
+
+	// ...until the project changes: a pass from before the change mustn't
+	// let a hook through.
+	if err := os.WriteFile(filepath.Join(projDir, "widget.go"), []byte("package x // broken after verify"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runCLI(t, []string{"check", "--session", sid})
+	if exitCode(err) != checkBlockedExit || !strings.Contains(out, "stale: it passed, but the project changed since; run tf_verify again") {
+		t.Errorf("check after an edit: %v\n%s", err, out)
+	}
+
+	// Content back as it ran: the pass is current again.
+	if err := os.WriteFile(filepath.Join(projDir, "widget.go"), []byte("package x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runCLI(t, []string{"check", "--session", sid}); err != nil {
+		t.Errorf("check after reverting the edit: %v\n%s", err, out)
 	}
 }
 

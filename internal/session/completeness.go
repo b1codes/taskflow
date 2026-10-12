@@ -54,7 +54,8 @@ type Obligation struct {
 	InheritedFrom    string           `json:"inherited_from"`
 	RemindedCount    int              `json:"reminded_count"`
 	// CommandCheck is the last run of the obligation's command check. A pass
-	// counts until the next run, and only for the same command line.
+	// counts only for the same command line, and only while the project is
+	// as it was when the command ran (CommandSpec.Fingerprint).
 	CommandCheck *CommandCheck `json:"command_check,omitempty"`
 	FirstSeenAt  time.Time     `json:"first_seen_at"`
 	SatisfiedAt  *time.Time    `json:"satisfied_at"`
@@ -126,6 +127,10 @@ type CommandSpec struct {
 	Root string
 	// Env is merged over the inherited environment.
 	Env map[string]string
+	// Fingerprint identifies the state the command would run against: the
+	// content under Root and Env. "" when it can't be taken (no git), and
+	// then a pass counts only in the evaluation that ran it.
+	Fingerprint string
 }
 
 func (c *CommandSpec) runKey() string { return c.Root + "\x00" + c.Line }
@@ -144,11 +149,20 @@ type CommandCheck struct {
 	// Output is the combined stdout and stderr, truncated to its end.
 	Output string    `json:"output,omitempty"`
 	RanAt  time.Time `json:"ran_at"`
+	// Fingerprint is the spec's when it ran.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // runs reports whether c is a run of spec.
 func (c *CommandCheck) runs(spec *CommandSpec) bool {
 	return c != nil && spec != nil && c.Command == spec.Line && c.Root == spec.Root
+}
+
+// current reports whether c, a run of spec, ran against the state spec would
+// run against now: nothing under its root or in its env changed since. With
+// no fingerprint either way, it can't be told, so it isn't.
+func (c *CommandCheck) current(spec *CommandSpec) bool {
+	return c.runs(spec) && c.Fingerprint != "" && c.Fingerprint == spec.Fingerprint
 }
 
 // result is c's outcome in a few words.
@@ -168,17 +182,21 @@ func (c *CommandCheck) result() string {
 
 // withCommand folds f's command check into its result: with a command,
 // f is met (and its checks pass) only once the command passes, on this
-// evaluation's run or else on prev, the obligation's last run of the same
-// command line. It returns the check to keep on the obligation.
+// evaluation's run, or else on prev, the obligation's last run, while it is
+// current: the same command line against the same project state. A pass
+// from before a change counts for nothing, so checks that don't run
+// commands (checkpoints, taskflow check) can't pass on stale results. It
+// returns the check to keep on the obligation.
 func (f *CompletenessFinding) withCommand(prev *CommandCheck) (satisfied, checksPassed bool, levels []string, check *CommandCheck) {
 	check = prev
-	if f.CommandResult != nil {
+	fresh := f.CommandResult != nil
+	if fresh {
 		check = f.CommandResult
 	}
 	if f.Command == nil {
 		return f.Satisfied, f.ChecksPassed, f.Levels, check
 	}
-	passed := check.runs(f.Command) && check.Passed
+	passed := check.runs(f.Command) && check.Passed && (fresh || check.current(f.Command))
 	levels = f.Levels
 	if passed {
 		levels = append(slices.Clone(levels), levelCommand)
@@ -327,8 +345,9 @@ type ObligationView struct {
 type CommandView struct {
 	Command string `json:"command"`
 	Root    string `json:"root"`
-	// Result is "not run yet", "passed", "failed (exit N)", "timed out", or
-	// "failed: …" (it couldn't start, or was killed).
+	// Result is "not run yet", "passed", "failed (exit N)", "timed out",
+	// "failed: …" (it couldn't start, or was killed), or "stale: …" (it
+	// passed, but the project changed since).
 	Result string `json:"result"`
 	// Output is the end of a failed run's output.
 	Output string `json:"output,omitempty"`
@@ -770,6 +789,11 @@ func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evalu
 			runs[i] = CommandCheck{Command: spec.Line, Root: spec.Root, ExitCode: -1, Error: "the command runner returned no result", RanAt: time.Now()}
 		}
 	}
+	// The state each run is tied to is the spec's, taken before it ran: a
+	// change made while it ran makes it stale too.
+	for i := range runs {
+		runs[i].Fingerprint = specs[i].Fingerprint
+	}
 	for i := range ev.Findings {
 		f := &ev.Findings[i]
 		if f.Command == nil || waived[f.key()] {
@@ -824,8 +848,12 @@ func (st *completenessState) view(o *Obligation, withStatus bool) ObligationView
 			check = nil
 		}
 		v.Command = &CommandView{Command: spec.Line, Root: spec.Root, Result: check.result()}
-		if check != nil && !check.Passed {
+		switch {
+		case check == nil:
+		case !check.Passed:
 			v.Command.Output = check.Output
+		case !check.current(spec) && !st.ranNow(check):
+			v.Command.Result = "stale: it passed, but the project changed since; run tf_verify again"
 		}
 	}
 	if withStatus {
@@ -980,6 +1008,17 @@ func (st *completenessState) report(sessionID string) *CompletenessReport {
 	return r
 }
 
+// ranNow reports whether c is one of this evaluation's runs, which count
+// whether or not they have a fingerprint.
+func (st *completenessState) ranNow(c *CommandCheck) bool {
+	for i := range st.runs {
+		if r := &st.runs[i]; r.Command == c.Command && r.Root == c.Root && r.RanAt.Equal(c.RanAt) {
+			return true
+		}
+	}
+	return false
+}
+
 // visible returns the non-void obligations, open first.
 func (st *completenessState) visible() []*Obligation {
 	var out []*Obligation
@@ -1055,8 +1094,12 @@ func (st *completenessState) reportTable() string {
 		evidence := "—"
 		if o.Evidence != "" {
 			evidence = o.Evidence
-		} else if c := o.CommandCheck; c != nil && st.commands[o.ID] != nil {
-			evidence = fmt.Sprintf("`%s`: %s", c.Command, c.result())
+		} else if c, spec := o.CommandCheck, st.commands[o.ID]; c != nil && spec != nil {
+			result := c.result()
+			if c.Passed && !c.current(spec) && !st.ranNow(c) {
+				result = "stale (passed before the latest changes)"
+			}
+			evidence = fmt.Sprintf("`%s`: %s", c.Command, result)
 			if !c.Passed {
 				if line := lastLine(c.Output); line != "" {
 					evidence += ": " + line

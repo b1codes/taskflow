@@ -43,6 +43,8 @@ func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*O
 		return nil, nil
 	}
 	c := *f.eval
+	// Like the real evaluator, each evaluation has its own findings.
+	c.Findings = slices.Clone(f.eval.Findings)
 	return &c, nil
 }
 

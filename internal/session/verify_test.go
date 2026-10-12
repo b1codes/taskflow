@@ -14,7 +14,7 @@ func suiteFinding() CompletenessFinding {
 	f := finding("regression-suite", "suite", "web", true)
 	f.Levels = nil
 	f.ChecksPassed = true
-	f.Command = &CommandSpec{Line: "pnpm test", Root: "frontend", Env: map[string]string{"CI": "true"}}
+	f.Command = &CommandSpec{Line: "pnpm test", Root: "frontend", Env: map[string]string{"CI": "true"}, Fingerprint: "state-1"}
 	return f
 }
 
@@ -49,19 +49,52 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 		}
 	})
 
-	t.Run("a pass stands until the next run, for the same command", func(t *testing.T) {
-		o := stored("regression-suite", "suite", "web", ObligationSatisfied)
-		o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+	t.Run("a stored pass counts only while the project is as it ran", func(t *testing.T) {
+		pass := func(fingerprint string) *Obligation {
+			o := stored("regression-suite", "suite", "web", ObligationSatisfied)
+			o.VerifiedLevels = []string{levelCommand}
+			o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true, Fingerprint: fingerprint}
+			return o
+		}
+		o := pass("state-1")
 		mergeObligations("s", []*Obligation{o}, commandEval(suiteFinding()), now)
 		if o.Status != ObligationSatisfied {
-			t.Errorf("a stored pass should stand: %+v", o)
+			t.Errorf("a current pass should stand: %+v", o)
 		}
 
 		changed := suiteFinding()
-		changed.Command.Line = "pnpm run test:ci"
-		mergeObligations("s", []*Obligation{o}, commandEval(changed), now)
+		changed.Command.Fingerprint = "state-2" // the code changed after the run
+		o = pass("state-1")
+		mr := mergeObligations("s", []*Obligation{o}, commandEval(changed), now)
+		if o.Status != ObligationOpen || slices.Contains(o.VerifiedLevels, levelCommand) || !mr.newlyOpen[o.ID] {
+			t.Errorf("a pass from before a change shouldn't count: %+v", o)
+		}
+
+		// Without a fingerprint (no git) a stored pass can't be trusted.
+		unknown := suiteFinding()
+		unknown.Command.Fingerprint = ""
+		o = pass("")
+		mergeObligations("s", []*Obligation{o}, commandEval(unknown), now)
+		if o.Status != ObligationOpen {
+			t.Errorf("a pass with no fingerprint shouldn't count later: %+v", o)
+		}
+
+		other := suiteFinding()
+		other.Command.Line = "pnpm run test:ci"
+		o = pass("state-1")
+		mergeObligations("s", []*Obligation{o}, commandEval(other), now)
 		if o.Status != ObligationOpen {
 			t.Errorf("a pass of another command line shouldn't count: %+v", o)
+		}
+	})
+
+	t.Run("a fresh pass counts without a fingerprint", func(t *testing.T) {
+		f := suiteFinding()
+		f.Command.Fingerprint = ""
+		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+		mr := mergeObligations("s", nil, commandEval(f), now)
+		if o := mr.obligations[0]; o.Status != ObligationSatisfied {
+			t.Errorf("obligation = %+v", o)
 		}
 	})
 
@@ -103,7 +136,7 @@ func TestService_Verify(t *testing.T) {
 	t.Run("runs each command once and records the results", func(t *testing.T) {
 		contract := finding("react-screen", "contract", "src/A.tsx", true)
 		contract.ChecksPassed = true
-		contract.Command = &CommandSpec{Line: "pnpm test", Root: "frontend"} // same run as the suite
+		contract.Command = &CommandSpec{Line: "pnpm test", Root: "frontend", Fingerprint: "state-1"} // same run as the suite
 		ev := &fakeEvaluator{eval: commandEval(suiteFinding(), contract)}
 		srv, store, sid := start(t, ev)
 
@@ -125,11 +158,35 @@ func TestService_Verify(t *testing.T) {
 		if v := r.Obligations[0].Command; v == nil || v.Result != "passed" || v.Output != "" {
 			t.Errorf("command view = %+v", v)
 		}
+		for _, o := range store.obligations[sid] {
+			if o.CommandCheck.Fingerprint != "state-1" {
+				t.Errorf("the run should be tied to the state it ran against: %+v", o.CommandCheck)
+			}
+		}
 
-		// A later checkpoint doesn't run anything, and the pass stands.
+		// A later checkpoint doesn't run anything, and the pass stands while
+		// nothing changed.
 		cp, err := srv.Checkpoint(ctx, sid, "more", nil, false)
 		if err != nil || cp.Completeness.Summary.Open != 0 || len(ev.ran) != 1 {
 			t.Errorf("checkpoint = %+v, %v, ran %d", cp.Completeness, err, len(ev.ran))
+		}
+
+		// Once the project changes, it doesn't: Check blocks and says why.
+		for i := range ev.eval.Findings {
+			ev.eval.Findings[i].Command.Fingerprint = "state-2"
+		}
+		res, err := srv.Check(ctx, sid, false)
+		if err != nil || !res.Blocked || len(res.OpenRequired) != 2 {
+			t.Fatalf("check after a change = %+v, %v", res, err)
+		}
+		if v := res.OpenRequired[0].Command; v == nil || !strings.HasPrefix(v.Result, "stale:") {
+			t.Errorf("command view = %+v", v)
+		}
+		if !strings.Contains(res.Reason(), "stale: it passed, but the project changed since; run tf_verify again") {
+			t.Errorf("reason = %s", res.Reason())
+		}
+		if len(ev.ran) != 1 {
+			t.Errorf("check must not run commands: ran %d", len(ev.ran))
 		}
 	})
 

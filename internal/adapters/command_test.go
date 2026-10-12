@@ -304,3 +304,77 @@ func TestCompletenessEvaluator_RunsStackCommands(t *testing.T) {
 		})
 	}
 }
+
+// Command specs carry a fingerprint of the state under their root and their
+// env, so a pass can't outlive a change; without git there is none.
+func TestCompletenessEvaluator_CommandFingerprint(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	manifest := func(env string) string {
+		return `version: 1
+stacks:
+  - { id: app, root: app, env: { CI: "` + env + `" }, commands: { test: [{ run: "make test" }] } }
+rules:
+  - id: suite
+    stack: app
+    describe: "suite"
+    scope: stack
+    when: { changed: "**" }
+    require: [{ id: suite, describe: "suite passes", run: { command: test } }]
+`
+	}
+	write := func(dir, rel, content string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := NewCompletenessEvaluator().WithCommands(true, time.Minute)
+	stored := []*session.Obligation{{ID: "o", RuleID: "suite", RequirementID: "suite", Subject: "app", Status: session.ObligationOpen}}
+	spec := func(dir string) (*session.CommandSpec, []string) {
+		t.Helper()
+		ev, err := e.Evaluate(context.Background(), &session.Session{ID: "s", ProjectPath: dir}, stored)
+		if err != nil || len(ev.Findings) != 1 || ev.Findings[0].Command == nil {
+			t.Fatalf("Evaluate = %+v, %v", ev, err)
+		}
+		return ev.Findings[0].Command, ev.Warnings
+	}
+
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "-C", dir, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	write(dir, ".agents/completeness.yaml", manifest("true"))
+	write(dir, "app/main.go", "package main")
+	first, _ := spec(dir)
+	if again, _ := spec(dir); first.Fingerprint == "" || again.Fingerprint != first.Fingerprint {
+		t.Fatalf("fingerprints %q, %q: want stable and non-empty", first.Fingerprint, again.Fingerprint)
+	}
+	write(dir, "README.md", "outside the stack root")
+	if s, _ := spec(dir); s.Fingerprint != first.Fingerprint {
+		t.Error("a change outside the root shouldn't change it")
+	}
+	write(dir, "app/main.go", "package main // edited")
+	edited, _ := spec(dir)
+	if edited.Fingerprint == first.Fingerprint {
+		t.Error("a change under the root should change it")
+	}
+	write(dir, ".agents/completeness.yaml", manifest("false"))
+	if s, _ := spec(dir); s.Fingerprint == edited.Fingerprint {
+		t.Error("a change to the stack env should change it")
+	}
+
+	plain := t.TempDir()
+	write(plain, ".agents/completeness.yaml", manifest("true"))
+	write(plain, "app/main.go", "package main")
+	s, warnings := spec(plain)
+	if s.Fingerprint != "" || !strings.Contains(strings.Join(warnings, "\n"), "can't be tied to the project's state") {
+		t.Errorf("without git: fingerprint %q, warnings %v", s.Fingerprint, warnings)
+	}
+}
