@@ -143,8 +143,10 @@ type CommandSpec struct {
 	// Env is merged over the inherited environment.
 	Env map[string]string
 	// Fingerprint identifies the state the command would run against: the
-	// content under Root and Env. "" when it can't be taken (no git), and
-	// then a pass counts only in the evaluation that ran it.
+	// whole repository's work tree and Env. The evaluator takes it only when
+	// a stored pass of the same command could be compared with it; it is ""
+	// otherwise, and when it can't be taken (no git), and then a pass counts
+	// only in the evaluation that ran it.
 	Fingerprint string
 }
 
@@ -184,7 +186,8 @@ type CommandCheck struct {
 	// Output is the combined stdout and stderr, truncated to its end.
 	Output string    `json:"output,omitempty"`
 	RanAt  time.Time `json:"ran_at"`
-	// Fingerprint is the spec's when it ran.
+	// Fingerprint is the state it ran against, as the runner stamped it, or
+	// else the spec's when it ran.
 	Fingerprint string `json:"fingerprint,omitempty"`
 	// Env is the spec's envKey: a run counts only for the env it ran with.
 	Env string `json:"env,omitempty"`
@@ -850,10 +853,14 @@ func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evalu
 			runs[i] = CommandCheck{Command: spec.Line, Root: spec.Root, ExitCode: -1, Error: "the command runner returned no result", RanAt: time.Now()}
 		}
 	}
-	// The state each run is tied to is the spec's, taken before it ran: a
-	// change made while it ran makes it stale too.
+	// The state each run is tied to is the one the runner stamped on it (the
+	// state the runs left behind, unless they ran while the project's
+	// content changed), or else the spec's, taken before it ran: either way
+	// a change made while it ran makes it stale.
 	for i := range runs {
-		runs[i].Fingerprint = specs[i].Fingerprint
+		if runs[i].Fingerprint == "" {
+			runs[i].Fingerprint = specs[i].Fingerprint
+		}
 		runs[i].Env = specs[i].envKey()
 	}
 	for i := range ev.Findings {

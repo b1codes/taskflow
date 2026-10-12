@@ -179,3 +179,42 @@ func TestWorkTreeHash_NoCommits(t *testing.T) {
 		t.Errorf("the real index shouldn't be created: %v", err)
 	}
 }
+
+// HashWorkTree keeps content and ignored files apart: an ignored file's
+// change moves only Ignored, a tracked or untracked file's only Content, and
+// WorkTreeHash follows both.
+func TestHashWorkTree_Parts(t *testing.T) {
+	t.Parallel()
+	_, proj, _, write, hash := worktreeRepo(t)
+	state := func() WorkTreeState {
+		t.Helper()
+		s, err := HashWorkTree(proj)
+		if err != nil || s.Content == "" || s.Ignored == "" {
+			t.Fatalf("HashWorkTree: %+v, %v", s, err)
+		}
+		return s
+	}
+	base := state()
+	if h := hash(); h != base.Hash() {
+		t.Errorf("WorkTreeHash %q, want the combined state %q", h, base.Hash())
+	}
+
+	write("proj/.env", "SECRET=a")
+	ign := state()
+	if ign.Content != base.Content || ign.Ignored == base.Ignored {
+		t.Errorf("an ignored file should move only Ignored: %+v -> %+v", base, ign)
+	}
+	write("proj/web/src/a.ts", "edited")
+	edited := state()
+	if edited.Content == ign.Content || edited.Ignored != ign.Ignored {
+		t.Errorf("a tracked edit should move only Content: %+v -> %+v", ign, edited)
+	}
+	write("proj/web/src/new.ts", "new")
+	if s := state(); s.Content == edited.Content || s.Ignored != edited.Ignored {
+		t.Errorf("an untracked file should move only Content: %+v -> %+v", edited, s)
+	}
+
+	if _, err := HashWorkTree(t.TempDir()); !errors.Is(err, session.ErrNotAGitRepository) {
+		t.Errorf("not a repo: err = %v", err)
+	}
+}
