@@ -580,15 +580,18 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	}
 	// The plan is only recorded once all of its obligations are: a plan
 	// state with obligations missing would claim work is tracked that isn't.
-	// The checklist is pushed whether or not the plan changed it, unless the
-	// task's latest checklist op already carries it, so it shows the planned
-	// work as soon as the plan is made.
+	// The checklist is pushed only once the plan is recorded, so ClickUp never
+	// shows a plan tf_plan reported as failed, whether or not the plan
+	// changed it, unless the task's latest checklist op already carries it.
 	st, mr := mergeEvaluation(sess, stored, ev)
-	if err := s.persistMerge(ctx, sess, st, mr); err != nil {
+	if err := s.writeMerge(ctx, st, mr); err != nil {
 		return nil, fmt.Errorf("failed to save the plan's obligations, so the plan wasn't recorded; call tf_plan again: %w", err)
 	}
 	if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanPlanned); err != nil {
 		return nil, fmt.Errorf("failed to save plan state: %w", err)
+	}
+	if mr != nil {
+		s.enqueueChecklist(ctx, sess, st.obligations)
 	}
 
 	subjects := map[string]bool{}

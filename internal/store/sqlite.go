@@ -109,7 +109,8 @@ const walBusyTimeout = 5 * time.Second
 // file, so one switch covers every connection. Switching needs an exclusive
 // lock, and SQLite reports SQLITE_BUSY at once rather than calling the busy
 // handler while other connections hold the file (e.g. processes opening a
-// new database together), so it is retried here until walBusyTimeout.
+// new database together), so it is retried here until walBusyTimeout. A
+// filesystem without WAL support leaves the old journal mode, with a warning.
 func enableWAL(db *sql.DB) error {
 	deadline := time.Now().Add(walBusyTimeout)
 	for {
@@ -117,7 +118,9 @@ func enableWAL(db *sql.DB) error {
 		err := db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode)
 		if err == nil {
 			if !strings.EqualFold(mode, "wal") {
-				return fmt.Errorf("journal mode is %q, not wal", mode)
+				// Some filesystems (network mounts) can't do WAL; SQLite
+				// then keeps its rollback journal, which still works.
+				fmt.Fprintf(os.Stderr, "[store] warning: journal mode is %q, not wal; continuing without WAL\n", mode)
 			}
 			return nil
 		}
@@ -807,6 +810,24 @@ func (s *SQLiteStore) ReplaceListStatuses(ctx context.Context, listID string, en
 }
 
 // Sync Queue
+func (s *SQLiteStore) CoalesceSyncOp(ctx context.Context, op session.SyncOp) error {
+	// One statement, so the worker can't claim the op between finding it and
+	// replacing its payload: a claimed op is IN_FLIGHT and no longer matches.
+	// created_at moves the op to the back of the queue, as if newly queued,
+	// so it still runs after the ops queued before this state (a decision's
+	// comment before the checklist showing the waiver).
+	query := `UPDATE sync_queue SET payload = ?, created_at = ? WHERE id = (SELECT MAX(id) FROM sync_queue WHERE task_id = ? AND operation = ?)
+	AND (status = 'PENDING' OR (status = 'FAILED' AND retries < max_retries))`
+	res, err := s.db.ExecContext(ctx, query, op.Payload, op.CreatedAt, op.TaskID, op.Operation)
+	if err != nil {
+		return fmt.Errorf("failed to coalesce sync operation: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		return nil
+	}
+	return s.EnqueueSync(ctx, op)
+}
+
 func (s *SQLiteStore) EnqueueSync(ctx context.Context, op session.SyncOp) error {
 	query := `INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at) 
 	VALUES (?, ?, ?, 'PENDING', 0, ?, ?)`
@@ -827,20 +848,35 @@ func (s *SQLiteStore) DequeuePending(ctx context.Context, limit int) ([]*session
 	return scanSyncOps(rows)
 }
 
-func (s *SQLiteStore) MarkInFlight(ctx context.Context, id int64) error {
-	query := `UPDATE sync_queue SET status = 'IN_FLIGHT', last_attempted_at = ? WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, time.Now(), id)
+func (s *SQLiteStore) MarkInFlight(ctx context.Context, id int64) (*session.SyncOp, error) {
+	query := `UPDATE sync_queue SET status = 'IN_FLIGHT', last_attempted_at = ? WHERE id = ? AND (status = 'PENDING' OR (status = 'FAILED' AND retries < max_retries))
+	RETURNING ` + syncOpColumns
+	rows, err := s.db.QueryContext(ctx, query, time.Now(), id)
 	if err != nil {
-		return fmt.Errorf("failed to mark sync item in-flight: %w", err)
+		return nil, fmt.Errorf("failed to mark sync item in-flight: %w", err)
+	}
+	defer rows.Close()
+	ops, err := scanSyncOps(rows)
+	if err != nil || len(ops) == 0 {
+		return nil, err
+	}
+	return ops[0], nil
+}
+
+func (s *SQLiteStore) MarkDone(ctx context.Context, id int64, note string) error {
+	query := `UPDATE sync_queue SET status = 'DONE', error_msg = COALESCE(NULLIF(?, ''), error_msg) WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, note, id)
+	if err != nil {
+		return fmt.Errorf("failed to mark sync item done: %w", err)
 	}
 	return nil
 }
 
-func (s *SQLiteStore) MarkDone(ctx context.Context, id int64) error {
-	query := `UPDATE sync_queue SET status = 'DONE' WHERE id = ?`
-	_, err := s.db.ExecContext(ctx, query, id)
+func (s *SQLiteStore) MarkPartial(ctx context.Context, id int64, note string) error {
+	query := `UPDATE sync_queue SET status = 'PARTIAL', error_msg = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, note, id)
 	if err != nil {
-		return fmt.Errorf("failed to mark sync item done: %w", err)
+		return fmt.Errorf("failed to mark sync item partial: %w", err)
 	}
 	return nil
 }
@@ -927,7 +963,7 @@ func (s *SQLiteStore) HasNewerOp(ctx context.Context, op *session.SyncOp) (bool,
 	// applied nothing, and the op it was skipped for may since have failed
 	// for good, so counting it could leave no op to apply any state.
 	query := `SELECT EXISTS (SELECT 1 FROM sync_queue WHERE task_id = ? AND operation = ? AND id > ?
-	AND (status IN ('PENDING', 'IN_FLIGHT', 'DONE') OR (status = 'FAILED' AND retries < max_retries)))`
+	AND (status IN ('PENDING', 'IN_FLIGHT', 'DONE', 'PARTIAL') OR (status = 'FAILED' AND retries < max_retries)))`
 	var exists bool
 	if err := s.db.QueryRowContext(ctx, query, op.TaskID, op.Operation, op.ID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("failed to check for newer sync items: %w", err)

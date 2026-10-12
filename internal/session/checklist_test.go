@@ -45,31 +45,36 @@ func TestChecklistItem_Names(t *testing.T) {
 func TestChecklistItemMatches(t *testing.T) {
 	const match = "[story] Stories for Page"
 	for name, want := range map[string]bool{
-		"[story] Stories for Page":                           true,
-		"[story] Stories for Page — attested":                true,
-		"[story] Stories for Page — waived":                  true,
-		"[story] Stories for Page — void":                    true,
-		"[story] Stories for Page — structural ✓":            true,
-		"[story] Stories for Page — structural, runtime ✓":   true,
-		"[story] Stories for Page — attested, structural ✓":  true,
-		"[story] Stories for Page — waived, structural ✓":    true,
-		"~~[story] Stories for Page~~":                       true, // void, from earlier builds
-		"  [story]  Stories for\nPage — attested ":           true, // as ClickUp may space it
-		"[story] Stories for PageHeader":                     false,
-		"~~[story] Stories for PageHeader~~":                 false,
-		"[story] Stories for Page (old)":                     false,
-		"[story] Stories for Page—attested":                  false,
-		"[story] Stories for Page — edge cases":              false, // another item's describe
-		"[story] Stories for Page — attested twice":          false,
-		"[story] Stories for Page — void, structural ✓":      false,
-		"[story] Stories for Page — structural":              false,
-		"[story] Stories for Page — edge cases ✓":            false,
-		"[story] Stories for Page — structural ✓, attested":  false,
-		"[story] Stories for Page — attested — structural ✓": false,
-		"~~[story] Stories for Page — attested~~":            false,
-		"[e2e] Stories for Page":                             false,
-		"Stories for Page":                                   false,
-		"[story] stories for page":                           false,
+		"[story] Stories for Page":                              true,
+		"[story] Stories for Page — attested":                   true,
+		"[story] Stories for Page — waived":                     true,
+		"[story] Stories for Page — void":                       true,
+		"[story] Stories for Page — structural ✓":               true,
+		"[story] Stories for Page — structural, runtime ✓":      true,
+		"[story] Stories for Page — attested, structural ✓":     true,
+		"[story] Stories for Page — waived, structural ✓":       true,
+		"[story] Stories for Page — attested-by-qa ✓":           true, // a level, not "attested"
+		"[story] Stories for Page — waived-ok, structural ✓":    true,
+		"[story] Stories for Page — attested, attested-by-qa ✓": true,
+		"[story] Stories for Page — attestedly":                 false,
+		"[story] Stories for Page — attested-by-qa":             false,
+		"~~[story] Stories for Page~~":                          true, // void, from earlier builds
+		"  [story]  Stories for\nPage — attested ":              true, // as ClickUp may space it
+		"[story] Stories for PageHeader":                        false,
+		"~~[story] Stories for PageHeader~~":                    false,
+		"[story] Stories for Page (old)":                        false,
+		"[story] Stories for Page—attested":                     false,
+		"[story] Stories for Page — edge cases":                 false, // another item's describe
+		"[story] Stories for Page — attested twice":             false,
+		"[story] Stories for Page — void, structural ✓":         false,
+		"[story] Stories for Page — structural":                 false,
+		"[story] Stories for Page — edge cases ✓":               false,
+		"[story] Stories for Page — structural ✓, attested":     false,
+		"[story] Stories for Page — attested — structural ✓":    false,
+		"~~[story] Stories for Page — attested~~":               false,
+		"[e2e] Stories for Page":                                false,
+		"Stories for Page":                                      false,
+		"[story] stories for page":                              false,
 	} {
 		if got := ChecklistItemMatches(name, match); got != want {
 			t.Errorf("ChecklistItemMatches(%q) = %v, want %v", name, got, want)
@@ -594,5 +599,75 @@ func TestService_WaiveQueuesNoChecklistWhenCompletenessIsOff(t *testing.T) {
 				t.Errorf("with completeness off, Waive must not queue the checklist: %d ops after %d", n, before)
 			}
 		})
+	}
+}
+
+// While the task's latest checklist op is still waiting to run, a changed
+// checklist replaces its payload rather than queuing a second op.
+func TestService_ChecklistCoalescedIntoPendingOp(t *testing.T) {
+	ctx := context.Background()
+	ev := &fakeEvaluator{eval: screenEval()}
+	srv, store, dir := newCompletenessService(t, ev)
+	res, err := srv.Start(ctx, "task-1", dir, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	store.latestChecklistOp(t).Status = "PENDING"
+
+	ev.eval = evalWith(finding("react-screen", "story", "Page.tsx", true), finding("react-screen", "unit-test", "Page.tsx", true))
+	if _, err := srv.Checkpoint(ctx, res.Session.ID, "stories", nil, false); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	cls := store.checklists(t)
+	if len(cls) != 1 {
+		t.Fatalf("a pending op must take the new checklist: %d ops", len(cls))
+	}
+	for _, it := range cls[0].Items {
+		if !it.Resolved {
+			t.Errorf("item %+v should be resolved", it)
+		}
+	}
+}
+
+// An op that left a created item unresolved (PARTIAL) didn't fully apply its
+// checklist, so the same checklist is queued again.
+func TestService_ChecklistRequeuedAfterPartialOp(t *testing.T) {
+	ctx := context.Background()
+	ev := &fakeEvaluator{eval: screenEval()}
+	srv, store, dir := newCompletenessService(t, ev)
+	res, err := srv.Start(ctx, "task-1", dir, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	store.latestChecklistOp(t).Status = "PARTIAL"
+	if _, err := srv.Checkpoint(ctx, res.Session.ID, "no change", nil, false); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if n := len(store.checklists(t)); n != 2 {
+		t.Errorf("a checklist whose op applied in part must be queued again: %d ops", n)
+	}
+}
+
+// tf_plan pushes the checklist only once the plan is recorded.
+func TestService_PlanStateFailureQueuesNoChecklist(t *testing.T) {
+	ctx := context.Background()
+	ev := &fakeEvaluator{eval: evalWith()}
+	ev.plan = func(item PlanItem) (PlannedSubject, []CompletenessFinding, error) {
+		subject := item.Vars["name"] + ".tsx"
+		return PlannedSubject{RuleID: item.RuleID, Subject: subject},
+			[]CompletenessFinding{finding(item.RuleID, "story", subject, false)}, nil
+	}
+	srv, store, dir := newCompletenessService(t, ev)
+	res, err := srv.Start(ctx, "task-1", dir, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	store.planStateErr = errors.New("database is locked")
+	items := []PlanItem{{RuleID: "react-screen", Vars: map[string]string{"name": "Checkout"}}}
+	if _, err := srv.Plan(ctx, res.Session.ID, items, ""); err == nil {
+		t.Fatal("Plan must fail when its plan state can't be saved")
+	}
+	if n := len(store.checklists(t)); n != 0 {
+		t.Errorf("a plan that wasn't recorded must not be pushed to ClickUp: %d ops", n)
 	}
 }

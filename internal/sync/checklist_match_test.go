@@ -2,12 +2,14 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/b1codes/taskflow/internal/clickup"
+	"github.com/b1codes/taskflow/internal/config"
 	"github.com/b1codes/taskflow/internal/session"
 )
 
@@ -32,6 +34,21 @@ func TestMatchChecklistItems(t *testing.T) {
 			existing: []clickup.ChecklistItem{ci("a", "[r] A — unit ✓"), ci("b", "[r] B")},
 			want:     []session.ChecklistItem{item("K2", "[r] B", "", false), item("K1", "[r] A", "unit ✓", true)},
 			expect:   map[int]string{0: "b", 1: "a"},
+		},
+		{
+			// A void item never created has nothing to find, so it doesn't
+			// send every sync through the history read.
+			name:     "a void item never created needs no history",
+			existing: []clickup.ChecklistItem{ci("a", "[r] A")},
+			want:     []session.ChecklistItem{item("K1", "[r] A", "", false), voidItem("K2", "[r] B")},
+			expect:   map[int]string{0: "a"},
+		},
+		{
+			name:     "a void item with an item left over is looked for",
+			existing: []clickup.ChecklistItem{ci("a", "[r] A"), ci("b", "[r] B")},
+			want:     []session.ChecklistItem{item("K1", "[r] A", "", false), voidItem("K2", "[r] B")},
+			history:  map[string][]string{},
+			expect:   map[int]string{0: "a", 1: "b"},
 		},
 		{
 			name:     "status change without history",
@@ -258,6 +275,39 @@ func TestWorker_SyncChecklist_UnidentifiableCreatedItem(t *testing.T) {
 		if n, _ := st.CountPendingByTaskID(ctx, task); n != 0 {
 			t.Errorf("pending = %d", n)
 		}
+		// PARTIAL, not DONE, so the next evaluation queues the checklist
+		// again rather than taking it as applied.
+		if got := checklistOpStatuses(t, st, task); len(got) != 1 || got[0] != "PARTIAL" {
+			t.Errorf("op statuses = %v, want PARTIAL", got)
+		}
+	})
+
+	t.Run("is resolved by the next op of the same checklist", func(t *testing.T) {
+		t.Parallel()
+		const task = "task-cl-readback-fails"
+		st := newChecklistStore(t, task)
+		fake, client := newFakeChecklists(t, task)
+		// The response leaves the item out, and reading it back fails.
+		fake.omitCreated = true
+		fake.afterCreate = func(f *fakeChecklists) { f.reject = "GET /task/" }
+
+		enqueueChecklist(t, st, task, resolved)
+		drain(t, st, client)
+		if got := checklistOpStatuses(t, st, task); len(got) != 1 || got[0] != "PARTIAL" {
+			t.Fatalf("op statuses = %v, want PARTIAL", got)
+		}
+
+		fake.mu.Lock()
+		fake.reject, fake.afterCreate = "", nil
+		fake.mu.Unlock()
+		fake.state()
+		enqueueChecklist(t, st, task, resolved)
+		drain(t, st, client)
+		items, reqs := checklistItems(t, fake)
+		expectItems(t, items, []clickup.ChecklistItem{{ID: "item-2", Name: "[r] A — unit ✓", Resolved: true}})
+		if countPrefix(reqs, "POST /checklist/") != 0 {
+			t.Errorf("the item must not be created again: %v", reqs)
+		}
 	})
 
 	t.Run("is found by its stable part", func(t *testing.T) {
@@ -281,4 +331,71 @@ func TestWorker_SyncChecklist_UnidentifiableCreatedItem(t *testing.T) {
 			{ID: "item-3", Name: "[r] A", Resolved: true},
 		})
 	})
+}
+
+// An op that never applied (here, one that failed for good) is no evidence
+// of whose an item is, so its Match doesn't let its Key take another Key's
+// item.
+func TestWorker_SyncChecklist_FailedOpIsNoHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const task = "task-cl-failed-history"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	enqueueChecklist(t, st, task, item("K2", "[r] X", "", false))
+	drain(t, st, client)
+	fake.state()
+
+	// K1 once rendered X, in an op that failed before writing anything.
+	enqueueChecklist(t, st, task, item("K1", "[r] X", "", false))
+	failed, err := st.LatestSyncOp(ctx, task, session.OpSyncChecklist)
+	if err != nil || failed == nil {
+		t.Fatalf("LatestSyncOp = %+v, %v", failed, err)
+	}
+	if err := st.MarkFailedPermanent(ctx, failed.ID, "rejected"); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+
+	// K1 comes first, so it would claim X first if its failed op counted.
+	enqueueChecklist(t, st, task, item("K1", "[r] Y", "", false), item("K2", "[r] X", "", false))
+	drain(t, st, client)
+	items, _ := checklistItems(t, fake)
+	expectItems(t, items, []clickup.ChecklistItem{
+		{ID: "item-2", Name: "[r] X"},
+		{ID: "item-3", Name: "[r] Y"},
+	})
+}
+
+// The worker applies the payload of the op as it claims it, not as it was
+// listed: a newer state may have been coalesced into it in between.
+func TestWorker_AppliesClaimedPayload(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const task = "task-cl-claimed"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	enqueueChecklist(t, st, task, item("K", "[r] A", "", false))
+	listed, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("DequeuePending = %+v, %v", listed, err)
+	}
+	newer := *listed[0]
+	newer.Payload = `{"checklist_name":"` + session.ChecklistName + `","items":[{"key":"K","match":"[r] A","name":"[r] A — unit ✓","resolved":true}]}`
+	if err := st.CoalesceSyncOp(ctx, newer); err != nil {
+		t.Fatalf("CoalesceSyncOp failed: %v", err)
+	}
+
+	w := NewWorker(st, client, &config.SyncConfig{MaxRetries: 3, RateLimitMS: 1})
+	if err := w.processOp(ctx, listed[0]); err != nil {
+		t.Fatalf("processOp failed: %v", err)
+	}
+	items, _ := checklistItems(t, fake)
+	expectItems(t, items, []clickup.ChecklistItem{{ID: "item-2", Name: "[r] A — unit ✓", Resolved: true}})
+
+	// Claimed and finished: listing it again doesn't run it twice.
+	if err := w.processOp(ctx, listed[0]); !errors.Is(err, errNotClaimed) {
+		t.Errorf("processing a finished op again = %v, want errNotClaimed", err)
+	}
 }

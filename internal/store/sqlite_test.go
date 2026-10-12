@@ -573,7 +573,7 @@ func TestResetStaleInFlight_ReapsStale(t *testing.T) {
 	opID := ops[0].ID
 
 	// Mark in-flight with timestamp 10 minutes ago
-	if err := st.MarkInFlight(ctx, opID); err != nil {
+	if _, err := st.MarkInFlight(ctx, opID); err != nil {
 		t.Fatalf("MarkInFlight failed: %v", err)
 	}
 	staleTime := time.Now().Add(-10 * time.Minute)
@@ -639,7 +639,7 @@ func TestResetStaleInFlight_PreservesActiveInFlight(t *testing.T) {
 	opID := ops[0].ID
 
 	// Mark in-flight now (within the 5-minute window)
-	if err := st.MarkInFlight(ctx, opID); err != nil {
+	if _, err := st.MarkInFlight(ctx, opID); err != nil {
 		t.Fatalf("MarkInFlight failed: %v", err)
 	}
 
@@ -814,7 +814,7 @@ func TestRequeueRateLimited(t *testing.T) {
 	}
 	opID := ops[0].ID
 
-	if err := st.MarkInFlight(ctx, opID); err != nil {
+	if _, err := st.MarkInFlight(ctx, opID); err != nil {
 		t.Fatalf("MarkInFlight failed: %v", err)
 	}
 
@@ -1214,7 +1214,7 @@ func TestHasNewerOp(t *testing.T) {
 
 	// A retried older op must not undo a newer state that already applied.
 	done := enqueue(session.OpSyncChecklist, "task-a")
-	if err := st.MarkDone(ctx, done.ID); err != nil {
+	if err := st.MarkDone(ctx, done.ID, ""); err != nil {
 		t.Fatalf("MarkDone failed: %v", err)
 	}
 	if !hasNewer(older) {
@@ -1342,5 +1342,198 @@ func TestListSyncOps(t *testing.T) {
 	}
 	if len(before) != 1 || before[0].Payload != `{"n":2}` {
 		t.Errorf("expected only the op just before the latest, got %+v", before)
+	}
+}
+
+func TestCoalesceSyncOp(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	start := time.Now().Add(-time.Hour)
+
+	coalesce := func(payload string, at time.Time) {
+		t.Helper()
+		op := session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: payload, MaxRetries: 3, CreatedAt: at}
+		if err := st.CoalesceSyncOp(ctx, op); err != nil {
+			t.Fatalf("CoalesceSyncOp failed: %v", err)
+		}
+	}
+	ops := func() []*session.SyncOp {
+		t.Helper()
+		got, err := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 10)
+		if err != nil {
+			t.Fatalf("ListSyncOps failed: %v", err)
+		}
+		return got
+	}
+
+	coalesce(`{"n":1}`, start)
+	// Another task's and another operation's ops are never merged into.
+	if err := st.EnqueueSync(ctx, session.SyncOp{Operation: "POST_COMMENT", TaskID: "task-a", Payload: `{}`, MaxRetries: 3, CreatedAt: start}); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	if err := st.CoalesceSyncOp(ctx, session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-b", Payload: `{"b":1}`, MaxRetries: 3, CreatedAt: start}); err != nil {
+		t.Fatalf("CoalesceSyncOp failed: %v", err)
+	}
+
+	// A pending op takes the new state and moves to the back of the queue.
+	coalesce(`{"n":2}`, start.Add(time.Minute))
+	got := ops()
+	if len(got) != 1 || got[0].Payload != `{"n":2}` || got[0].Status != "PENDING" || !got[0].CreatedAt.Equal(start.Add(time.Minute)) {
+		t.Fatalf("ops = %+v, want the pending op with the new payload, requeued", got)
+	}
+	if pending, err := st.DequeuePending(ctx, 10); err != nil || len(pending) != 3 || pending[2].ID != got[0].ID {
+		t.Errorf("DequeuePending = %+v (err: %v), want the coalesced op last", pending, err)
+	}
+
+	// So does one failed with retries left, keeping its retries.
+	id := got[0].ID
+	if err := st.MarkFailed(ctx, id, "network error"); err != nil {
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+	coalesce(`{"n":3}`, start.Add(2*time.Minute))
+	if got = ops(); len(got) != 1 || got[0].Payload != `{"n":3}` || got[0].Status != "FAILED" || got[0].Retries != 1 {
+		t.Fatalf("ops = %+v, want the retryable op with the new payload", got)
+	}
+
+	// An op in flight is being applied: the new state is a new op.
+	if claimed, err := st.MarkInFlight(ctx, id); err != nil || claimed == nil {
+		t.Fatalf("MarkInFlight = %+v, %v", claimed, err)
+	}
+	coalesce(`{"n":4}`, start.Add(3*time.Minute))
+	if got = ops(); len(got) != 2 || got[0].Payload != `{"n":4}` || got[1].Payload != `{"n":3}` {
+		t.Fatalf("ops = %+v, want a new op beside the one in flight", got)
+	}
+
+	// Only the newest op is merged into: the next state replaces op 4's.
+	coalesce(`{"n":5}`, start.Add(4*time.Minute))
+	if got = ops(); len(got) != 2 || got[0].Payload != `{"n":5}` {
+		t.Fatalf("ops = %+v, want the newest op to take the state", got)
+	}
+
+	// Done and failed-for-good ops are finished: a new op is queued.
+	if err := st.MarkDone(ctx, got[0].ID, ""); err != nil {
+		t.Fatalf("MarkDone failed: %v", err)
+	}
+	coalesce(`{"n":6}`, start.Add(5*time.Minute))
+	got = ops()
+	if len(got) != 3 || got[0].Payload != `{"n":6}` {
+		t.Fatalf("ops = %+v, want a new op after a done one", got)
+	}
+	if err := st.MarkFailedPermanent(ctx, got[0].ID, "rejected"); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+	coalesce(`{"n":7}`, start.Add(6*time.Minute))
+	if got = ops(); len(got) != 4 || got[0].Payload != `{"n":7}` {
+		t.Fatalf("ops = %+v, want a new op after one that failed for good", got)
+	}
+
+	if other, err := st.LatestSyncOp(ctx, "task-b", session.OpSyncChecklist); err != nil || other == nil || other.Payload != `{"b":1}` {
+		t.Errorf("task-b op = %+v (err: %v)", other, err)
+	}
+}
+
+// MarkInFlight claims an op only while it waits to run, and returns it as
+// claimed, so a payload coalesced after the op was listed is the one applied.
+func TestMarkInFlight_Claims(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	op := session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: `{"n":1}`, MaxRetries: 3, CreatedAt: time.Now()}
+	if err := st.EnqueueSync(ctx, op); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	listed, err := st.DequeuePending(ctx, 1)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("DequeuePending = %+v, %v", listed, err)
+	}
+	op.Payload = `{"n":2}`
+	if err := st.CoalesceSyncOp(ctx, op); err != nil {
+		t.Fatalf("CoalesceSyncOp failed: %v", err)
+	}
+
+	claimed, err := st.MarkInFlight(ctx, listed[0].ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("MarkInFlight = %+v, %v", claimed, err)
+	}
+	if claimed.Payload != `{"n":2}` || claimed.Status != "IN_FLIGHT" || claimed.LastAttemptedAt == nil {
+		t.Errorf("claimed = %+v, want the coalesced payload, in flight", claimed)
+	}
+	if again, err := st.MarkInFlight(ctx, listed[0].ID); err != nil || again != nil {
+		t.Errorf("a second claim = %+v (err: %v), want none", again, err)
+	}
+
+	if err := st.MarkFailedPermanent(ctx, listed[0].ID, "rejected"); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+	if again, err := st.MarkInFlight(ctx, listed[0].ID); err != nil || again != nil {
+		t.Errorf("claiming an op that failed for good = %+v (err: %v), want none", again, err)
+	}
+}
+
+func TestMarkDoneAndPartial(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		op := session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: `{}`, MaxRetries: 3, CreatedAt: time.Now()}
+		if err := st.EnqueueSync(ctx, op); err != nil {
+			t.Fatalf("EnqueueSync failed: %v", err)
+		}
+		var id int64
+		if err := st.db.QueryRowContext(ctx, "SELECT MAX(id) FROM sync_queue").Scan(&id); err != nil {
+			t.Fatalf("reading op id: %v", err)
+		}
+		ids = append(ids, id)
+	}
+
+	// A note replaces an earlier attempt's error; no note keeps it.
+	if err := st.MarkFailed(ctx, ids[0], "network error"); err != nil {
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+	if err := st.MarkDone(ctx, ids[0], ""); err != nil {
+		t.Fatalf("MarkDone failed: %v", err)
+	}
+	if err := st.MarkDone(ctx, ids[1], "rejected by ClickUp: B"); err != nil {
+		t.Fatalf("MarkDone failed: %v", err)
+	}
+	if err := st.MarkPartial(ctx, ids[2], "created but left unresolved: A"); err != nil {
+		t.Fatalf("MarkPartial failed: %v", err)
+	}
+	got, err := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 10)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("ListSyncOps = %+v, %v", got, err)
+	}
+	for i, want := range []struct{ status, msg string }{
+		{"PARTIAL", "created but left unresolved: A"},
+		{"DONE", "rejected by ClickUp: B"},
+		{"DONE", "network error"},
+	} {
+		if got[i].Status != want.status || got[i].ErrorMsg != want.msg {
+			t.Errorf("op %d = %s %q, want %s %q", got[i].ID, got[i].Status, got[i].ErrorMsg, want.status, want.msg)
+		}
+	}
+
+	// A PARTIAL op applied its state: an older op must not undo it.
+	if !mustHasNewer(t, st, &session.SyncOp{ID: ids[1], TaskID: "task-a", Operation: session.OpSyncChecklist}) {
+		t.Error("a newer PARTIAL op must hold back an older one")
 	}
 }

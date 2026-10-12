@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/b1codes/taskflow/internal/clickup"
@@ -171,10 +172,18 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 		return nil
 	}
 
-	if err := w.store.MarkInFlight(ctx, op.ID); err != nil {
+	claimed, err := w.store.MarkInFlight(ctx, op.ID)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sync] failed to mark op %d in-flight: %v\n", op.ID, err)
 		return err
 	}
+	if claimed == nil {
+		// Another worker claimed it, or it finished, since it was listed.
+		return errNotClaimed
+	}
+	// The claimed row, not the listed one: a full-state op's payload may
+	// have been replaced in between (CoalesceSyncOp).
+	op = claimed
 
 	var payload SyncPayload
 	if err := json.Unmarshal([]byte(op.Payload), &payload); err != nil {
@@ -200,8 +209,21 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 
 	if errors.Is(opErr, errSuperseded) {
 		// Recorded apart from DONE: a skipped op applied nothing, so
-		// HasNewerOp must not count it as holding back older ops.
-		return w.store.MarkSkipped(ctx, op.ID, opErr.Error())
+		// HasNewerOp must not count it as holding back older ops. It still
+		// returns an error, so it isn't counted as synced.
+		if err := w.store.MarkSkipped(ctx, op.ID, opErr.Error()); err != nil {
+			return err
+		}
+		return opErr
+	}
+
+	var short *checklistShortfall
+	if errors.As(opErr, &short) {
+		fmt.Fprintf(os.Stderr, "[sync] op %d (task %s) applied in part: %v\n", op.ID, op.TaskID, short)
+		if len(short.unresolved) > 0 {
+			return w.store.MarkPartial(ctx, op.ID, short.Error())
+		}
+		return w.store.MarkDone(ctx, op.ID, short.Error())
 	}
 
 	if opErr != nil {
@@ -223,7 +245,7 @@ func (w *Worker) processOp(ctx context.Context, op *session.SyncOp) error {
 		return opErr
 	}
 
-	return w.store.MarkDone(ctx, op.ID)
+	return w.store.MarkDone(ctx, op.ID, "")
 }
 
 var (
@@ -238,7 +260,32 @@ var (
 	// errSuperseded means the op was skipped for a newer op of the same
 	// operation for the task; processOp marks it SKIPPED, not failed.
 	errSuperseded = errors.New("superseded by a newer op")
+	// errNotClaimed means the op was no longer waiting to run when the
+	// worker went to claim it.
+	errNotClaimed = errors.New("op no longer waiting to run")
 )
+
+// checklistShortfall is a SYNC_CHECKLIST op that applied all but some items:
+// rejected ones, whose create or update ClickUp refused with a 400 (the same
+// write would be refused again, so the op is DONE and only a changed
+// payload retries them), and unresolved ones, created but not identifiable
+// in ClickUp's response to resolve (the op is PARTIAL, so the next
+// evaluation queues the checklist again and finds them by name).
+type checklistShortfall struct {
+	rejected   []string
+	unresolved []string
+}
+
+func (e *checklistShortfall) Error() string {
+	var parts []string
+	if len(e.rejected) > 0 {
+		parts = append(parts, "rejected by ClickUp: "+strings.Join(e.rejected, "; "))
+	}
+	if len(e.unresolved) > 0 {
+		parts = append(parts, "created but left unresolved: "+strings.Join(e.unresolved, "; "))
+	}
+	return strings.Join(parts, "; ")
+}
 
 // isPermanent reports whether an op error will recur on every retry, so the op
 // should fail immediately instead of consuming max_retries attempts. Only a
@@ -289,7 +336,9 @@ func (w *Worker) latestSessionCompleted(ctx context.Context, taskID string) bool
 // (un)resolves items that differ. Items are never deleted, and void items
 // are only renamed, never created. The op is skipped (errSuperseded, marked
 // SKIPPED) when a newer op for the task has already been applied or still
-// will be, so a retried stale op never undoes a later state.
+// will be, so a retried stale op never undoes a later state. An item ClickUp
+// rejects doesn't stop the others: they are all applied, and the op then
+// reports a *checklistShortfall.
 func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 	var p session.ChecklistPayload
 	if err := json.Unmarshal([]byte(op.Payload), &p); err != nil {
@@ -327,6 +376,7 @@ func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 	for _, ci := range cl.Items {
 		known[ci.ID] = true
 	}
+	var short checklistShortfall
 	for i, it := range p.Items {
 		ex, ok := matched[i]
 		if !ok {
@@ -334,6 +384,10 @@ func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 				continue
 			}
 			updated, err := w.clickup.CreateChecklistItem(ctx, cl.ID, it.Name)
+			if errors.Is(err, clickup.ErrBadRequest) {
+				short.rejected = append(short.rejected, fmt.Sprintf("creating %q: %v", it.Name, err))
+				continue
+			}
 			if err != nil {
 				return checklistWriteError(fmt.Sprintf("creating checklist item %q", it.Name), err)
 			}
@@ -351,22 +405,31 @@ func (w *Worker) syncChecklist(ctx context.Context, op *session.SyncOp) error {
 			}
 			if !ok {
 				// Once created, an item must not be created again, so this
-				// isn't an error: a retry that can't match the item by name
-				// either would create a duplicate on every attempt. Leaving
-				// it unresolved until a later op is the lesser harm.
+				// isn't an error retried at once: a retry that can't match
+				// the item by name either would create a duplicate on every
+				// attempt. The op is PARTIAL instead, so the next
+				// evaluation queues the checklist again to resolve it.
 				why := fmt.Sprintf("%d new items, none identifiable", len(added))
 				if err != nil {
 					why = err.Error()
 				}
-				fmt.Fprintf(os.Stderr, "[sync] warning: created checklist item %q on task %s but couldn't find it to resolve it: %s\n", it.Name, op.TaskID, why)
+				short.unresolved = append(short.unresolved, fmt.Sprintf("%q (%s)", it.Name, why))
 				continue
 			}
 		}
 		if !sameChecklistName(ex.Name, it.Name) || ex.Resolved != it.Resolved {
-			if err := w.clickup.UpdateChecklistItem(ctx, cl.ID, ex.ID, it.Name, it.Resolved); err != nil {
+			err := w.clickup.UpdateChecklistItem(ctx, cl.ID, ex.ID, it.Name, it.Resolved)
+			if errors.Is(err, clickup.ErrBadRequest) {
+				short.rejected = append(short.rejected, fmt.Sprintf("updating %q: %v", it.Name, err))
+				continue
+			}
+			if err != nil {
 				return checklistWriteError(fmt.Sprintf("updating checklist item %q", it.Name), err)
 			}
 		}
+	}
+	if len(short.rejected) > 0 || len(short.unresolved) > 0 {
+		return &short
 	}
 	return nil
 }
@@ -436,9 +499,10 @@ const maxEarlierChecklistOps = 50
 // earlierMatches maps each obligation Key to the Match values its item had in
 // the task's earlier checklist ops, most recent first, so an item whose
 // describe text changed in the manifest is still found without storing
-// ClickUp IDs. SKIPPED ops are left out: they applied nothing, so they are no
-// evidence of whose an item is. A failed lookup only loses that matching
-// pass, so it is logged rather than failing the sync.
+// ClickUp IDs. Only ops that applied (DONE, PARTIAL) count: a skipped,
+// failed, or still-waiting op may have written nothing, so it is no evidence
+// of whose an item is. A failed lookup only loses that matching pass, so it
+// is logged rather than failing the sync.
 func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[string][]string {
 	ops, err := w.store.ListSyncOps(ctx, op.TaskID, op.Operation, op.ID, maxEarlierChecklistOps)
 	if err != nil {
@@ -449,7 +513,7 @@ func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[str
 	seen := map[[2]string]bool{}
 	for _, o := range ops { // newest first
 		var p session.ChecklistPayload
-		if o.Status == "SKIPPED" || json.Unmarshal([]byte(o.Payload), &p) != nil {
+		if (o.Status != "DONE" && o.Status != "PARTIAL") || json.Unmarshal([]byte(o.Payload), &p) != nil {
 			continue
 		}
 		for _, it := range p.Items {
@@ -466,7 +530,11 @@ func (w *Worker) earlierMatches(ctx context.Context, op *session.SyncOp) map[str
 
 // matchChecklistItems pairs each wanted item with an existing ClickUp item,
 // each existing item used at most once. When every wanted item has an item of
-// exactly its name, those are used and nothing changes. Otherwise an item
+// exactly its name, those are used and nothing changes; likewise when only
+// void items are left unmatched and no existing item is left over for them
+// (a void item that was never created has nothing to find, and void items
+// are never created), so such an item doesn't send every later sync through
+// the history read. Otherwise an item
 // goes first to the obligation Key whose earlier ops (earlier, read only then)
 // had its stable part (session.ChecklistItemMatches): each Key tries the
 // Match values it had, most recent first, one rank at a time across Keys, so
@@ -506,7 +574,7 @@ func matchChecklistItems(existing []clickup.ChecklistItem, want []session.Checkl
 	}
 
 	byName()
-	if len(matched) == len(want) || len(existing) == 0 {
+	if len(matched) == len(want) || len(existing) == 0 || (len(used) == len(existing) && onlyVoidUnmatched(want, matched)) {
 		return matched
 	}
 	var history map[string][]string
@@ -533,8 +601,19 @@ func matchChecklistItems(existing []clickup.ChecklistItem, want []session.Checkl
 	return matched
 }
 
+// onlyVoidUnmatched reports whether every wanted item without a match is void.
+func onlyVoidUnmatched(want []session.ChecklistItem, matched map[int]clickup.ChecklistItem) bool {
+	for i, it := range want {
+		if _, ok := matched[i]; !ok && !it.Void {
+			return false
+		}
+	}
+	return true
+}
+
 // checklistWriteError wraps a failed checklist write; a 400 is permanent,
-// since the same write would be rejected again.
+// since the same write would be rejected again. (A 400 to an item's write
+// only skips that item: see checklistShortfall.)
 func checklistWriteError(what string, err error) error {
 	if errors.Is(err, clickup.ErrBadRequest) {
 		return fmt.Errorf("%w: %s: %w", errChecklistRejected, what, err)

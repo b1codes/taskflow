@@ -30,10 +30,14 @@ type fakeChecklists struct {
 	nextID     int
 	// reject answers requests whose "METHOD path" has this prefix with a 400.
 	reject string
+	// rejectName answers item writes whose name has this prefix with a 400.
+	rejectName string
 	// store is what ClickUp does to an item name it is sent (nil: keeps it).
 	store func(name string) string
 	// omitCreated leaves the new item out of the create item response.
 	omitCreated bool
+	// afterCreate runs, under the lock, after each item is created.
+	afterCreate func(f *fakeChecklists)
 }
 
 func newFakeChecklists(t *testing.T, taskID string, existing ...clickup.Checklist) (*fakeChecklists, *clickup.Client) {
@@ -49,16 +53,17 @@ func (f *fakeChecklists) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	req := r.Method + " " + r.URL.Path
 	f.requests = append(f.requests, req)
-	if f.reject != "" && strings.HasPrefix(req, f.reject) {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"err": "rejected"}`))
-		return
-	}
 	var body struct {
 		Name     string `json:"name"`
 		Resolved *bool  `json:"resolved"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if (f.reject != "" && strings.HasPrefix(req, f.reject)) ||
+		(f.rejectName != "" && strings.Contains(req, "/checklist_item") && strings.HasPrefix(body.Name, f.rejectName)) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"err": "rejected"}`))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
@@ -75,6 +80,9 @@ func (f *fakeChecklists) serve(w http.ResponseWriter, r *http.Request) {
 		cl.Items = append(cl.Items, clickup.ChecklistItem{ID: f.id("item"), Name: f.storedName(body.Name)})
 		if !f.omitCreated {
 			resp = *cl
+		}
+		if f.afterCreate != nil {
+			f.afterCreate(f)
 		}
 		f.write(w, map[string]any{"checklist": resp})
 	case r.Method == "PUT" && len(parts) == 4 && parts[0] == "checklist" && parts[2] == "checklist_item":
@@ -350,7 +358,9 @@ func TestWorker_SyncChecklist_MarksVoids(t *testing.T) {
 	}
 }
 
-func TestWorker_SyncChecklist_CoalescesToNewest(t *testing.T) {
+// Two ops queued side by side (as when the newer is queued while the older
+// is in flight, so CoalesceSyncOp can't merge them): only the newer applies.
+func TestWorker_SyncChecklist_SkipsOlderOp(t *testing.T) {
 	t.Parallel()
 	const task = "task-cl-coalesce"
 	st := newChecklistStore(t, task)
@@ -358,8 +368,8 @@ func TestWorker_SyncChecklist_CoalescesToNewest(t *testing.T) {
 
 	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
 	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "structural ✓", true))
-	if n := drain(t, st, client); n != 2 {
-		t.Fatalf("expected both ops done (one skipped), got %d", n)
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected one op synced and the skipped one not counted, got %d", n)
 	}
 
 	cls, reqs := fake.state()
@@ -405,9 +415,10 @@ func TestWorker_SyncChecklist_RetryNotHeldBackBySkippedOp(t *testing.T) {
 	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
 	drain(t, st, client)
 
-	// op#2 is skipped for op#3, whose item write is then rejected for good.
+	// op#2 is skipped for op#3, whose checklist create is then rejected for
+	// good.
 	fake.mu.Lock()
-	fake.reject = "POST /checklist/"
+	fake.reject = "POST /task/"
 	fake.mu.Unlock()
 	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "structural ✓", true))
 	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "attested", true))
@@ -443,18 +454,56 @@ func TestWorker_SyncChecklist_ErrorClassification(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	t.Run("a 400 to an item write is permanent", func(t *testing.T) {
+	t.Run("a 400 to one item write skips only that item, for good", func(t *testing.T) {
 		t.Parallel()
 		const task = "task-cl-write-400"
 		st := newChecklistStore(t, task)
 		fake, client := newFakeChecklists(t, task)
-		fake.reject = "POST /checklist/"
-		enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
-		drain(t, st, client)
+		fake.rejectName = "[story] Stories for B"
+		enqueueChecklist(t, st, task,
+			item("r/story/A", "[story] Stories for A", "", false),
+			item("r/story/B", "[story] Stories for B", "", false),
+			item("r/story/C", "[story] Stories for C", "structural ✓", true),
+		)
+		if n := drain(t, st, client); n != 1 {
+			t.Fatalf("expected the op to count as synced, got %d", n)
+		}
+		cls, _ := fake.state()
+		if got := itemNames(cls[0]); len(got) != 2 || got["[story] Stories for A"] || !got["[story] Stories for C — structural ✓"] {
+			t.Errorf("items = %v, want A and C, B rejected", got)
+		}
 		st.SetRetryBackoffBase(time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
 		if ops, err := st.ListRetryable(ctx); err != nil || len(ops) != 0 {
 			t.Errorf("expected no retryable ops, got %d (err: %v)", len(ops), err)
+		}
+		ops, err := st.ListSyncOps(ctx, task, session.OpSyncChecklist, 0, 1)
+		if err != nil || len(ops) != 1 || ops[0].Status != "DONE" || !strings.Contains(ops[0].ErrorMsg, "Stories for B") {
+			t.Errorf("op = %+v (err: %v), want DONE noting the rejected item", ops, err)
+		}
+	})
+
+	t.Run("a 400 to an item update skips only that item", func(t *testing.T) {
+		t.Parallel()
+		const task = "task-cl-update-400"
+		st := newChecklistStore(t, task)
+		fake, client := newFakeChecklists(t, task)
+		enqueueChecklist(t, st, task,
+			item("r/story/A", "[story] Stories for A", "", false),
+			item("r/story/B", "[story] Stories for B", "", false),
+		)
+		drain(t, st, client)
+		fake.mu.Lock()
+		fake.rejectName = "[story] Stories for A"
+		fake.mu.Unlock()
+		enqueueChecklist(t, st, task,
+			item("r/story/A", "[story] Stories for A", "structural ✓", true),
+			item("r/story/B", "[story] Stories for B", "structural ✓", true),
+		)
+		drain(t, st, client)
+		cls, _ := fake.state()
+		if got := itemNames(cls[0]); len(got) != 2 || got["[story] Stories for A"] || !got["[story] Stories for B — structural ✓"] {
+			t.Errorf("items = %v, want A unchanged and B resolved", got)
 		}
 	})
 
@@ -687,11 +736,15 @@ func TestWorker_SyncChecklist_StaleRetryAfterNewerDone(t *testing.T) {
 	}
 	fake.state()
 
-	// op#1's retry is skipped: it must not undo op#2.
+	// op#1's retry is skipped, and not counted as synced: it must not undo
+	// op#2.
 	st.SetRetryBackoffBase(time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
-	if n := drain(t, st, client); n != 1 {
-		t.Fatalf("expected op#1's retry to be processed, got %d", n)
+	if n := drain(t, st, client); n != 0 {
+		t.Fatalf("expected op#1's retry to be skipped, got %d synced", n)
+	}
+	if got := checklistOpStatuses(t, st, task); got[0] != "SKIPPED" {
+		t.Errorf("op#1 status = %s, want SKIPPED", got[0])
 	}
 	cls, reqs := fake.state()
 	if len(reqs) != 0 {

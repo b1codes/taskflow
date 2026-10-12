@@ -127,26 +127,21 @@ func ChecklistItemMatches(name, match string) bool {
 
 // isChecklistSuffix reports whether s is a status suffix checklistItem
 // builds: "void", or "waived"/"attested" and verify levels, in that order,
-// joined by ", ", the levels as one-word names ending in " ✓".
+// joined by ", ", the levels as one-word names ending in " ✓". A status is
+// only one whole word, so a level such as "attested-by-qa" isn't read as
+// "attested" followed by junk.
 func isChecklistSuffix(s string) bool {
-	if s == checklistVoid {
+	switch s {
+	case checklistVoid, "waived", "attested":
 		return true
 	}
-	if rest, ok := strings.CutPrefix(s, "waived"); ok {
-		s = rest
-	} else if rest, ok := strings.CutPrefix(s, "attested"); ok {
-		s = rest
-	} else {
-		s = ", " + s // levels alone
-	}
-	if s == "" {
-		return true
+	for _, status := range []string{"waived", "attested"} {
+		if rest, ok := strings.CutPrefix(s, status+", "); ok {
+			s = rest
+			break
+		}
 	}
 	levels, ok := strings.CutSuffix(s, " ✓")
-	if !ok {
-		return false
-	}
-	levels, ok = strings.CutPrefix(levels, ", ")
 	if !ok {
 		return false
 	}
@@ -163,14 +158,16 @@ func isChecklistSuffix(s string) bool {
 
 // enqueueChecklist queues the session's checklist as it stands in
 // obligations unless ClickUp has it or will: it is queued when the task's
-// latest SYNC_CHECKLIST op carries a different checklist or failed for good,
+// latest SYNC_CHECKLIST op carries a different checklist, failed for good, or
+// applied only in part (PARTIAL: an item it created couldn't be resolved),
 // or when there is no op yet. Comparing with what was queued, rather than
 // with the last merge, also repairs a checklist that drifted (its op ran out
 // of retries, or the session predates the checklist). When the latest op
 // can't be read, the checklist is queued: a redundant op changes nothing in
 // ClickUp, and a missing one would leave it out of date. An empty checklist
 // is never queued: a session's obligations are never deleted, so there is
-// nothing to clear.
+// nothing to clear. The op is coalesced (enqueueSyncState): while the task's
+// latest op is still waiting to run, it takes this payload instead.
 func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligations []*Obligation) {
 	if len(obligations) == 0 {
 		return
@@ -180,13 +177,13 @@ func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligatio
 	switch {
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "[session] failed to read the latest checklist op for task %s: %v\n", sess.TaskID, err)
-	case latest != nil && !(latest.Status == "FAILED" && latest.Retries >= latest.MaxRetries):
+	case latest != nil && latest.Status != "PARTIAL" && !(latest.Status == "FAILED" && latest.Retries >= latest.MaxRetries):
 		var queued ChecklistPayload
 		if json.Unmarshal([]byte(latest.Payload), &queued) == nil && sameChecklist(queued, payload) {
 			return
 		}
 	}
-	s.enqueueSync(ctx, sess.TaskID, OpSyncChecklist, payload)
+	s.enqueueSyncState(ctx, sess.TaskID, OpSyncChecklist, payload)
 }
 
 // sameChecklist reports whether a and b carry the same items, whatever their

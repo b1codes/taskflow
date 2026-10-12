@@ -143,6 +143,17 @@ type RelatedResolution struct {
 }
 
 func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, payloadVal interface{}) {
+	s.queueSync(ctx, taskID, operation, payloadVal, s.store.EnqueueSync)
+}
+
+// enqueueSyncState queues an op whose payload is the full state its operation
+// applies, replacing the payload of the task's op still waiting to run, if
+// any (SessionStore.CoalesceSyncOp).
+func (s *Service) enqueueSyncState(ctx context.Context, taskID, operation string, payloadVal interface{}) {
+	s.queueSync(ctx, taskID, operation, payloadVal, s.store.CoalesceSyncOp)
+}
+
+func (s *Service) queueSync(ctx context.Context, taskID, operation string, payloadVal interface{}, enqueue func(context.Context, SyncOp) error) {
 	b, err := json.Marshal(payloadVal)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[session] failed to marshal sync payload (task: %s, op: %s): %v\n", taskID, operation, err)
@@ -155,7 +166,7 @@ func (s *Service) enqueueSync(ctx context.Context, taskID, operation string, pay
 		MaxRetries: 5,
 		CreatedAt:  time.Now(),
 	}
-	if err := s.store.EnqueueSync(ctx, op); err != nil {
+	if err := enqueue(ctx, op); err != nil {
 		fmt.Fprintf(os.Stderr, "[session] failed to enqueue sync op (task: %s, op: %s): %v\n", taskID, operation, err)
 	}
 }
