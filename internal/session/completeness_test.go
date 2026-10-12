@@ -15,6 +15,9 @@ type fakeEvaluator struct {
 	baseSHA string
 	eval    *Evaluation // nil = no manifest
 	calls   int
+	// run answers command checks; nil passes every one. ran records them.
+	run func(spec CommandSpec) CommandCheck
+	ran []CommandSpec
 	// plan resolves a plan item to its subject and the findings for it;
 	// nil rejects every item.
 	plan func(item PlanItem) (PlannedSubject, []CompletenessFinding, error)
@@ -41,6 +44,19 @@ func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*O
 	}
 	c := *f.eval
 	return &c, nil
+}
+
+func (f *fakeEvaluator) RunCommands(ctx context.Context, sess *Session, specs []CommandSpec) []CommandCheck {
+	var out []CommandCheck
+	for _, spec := range specs {
+		f.ran = append(f.ran, spec)
+		if f.run != nil {
+			out = append(out, f.run(spec))
+			continue
+		}
+		out = append(out, CommandCheck{Command: spec.Line, Root: spec.Root, Passed: true, RanAt: time.Now()})
+	}
+	return out
 }
 
 func (f *fakeEvaluator) Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error) {

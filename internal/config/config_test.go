@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/session"
 )
@@ -141,5 +142,31 @@ func TestCompletenessConfigGateMode(t *testing.T) {
 	// A Config not built by LoadFrom is checked the same way.
 	if got, err := (CompletenessConfig{Gate: "blok"}).GateMode(); err == nil || got != "" || !strings.Contains(err.Error(), "completeness.gate") {
 		t.Errorf("GateMode(blok) = %q, %v; want an error", got, err)
+	}
+}
+
+func TestLoadCompletenessCommands(t *testing.T) {
+	load := func(t *testing.T, content string) (*Config, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatalf("failed to write config: %v", err)
+		}
+		return LoadFrom(configPath)
+	}
+
+	cfg, err := load(t, DefaultConfigContent)
+	if err != nil || cfg.Completeness.AllowCommands || cfg.Completeness.CommandTimeout() != 300*time.Second {
+		t.Errorf("defaults = %+v, %v; want commands off, 300s", cfg.Completeness, err)
+	}
+	cfg, err = load(t, "[completeness]\nallow_commands = true\ncommand_timeout_s = 90\n")
+	if err != nil || !cfg.Completeness.AllowCommands || cfg.Completeness.CommandTimeout() != 90*time.Second {
+		t.Errorf("config = %+v, %v", cfg.Completeness, err)
+	}
+	if (CompletenessConfig{}).CommandTimeout() != 300*time.Second {
+		t.Error("an unset timeout is the default")
+	}
+	if _, err := load(t, "[completeness]\ncommand_timeout_s = -1\n"); err == nil {
+		t.Error("a negative timeout should fail to load")
 	}
 }

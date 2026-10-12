@@ -50,6 +50,12 @@ max_retries = 5
 rate_limit_ms = 600
 drain_timeout_s = 5
 
+# Projects with a completeness manifest (see "Completeness" below)
+[completeness]
+gate = "review"          # report | review | block
+allow_commands = false   # run the manifest's command checks (test suites)
+command_timeout_s = 300
+
 [database]
 path = "~/.taskflow/sessions.db"
 ```
@@ -95,6 +101,9 @@ taskflow init
 | `list` | List active / past sessions | `taskflow list --status active,paused` |
 | `stop` | Stop or pause a session | `taskflow stop <session_id> --summary "Completed auth module" --status completed` |
 | `completeness` | Report what the session still owes under the project's completeness manifest | `taskflow completeness <session_id>` |
+| `verify` | Run the session's command checks now (needs `allow_commands`) | `taskflow verify <session_id>` |
+| `check` | Exit 2 while required obligations are open; `--hook claude` for a Claude Code Stop hook | `taskflow check --project . [--hook claude]` |
+| `completeness report` | Drift report: where rules aren't followed, per b1 module | `taskflow completeness report --since 30d --format b1` |
 | `sync` | Manually drain async sync queue | `taskflow sync` |
 | `serve` | Run stdio MCP server + sync worker | `taskflow serve` |
 
@@ -152,6 +161,7 @@ Add Taskflow to your Claude MCP config (e.g. `claude_desktop_config.json`):
 | `tf_list` | `status` (string, opt), `project_path` (string, opt) | Queries coding sessions |
 | `tf_stop` | `session_id` (string), `summary` (string, opt), `status` (string, opt) | Completes (`completed`), pauses (`paused`), or archives (`archived`) a session |
 | `tf_completeness` | `session_id` (string) | Re-checks the session's changes against the completeness manifest and reports open obligations |
+| `tf_verify` | `session_id` (string) | Runs the session's command checks now (test suites, Storybook test-runner); needs `allow_commands` |
 | `tf_init` | `refresh` (bool, opt) | Scans ClickUp hierarchy and updates local cache |
 
 ---
@@ -176,7 +186,46 @@ rules:
           contains: ["export default", "{name}"]
 ```
 
-`tf_checkpoint` responses gain a `completeness` section (`newly_open`, `newly_satisfied`, `still_open`), ClickUp checkpoint comments gain a `**Completeness:** 2/5 · open: story, e2e` line, and the "Session Finished" comment lists every obligation. Nothing blocks yet. Without a manifest, nothing changes. See `docs/superpowers/specs/2026-10-10-completeness-design.md` for the full schema (stacks, command resolution, every `verify` check).
+`tf_checkpoint` responses gain a `completeness` section (`newly_open`, `newly_satisfied`, `still_open`), ClickUp checkpoint comments gain a `**Completeness:** 2/5 · open: story, e2e` line, and the "Session Finished" comment lists every obligation. Completing a session with required work open goes through the completion gate (`[completeness] gate`): `review` moves the ClickUp task to review, `block` refuses until the work is done, attested, or waived. Without a manifest, nothing changes. See `docs/superpowers/specs/2026-10-10-completeness-design.md` for the full schema (stacks, command resolution, every `verify` check).
+
+A `deleted:` trigger fires on a file removed since the session started (or a rename's old path), and the `absent:` check passes once nothing matches, e.g. "a deleted screen's stories go too":
+
+```yaml
+  - id: react-screen-deleted
+    when: { deleted: "src/features/{feature}/pages/{name}.tsx" }
+    require:
+      - id: stories-removed
+        describe: "Remove the stories for {name}"
+        verify: { absent: "src/features/{feature}/pages/{name}.stories.tsx" }
+```
+
+### Command checks
+
+A requirement's `run:` (a stack command such as `{ command: test }`, or a literal command line from the project overrides) is a command check. With `allow_commands = true` in `~/.taskflow/config.toml`, taskflow runs it with `sh -c` in the stack's `root`, with the stack's `env` over the inherited environment and a `command_timeout_s` limit (the whole process group is killed on timeout). Exit status 0 passes and adds `command` to the obligation's verified levels; anything else leaves it open, with the end of the output as evidence. Commands run when a session is completed and on demand with `tf_verify` / `taskflow verify`, never on checkpoints, and they come only from the manifest and overrides, never from tool arguments. A pass stands until the next run of the same command line. With commands off, or no command resolved for the stack, `attest_when: no_command` falls back to an attestation.
+
+### Hooks
+
+The completion gate only fires when the agent calls `tf_stop`. `taskflow check` runs outside the agent, so it can't be skipped. It finds the session from `.b1codes/session.lock`, evaluates it, and exits 2 while required obligations are open. As a Claude Code `Stop` hook (`b1 pair` installs it), it answers with Claude Code's block response listing the open work, so the agent keeps going. It allows the stop once the hook input has `stop_hook_active`, so it can't loop:
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command",
+      "command": "taskflow check --project \"$CLAUDE_PROJECT_DIR\" --hook claude" }] }]
+  }
+}
+```
+
+For any agent, an optional git `pre-push` hook keeps unfinished work off the remote (`.git/hooks/pre-push`, executable):
+
+```sh
+#!/bin/sh
+exec taskflow check --project "$(git rev-parse --show-toplevel)"
+```
+
+### Drift report
+
+`taskflow completeness report [--project PATH] [--since 30d] [--format text|json|b1]` aggregates obligations per `(source, rule, requirement)`: satisfied before any reminder (`AGENTS.md` worked), satisfied only after reminders (the guidance is weak), attested, waived (similar rationales clustered), and open at stop (the rule isn't followed). `--format b1` turns the patterns into suggestions aimed at the b1 module files to change (`modules/<module>/context/`, `modules/<module>/completeness.yaml`). Nothing is changed automatically.
 
 ---
 
@@ -216,7 +265,8 @@ Taskflow employs a clean, decoupled architecture:
 - **`internal/clickup`**: ClickUp REST client, workspace topology discovery, and custom status resolution with 24h caching.
 - **`internal/sync`**: Rate-limited background worker consuming `sync_queue` tasks with exponential backoff retries.
 - **`internal/gitctx`**: Fast Git inspection layer retrieving branch, SHA, status, dirty diffs, and the files changed since a session's base commit.
-- **`internal/completeness`**: Loads and validates the completeness manifest, resolves per-stack test commands, and checks a changed-file set against its rules.
+- **`internal/completeness`**: Loads and validates the completeness manifest, resolves per-stack test commands, and checks a changed-file set against its rules (it executes nothing; command checks are run by `internal/adapters`).
+- **`internal/drift`**: Builds the completeness drift report from the store's per-requirement counts: waiver-rationale clusters, signals, and b1 module suggestions.
 - **`internal/server`**: JSON-RPC Model Context Protocol (MCP) server implementation wrapping `session.Service`.
 
 ---

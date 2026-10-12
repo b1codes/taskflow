@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -42,8 +43,27 @@ It maintains session history, progress checkpoints, and engineering snags.`,
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
+		var exit *ExitError
+		if errors.As(err, &exit) {
+			os.Exit(exit.Code)
+		}
 		os.Exit(1)
 	}
+}
+
+// ExitError ends the command with exit status Code and no error message: the
+// command has printed what it has to say (e.g. check's open obligations).
+type ExitError struct {
+	Code int
+}
+
+func (e *ExitError) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
+
+// exitWith returns an *ExitError for cmd, silencing cobra's error and usage
+// output for it.
+func exitWith(cmd *cobra.Command, code int) error {
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	return &ExitError{Code: code}
 }
 
 func init() {
@@ -68,8 +88,12 @@ func newSessionService(st store.Store, cfg *config.Config) *session.Service {
 	if cfg != nil && cfg.ClickUp.APIKey != "" {
 		cuClient = adapters.NewClickUpAdapter(clickup.New(cfg.ClickUp.APIKey))
 	}
+	evaluator := adapters.NewCompletenessEvaluator()
+	if cfg != nil {
+		evaluator.WithCommands(cfg.Completeness.AllowCommands, cfg.Completeness.CommandTimeout())
+	}
 	srv := session.NewService(st, adapters.NewGitCapturer(), cuClient).
-		WithCompleteness(adapters.NewCompletenessEvaluator())
+		WithCompleteness(evaluator)
 	if cfg != nil {
 		srv.WithGate(cliGate(cfg))
 	}

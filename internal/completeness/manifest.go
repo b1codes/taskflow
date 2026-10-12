@@ -85,7 +85,9 @@ type Rule struct {
 	exclude  []*Pattern
 }
 
-// Trigger kinds a rule fires on. Deleted is parsed but not acted on yet.
+// Trigger kinds a rule fires on. Deleted fires on a file removed since the
+// base commit (or the old path of a rename), so a rule can ask for what was
+// built around the file to go too.
 type Trigger struct {
 	Added    string   `yaml:"added"`
 	Modified string   `yaml:"modified"`
@@ -124,7 +126,10 @@ type Requirement struct {
 
 // Verify is a set of file checks; every key present must pass.
 type Verify struct {
-	Exists      string      `yaml:"exists"`
+	Exists string `yaml:"exists"`
+	// Absent passes when nothing matches: e.g. a deleted screen's stories
+	// are gone too.
+	Absent      string      `yaml:"absent"`
 	Changed     string      `yaml:"changed"`
 	Contains    []string    `yaml:"contains"`
 	ContainsAny []string    `yaml:"contains_any"`
@@ -496,6 +501,7 @@ func validateVerify(v *Verify, at string, checkVars func(loc, tmpl string), add 
 		}
 	}
 	pattern("exists", v.Exists)
+	pattern("absent", v.Absent)
 	pattern("changed", v.Changed)
 	for _, s := range v.Contains {
 		checkVars(at+".contains", s)

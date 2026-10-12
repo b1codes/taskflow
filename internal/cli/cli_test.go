@@ -63,6 +63,8 @@ func resetFlags() {
 	listStatus = "active,paused"
 	listProject = ""
 	refreshFlag = false
+	checkSession, checkProject, checkHook = "", "", ""
+	reportProject, reportSince, reportFormat = "", "30d", "text"
 	resetCobraFlags(rootCmd)
 	// Set(DefValue) on a string array flag stores "[]" as a value.
 	planVars = nil

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/b1codes/taskflow/internal/completeness"
 	"github.com/b1codes/taskflow/internal/gitctx"
@@ -15,11 +16,24 @@ import (
 
 // CompletenessEvaluator implements session.CompletenessEvaluator using
 // internal/completeness for the rules and internal/gitctx for the changes.
-type CompletenessEvaluator struct{}
+type CompletenessEvaluator struct {
+	commands       bool
+	commandTimeout time.Duration
+}
 
-// NewCompletenessEvaluator creates a new session.CompletenessEvaluator adapter.
+// NewCompletenessEvaluator creates a new session.CompletenessEvaluator
+// adapter, with command checks off.
 func NewCompletenessEvaluator() *CompletenessEvaluator {
 	return &CompletenessEvaluator{}
+}
+
+// WithCommands turns command checks on or off (completeness.allow_commands),
+// each limited to timeout (DefaultCommandTimeout when it is 0 or less). Off,
+// evaluations carry no command checks and an attest_when: no_command
+// attestation stands in for them.
+func (e *CompletenessEvaluator) WithCommands(enabled bool, timeout time.Duration) *CompletenessEvaluator {
+	e.commands, e.commandTimeout = enabled, timeout
+	return e
 }
 
 // BaseSHA returns the project's HEAD commit, or the empty tree in a repo with
@@ -73,7 +87,7 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 		return nil, nil
 	}
 
-	ev := &session.Evaluation{Manifest: m.Path, Gate: m.Gate}
+	ev := &session.Evaluation{Manifest: m.Path, Gate: m.Gate, CommandsEnabled: e.commands}
 	rechecks := newRechecks()
 	var problems []string
 	for i, item := range items {
@@ -125,7 +139,7 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 			rechecks.add(completeness.Recheck{RuleID: o.RuleID, Subject: o.Subject})
 		}
 	}
-	res := completeness.Evaluate(sess.ProjectPath, m, overrides, changes, rechecks.list)
+	res := completeness.EvaluateWith(sess.ProjectPath, m, overrides, changes, rechecks.list, completeness.Options{Commands: e.commands})
 	ev.Warnings = append(ev.Warnings, res.Warnings...)
 	for _, d := range res.Dropped {
 		ev.Dropped = append(ev.Dropped, session.DroppedSubject{RuleID: d.RuleID, Subject: d.Subject, Reason: d.Reason})
@@ -147,6 +161,10 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 			PlanHints: r.PlanHints, PlanVars: r.PlanVars})
 	}
 	for _, f := range res.Findings {
+		var cmd *session.CommandSpec
+		if f.Command != nil {
+			cmd = &session.CommandSpec{Line: f.Command.Line, Root: f.Command.Root, Env: f.Command.Env}
+		}
 		ev.Findings = append(ev.Findings, session.CompletenessFinding{
 			RuleID:        f.RuleID,
 			RequirementID: f.RequirementID,
@@ -159,6 +177,7 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 			ChecksPassed:  f.ChecksPassed,
 			Levels:        f.Levels,
 			AttestPrompt:  f.AttestPrompt,
+			Command:       cmd,
 		})
 	}
 	return ev, nil
