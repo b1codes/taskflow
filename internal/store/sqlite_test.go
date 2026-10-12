@@ -1549,75 +1549,271 @@ func TestPruneSyncQueue(t *testing.T) {
 	ctx := context.Background()
 	old, recent := time.Now().Add(-40*24*time.Hour), time.Now().Add(-time.Hour)
 
-	// add inserts an op in a given state; lastAttempted nil leaves it unset.
-	add := func(name, operation, taskID, status string, retries int, createdAt time.Time, lastAttempted *time.Time) {
+	// add inserts an op in a given state; finishedAt nil leaves it waiting.
+	add := func(name, status string, retries int, finishedAt *time.Time) {
 		t.Helper()
-		_, err := st.db.ExecContext(ctx, `INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at, last_attempted_at)
-			VALUES (?, ?, ?, ?, ?, 3, ?, ?)`, operation, taskID, name, status, retries, createdAt, lastAttempted)
+		var fin sql.NullInt64
+		if finishedAt != nil {
+			fin = sql.NullInt64{Int64: finishedAt.Unix(), Valid: true}
+		}
+		_, err := st.db.ExecContext(ctx, `INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at, finished_at)
+			VALUES ('POST_COMMENT', 'task-a', ?, ?, ?, 3, ?, ?)`, name, status, retries, old, fin)
 		if err != nil {
 			t.Fatalf("insert %s: %v", name, err)
 		}
 	}
 
-	// Finished and old: pruned.
-	add("done-old", "POST_COMMENT", "task-a", "DONE", 0, old, &old)
-	add("partial-old", "UPDATE_STATUS", "task-a", "PARTIAL", 0, old, &old)
-	add("skipped-old", "UPDATE_STATUS", "task-a", "SKIPPED", 0, old, &old)
-	add("failed-for-good-old", "POST_COMMENT", "task-a", "FAILED", 3, old, &old)
-	add("never-claimed-old", "POST_COMMENT", "task-a", "DONE", 0, old, nil)
-	// Finished but recently touched: kept.
-	add("done-recent", "POST_COMMENT", "task-a", "DONE", 0, recent, &recent)
-	add("done-claimed-recently", "POST_COMMENT", "task-a", "DONE", 0, old, &recent)
+	// Finished long ago: pruned.
+	add("done-old", "DONE", 0, &old)
+	add("partial-old", "PARTIAL", 0, &old)
+	add("skipped-old", "SKIPPED", 0, &old)
+	add("failed-for-good-old", "FAILED", 3, &old)
+	// Finished recently, though queued long ago: kept.
+	add("done-recent", "DONE", 0, &recent)
 	// Still waiting or running, however old: kept.
-	add("pending-old", "POST_COMMENT", "task-b", "PENDING", 0, old, nil)
-	add("in-flight-old", "POST_COMMENT", "task-c", "IN_FLIGHT", 0, old, &old)
-	// A finished op older than a waiting one goes; one newer stays for HasNewerOp.
-	add("done-before-retryable", "UPDATE_STATUS", "task-d", "DONE", 0, old, &old)
-	add("retryable-old", "UPDATE_STATUS", "task-d", "FAILED", 1, old, &old)
-	add("done-after-retryable", "UPDATE_STATUS", "task-d", "DONE", 0, old, &old)
-	add("done-after-pending", "POST_COMMENT", "task-b", "DONE", 0, old, &old)
-	// Each task keeps its newest 2 finished checklist ops, whatever their
-	// age; a waiting checklist op doesn't take one of their places.
-	for _, name := range []string{"checklist-1", "checklist-2", "checklist-3", "checklist-4"} {
-		add(name, session.OpSyncChecklist, "task-e", "DONE", 0, old, &old)
-	}
-	add("checklist-pending", session.OpSyncChecklist, "task-e", "PENDING", 0, old, nil)
-	add("other-task-checklist", session.OpSyncChecklist, "task-f", "SKIPPED", 0, old, &old)
+	add("pending-old", "PENDING", 0, nil)
+	add("retryable-old", "FAILED", 1, nil)
+	add("in-flight-old", "IN_FLIGHT", 0, nil)
 
-	pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour, 2)
+	pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour)
 	if err != nil {
 		t.Fatalf("PruneSyncQueue failed: %v", err)
 	}
+	ops, err := st.ListSyncOps(ctx, "task-a", "POST_COMMENT", 0, 100)
+	if err != nil {
+		t.Fatalf("ListSyncOps failed: %v", err)
+	}
+	var kept []string
+	for i := len(ops) - 1; i >= 0; i-- {
+		kept = append(kept, ops[i].Payload)
+	}
+	want := []string{"done-recent", "pending-old", "retryable-old", "in-flight-old"}
+	if strings.Join(kept, " ") != strings.Join(want, " ") {
+		t.Errorf("kept %v,\nwant %v", kept, want)
+	}
+	if pruned != 4 {
+		t.Errorf("pruned = %d, want 4", pruned)
+	}
 
-	rows, err := st.db.QueryContext(ctx, `SELECT payload FROM sync_queue ORDER BY id`)
+	// Pruning again finds nothing left to prune.
+	if pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour); err != nil || pruned != 0 {
+		t.Errorf("second prune = %d, %v; want 0", pruned, err)
+	}
+}
+
+func TestFinishingSetsFinishedAt(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	ids := make([]int64, 6)
+	for i := range ids {
+		if err := st.EnqueueSync(ctx, session.SyncOp{Operation: "POST_COMMENT", TaskID: "task-a", Payload: "{}", MaxRetries: 2, CreatedAt: time.Now()}); err != nil {
+			t.Fatalf("EnqueueSync failed: %v", err)
+		}
+		ops, _ := st.ListSyncOps(ctx, "task-a", "POST_COMMENT", 0, 1)
+		ids[i] = ops[0].ID
+	}
+	_ = st.MarkDone(ctx, ids[0], "")
+	_ = st.MarkPartial(ctx, ids[1], "left unresolved")
+	_ = st.MarkSkipped(ctx, ids[2], "superseded")
+	_ = st.MarkFailedPermanent(ctx, ids[3], "rejected")
+	_ = st.MarkFailed(ctx, ids[4], "timeout") // 1 of 2 retries: still waiting
+	_ = st.MarkFailed(ctx, ids[5], "timeout")
+	_ = st.MarkFailed(ctx, ids[5], "timeout") // out of retries
+
+	finished := map[int64]bool{}
+	rows, err := st.db.QueryContext(ctx, `SELECT id FROM sync_queue WHERE finished_at IS NOT NULL`)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	defer rows.Close()
-	var kept []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatalf("scan: %v", err)
+		var id int64
+		_ = rows.Scan(&id)
+		finished[id] = true
+	}
+	for i, want := range []bool{true, true, true, true, false, true} {
+		if finished[ids[i]] != want {
+			t.Errorf("op %d finished = %v, want %v", i, finished[ids[i]], want)
 		}
-		kept = append(kept, name)
 	}
-	want := []string{
-		"done-recent", "done-claimed-recently",
-		"pending-old", "in-flight-old", "retryable-old",
-		"done-after-retryable", "done-after-pending",
-		"checklist-3", "checklist-4", "checklist-pending",
-		"other-task-checklist",
+}
+
+func TestSyncHistory(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
 	}
-	if strings.Join(kept, " ") != strings.Join(want, " ") {
-		t.Errorf("kept %v,\nwant %v", kept, want)
+	defer st.Close()
+	ctx := context.Background()
+
+	// enqueue queues a checklist op for task-a and returns its ID.
+	enqueue := func(payload string) int64 {
+		t.Helper()
+		if err := st.EnqueueSync(ctx, session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: payload, MaxRetries: 3, CreatedAt: time.Now()}); err != nil {
+			t.Fatalf("EnqueueSync failed: %v", err)
+		}
+		ops, _ := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 1)
+		return ops[0].ID
 	}
-	if pruned != 8 {
-		t.Errorf("pruned = %d, want 8", pruned)
+	age := func() {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, `UPDATE sync_queue SET finished_at = finished_at - 40 * 86400 WHERE finished_at IS NOT NULL`); err != nil {
+			t.Fatalf("age: %v", err)
+		}
 	}
 
-	// Pruning again finds nothing left to prune.
-	if pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour, 2); err != nil || pruned != 0 {
-		t.Errorf("second prune = %d, %v; want 0", pruned, err)
+	waiting := enqueue("waiting")
+	if err := st.MarkFailed(ctx, waiting, "timeout"); err != nil { // retries left
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+	applied := enqueue("applied")
+	_ = st.MarkPartial(ctx, applied, "left unresolved")
+	skipped := enqueue("skipped")
+	_ = st.MarkSkipped(ctx, skipped, "superseded")
+	age()
+	if _, err := st.PruneSyncQueue(ctx, 30*24*time.Hour); err != nil {
+		t.Fatalf("PruneSyncQueue failed: %v", err)
+	}
+
+	// The applied op is gone from the queue but not from the history: it
+	// still holds back the older waiting op, and stands in as the latest.
+	if ops, _ := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 10); len(ops) != 1 || ops[0].ID != waiting {
+		t.Fatalf("queue after prune = %+v, want only the waiting op", ops)
+	}
+	if !mustHasNewer(t, st, &session.SyncOp{ID: waiting, TaskID: "task-a", Operation: session.OpSyncChecklist}) {
+		t.Error("a pruned applied op must still hold back an older waiting one")
+	}
+	latest, err := st.LatestSyncOp(ctx, "task-a", session.OpSyncChecklist)
+	if err != nil || latest == nil || latest.ID != applied || latest.Status != "PARTIAL" || latest.Payload != "applied" {
+		t.Errorf("LatestSyncOp = %+v, %v; want the pruned PARTIAL op from the history", latest, err)
+	}
+	hist, err := st.ListSyncHistory(ctx, "task-a", session.OpSyncChecklist, 0, 10)
+	if err != nil || len(hist) != 1 || hist[0].ID != applied {
+		t.Errorf("history = %+v, %v; want only the applied op", hist, err)
+	}
+
+	// While an op is still queued, its own row is the latest.
+	newest := enqueue("newest")
+	if latest, _ := st.LatestSyncOp(ctx, "task-a", session.OpSyncChecklist); latest == nil || latest.ID != newest || latest.Status != "PENDING" {
+		t.Errorf("LatestSyncOp = %+v, want the pending op", latest)
+	}
+	_ = st.MarkDone(ctx, newest, "")
+	if latest, _ := st.LatestSyncOp(ctx, "task-a", session.OpSyncChecklist); latest == nil || latest.ID != newest || latest.Status != "DONE" {
+		t.Errorf("LatestSyncOp = %+v, want the done op", latest)
+	}
+
+	// The history keeps the newest MaxSyncHistory applied ops; ops that
+	// applied nothing never take their places.
+	for i := 0; i < MaxSyncHistory+5; i++ {
+		_ = st.MarkSkipped(ctx, enqueue("skipped"), "superseded")
+		_ = st.MarkDone(ctx, enqueue(fmt.Sprintf("done-%d", i)), "")
+	}
+	hist, err = st.ListSyncHistory(ctx, "task-a", session.OpSyncChecklist, 0, 1000)
+	if err != nil || len(hist) != MaxSyncHistory {
+		t.Fatalf("history = %d ops, %v; want %d", len(hist), err, MaxSyncHistory)
+	}
+	if hist[0].Payload != fmt.Sprintf("done-%d", MaxSyncHistory+4) || hist[len(hist)-1].Payload != "done-5" {
+		t.Errorf("history runs %s..%s, want the newest applied ops", hist[0].Payload, hist[len(hist)-1].Payload)
+	}
+
+	// Comments and status updates aren't kept as history.
+	if err := st.EnqueueSync(ctx, session.SyncOp{Operation: "POST_COMMENT", TaskID: "task-a", Payload: "{}", MaxRetries: 3, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	ops, _ := st.ListSyncOps(ctx, "task-a", "POST_COMMENT", 0, 1)
+	_ = st.MarkDone(ctx, ops[0].ID, "")
+	if hist, _ := st.ListSyncHistory(ctx, "task-a", "POST_COMMENT", 0, 10); len(hist) != 0 {
+		t.Errorf("comment history = %+v, want none", hist)
+	}
+}
+
+func TestSQLiteStore_Migration9_Backfill(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", buildDSN(":memory:"))
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL); INSERT INTO schema_version (version) VALUES (8);`); err != nil {
+		t.Fatalf("failed to setup schema_version: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version <= 8 {
+			if _, err := db.Exec(m.sql); err != nil {
+				t.Fatalf("migration %d failed: %v", m.version, err)
+			}
+		}
+	}
+	// Times as Go stored them: with fractional seconds and a zone, and
+	// without fractional seconds.
+	lastTouched := time.Date(2026, 3, 1, 9, 30, 15, 123456000, time.FixedZone("EST", -5*3600))
+	whole := time.Date(2026, 3, 2, 10, 0, 0, 0, time.UTC)
+	seed := []struct {
+		operation, status string
+		retries           int
+		created           time.Time
+		touched           any
+	}{
+		{"POST_COMMENT", "DONE", 0, whole, lastTouched},                // 1: finished at its last touch
+		{"POST_COMMENT", "FAILED", 3, whole, nil},                      // 2: never claimed, ages from when queued
+		{"POST_COMMENT", "FAILED", 1, whole, lastTouched},              // 3: retries left, still waiting
+		{"POST_COMMENT", "PENDING", 0, whole, nil},                     // 4
+		{session.OpSyncChecklist, "PARTIAL", 0, whole, lastTouched},    // 5: history
+		{session.OpSyncChecklist, "SKIPPED", 0, whole, lastTouched},    // 6: applied nothing
+		{session.OpSyncChecklist, "DONE", 0, whole, "not a timestamp"}, // 7: history, aged from the upgrade
+	}
+	for _, r := range seed {
+		if _, err := db.Exec(`INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at, last_attempted_at)
+			VALUES (?, 'task-a', '{}', ?, ?, 3, ?, ?)`, r.operation, r.status, r.retries, r.created, r.touched); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	before := time.Now().Unix()
+	if err := runMigrations(db); err != nil {
+		t.Fatalf("runMigrations failed on upgrade: %v", err)
+	}
+	finished := map[int64]sql.NullInt64{}
+	rows, err := db.Query(`SELECT id, finished_at FROM sync_queue`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		var at sql.NullInt64
+		_ = rows.Scan(&id, &at)
+		finished[id] = at
+	}
+	rows.Close()
+	want := map[int64]int64{1: lastTouched.Unix(), 2: whole.Unix(), 5: lastTouched.Unix(), 6: lastTouched.Unix()}
+	for id, at := range finished {
+		switch w, ok := want[id]; {
+		case id == 7:
+			if !at.Valid || at.Int64 < before {
+				t.Errorf("op 7 finished_at = %v, want the upgrade time", at)
+			}
+		case !ok:
+			if at.Valid {
+				t.Errorf("waiting op %d finished_at = %v, want NULL", id, at)
+			}
+		case !at.Valid || at.Int64 != w:
+			t.Errorf("op %d finished_at = %v, want %d", id, at, w)
+		}
+	}
+
+	st := &SQLiteStore{db: db}
+	hist, err := st.ListSyncHistory(context.Background(), "task-a", session.OpSyncChecklist, 0, 10)
+	if err != nil || len(hist) != 2 || hist[0].ID != 7 || hist[1].ID != 5 {
+		t.Errorf("history = %+v, %v; want ops 7 and 5", hist, err)
 	}
 }

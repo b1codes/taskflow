@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,5 +197,16 @@ func TestLoadSyncRetention(t *testing.T) {
 	}
 	if _, err := load(t, "[sync]\nretention_days = -1\n"); err == nil {
 		t.Error("a negative retention should fail to load")
+	}
+	// A retention too long for a time.Duration fails to load rather than
+	// wrapping around.
+	if _, err := load(t, "[sync]\nretention_days = 1000000\n"); err == nil {
+		t.Error("an overlong retention should fail to load")
+	}
+	if cfg, err := load(t, fmt.Sprintf("[sync]\nretention_days = %d\n", MaxRetentionDays)); err != nil || cfg.Sync.Retention() <= 0 {
+		t.Errorf("config = %+v, %v; want the longest retention to load", cfg, err)
+	}
+	if got := (SyncConfig{RetentionDays: 1000000}).Retention(); got != MaxRetentionDays*24*time.Hour {
+		t.Errorf("Retention() = %v, want it capped at %d days", got, MaxRetentionDays)
 	}
 }

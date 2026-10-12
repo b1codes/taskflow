@@ -44,7 +44,8 @@ type SessionStore interface {
 	// inserted.
 	CoalesceSyncOp(ctx context.Context, op SyncOp) error
 	// LatestSyncOp returns the task's most recently queued op of operation,
-	// or nil when there is none.
+	// or nil when there is none. Once that op is pruned from the queue, an
+	// applied checklist op still stands in from the task's sync history.
 	LatestSyncOp(ctx context.Context, taskID, operation string) (*SyncOp, error)
 
 	SetSessionBaseSHA(ctx context.Context, id string, sha string) error

@@ -42,12 +42,13 @@ type Store interface {
 	// another worker claimed it, or it finished.
 	MarkInFlight(ctx context.Context, id int64) (*session.SyncOp, error)
 	// MarkDone marks the op DONE; a non-empty note (e.g. items ClickUp
-	// rejected) replaces its error_msg.
+	// rejected) replaces its error_msg. A SYNC_CHECKLIST op is also recorded
+	// in the task's sync history (ListSyncHistory).
 	MarkDone(ctx context.Context, id int64, note string) error
 	// MarkPartial marks the op PARTIAL: it applied its state except for
 	// something a later op of the same state can still apply (see
 	// session.enqueueChecklist), noted in its error_msg. Like DONE, it counts
-	// as applied for HasNewerOp and as history for later ops.
+	// as applied for HasNewerOp and is recorded in the sync history.
 	MarkPartial(ctx context.Context, id int64, note string) error
 	// MarkSkipped marks the op SKIPPED, finished without applying anything
 	// because a later op superseded it (see HasNewerOp); reason is kept as
@@ -60,8 +61,8 @@ type Store interface {
 	MarkFailedPermanent(ctx context.Context, id int64, errMsg string) error
 	RequeueRateLimited(ctx context.Context, id int64, errMsg string) error
 	ListRetryable(ctx context.Context) ([]*session.SyncOp, error)
-	// HasNewerOp reports whether a later op of the same operation for the
-	// same task as op applied (DONE, PARTIAL) or still will run (pending, in
+	// HasNewerOp reports whether a later SYNC_CHECKLIST op for the same task
+	// as op applied (in its sync history) or still will run (pending, in
 	// flight, or failed with retries left), so an op carrying full state can
 	// be skipped for it: retrying it after a later one applied would undo the
 	// later state. A later op that failed for good or was itself SKIPPED
@@ -69,18 +70,21 @@ type Store interface {
 	// waiting per task, so a newer op only exists beside a waiting one when
 	// the newer was queued while the older was in flight.
 	HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error)
-	// ListSyncOps lists the task's ops of operation with an ID below beforeID
-	// (0 for no bound), newest first, at most limit of them.
+	// ListSyncOps lists the task's queued ops of operation with an ID below
+	// beforeID (0 for no bound), newest first, at most limit of them.
 	ListSyncOps(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error)
+	// ListSyncHistory lists the task's applied (DONE, PARTIAL) SYNC_CHECKLIST
+	// ops with an ID below beforeID (0 for no bound), newest first, at most
+	// limit of them. The history keeps each task's newest MaxSyncHistory
+	// applied ops apart from the queue, so pruning the queue never loses them.
+	ListSyncHistory(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error)
 	ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error)
-	// PruneSyncQueue deletes finished ops (DONE, PARTIAL, SKIPPED, or failed
-	// for good) last touched more than olderThan ago and returns how many it
-	// deleted. Ops still waiting or in flight are never touched, and neither
-	// are the rows later reads depend on: each task's newest keepPerTask
-	// finished SYNC_CHECKLIST ops (the history the worker matches items
-	// against, and LatestSyncOp for session.enqueueChecklist), and any
-	// finished op newer than a waiting op of its task (HasNewerOp).
-	PruneSyncQueue(ctx context.Context, olderThan time.Duration, keepPerTask int) (int64, error)
+	// PruneSyncQueue deletes ops that finished (DONE, PARTIAL, SKIPPED, or
+	// failed for good) more than olderThan ago and returns how many it
+	// deleted. Ops still waiting or in flight are never touched. Later reads
+	// of finished ops (HasNewerOp, LatestSyncOp, the worker's item matching)
+	// fall back on the sync history, which pruning leaves alone.
+	PruneSyncQueue(ctx context.Context, olderThan time.Duration) (int64, error)
 	SetRetryBackoffBase(d time.Duration)
 
 	GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error)

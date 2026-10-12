@@ -47,9 +47,14 @@ type SyncConfig struct {
 // sets no retention.
 const DefaultRetentionDays = 30
 
-// Retention is how long finished sync ops are kept; 0 means forever.
+// MaxRetentionDays bounds retention_days, well inside what a time.Duration
+// holds (about 292 years).
+const MaxRetentionDays = 36500
+
+// Retention is how long finished sync ops are kept; 0 means forever. Days
+// past MaxRetentionDays count as MaxRetentionDays, so it never overflows.
 func (c SyncConfig) Retention() time.Duration {
-	return time.Duration(c.RetentionDays) * 24 * time.Hour
+	return time.Duration(min(c.RetentionDays, MaxRetentionDays)) * 24 * time.Hour
 }
 
 // CompletenessConfig configures completeness enforcement for projects with a
@@ -249,8 +254,8 @@ func LoadFrom(configPath string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Completeness.Gate = string(gate)
-	if cfg.Sync.RetentionDays < 0 {
-		return nil, fmt.Errorf("invalid config: sync.retention_days must not be negative, got %d", cfg.Sync.RetentionDays)
+	if cfg.Sync.RetentionDays < 0 || cfg.Sync.RetentionDays > MaxRetentionDays {
+		return nil, fmt.Errorf("invalid config: sync.retention_days must be between 0 and %d, got %d", MaxRetentionDays, cfg.Sync.RetentionDays)
 	}
 	if cfg.Completeness.CommandTimeoutS < 0 {
 		return nil, fmt.Errorf("invalid config: completeness.command_timeout_s must be positive, got %d", cfg.Completeness.CommandTimeoutS)
