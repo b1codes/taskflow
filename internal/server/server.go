@@ -47,7 +47,8 @@ func New(st store.Store, cfg *config.Config, client *clickup.Client) (*Server, e
 	srv := &Server{
 		mcpServer: s,
 		service: session.NewService(st, adapters.NewGitCapturer(), cuClient).
-			WithCompleteness(adapters.NewCompletenessEvaluator()).
+			WithCompleteness(adapters.NewCompletenessEvaluator().
+				WithCommands(cfg.Completeness.AllowCommands, cfg.Completeness.CommandTimeout())).
 			WithGate(gate),
 		store:  st,
 		config: cfg,
@@ -106,7 +107,7 @@ func (s *Server) registerTools() {
 	), s.handleList)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_stop",
-		mcp.WithDescription("Stop or pause the session. Completing it with required completeness obligations open goes through the project's completion gate: it may move the ClickUp task to review, or (gate: block) refuse until each one is done, attested, or waived"),
+		mcp.WithDescription("Stop or pause the session. Completing it runs the completeness command checks (when enabled), and with required obligations open goes through the project's completion gate: it may move the ClickUp task to review, or (gate: block) refuse until each one is done, attested, or waived"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID to stop")),
 		mcp.WithString("summary", mcp.Description("Optional final markdown summary of achievements")),
 		mcp.WithString("status", mcp.Description("Target status: completed, paused, archived (defaults to completed)")),
@@ -116,6 +117,11 @@ func (s *Server) registerTools() {
 		mcp.WithDescription("Re-check the session's changes against the project's completeness manifest and report what is still owed (tests, stories, contracts)"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID")),
 	), s.handleCompleteness)
+
+	s.mcpServer.AddTool(mcp.NewTool("tf_verify",
+		mcp.WithDescription("Run the session's completeness command checks now (e.g. the stack's test suite or Storybook test-runner, from the project's manifest) rather than waiting for tf_stop, and report the results. A failing command keeps its obligation open, with its output. Needs command checks enabled in the user's taskflow config"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("The active session UUID")),
+	), s.handleVerify)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_waive",
 		mcp.WithDescription("Waive a completeness obligation that genuinely does not apply. The rationale is logged as a decision and posted to the ClickUp task"),
@@ -408,6 +414,18 @@ func (s *Server) handleCompleteness(ctx context.Context, request mcp.CallToolReq
 	}
 
 	return mcp.NewToolResultText(string(b)), nil
+}
+
+func (s *Server) handleVerify(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sessionID, err := request.RequireString("session_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	report, err := s.service.Verify(ctx, sessionID)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(report)
 }
 
 func (s *Server) handleInit(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -165,6 +165,14 @@ CREATE INDEX IF NOT EXISTS idx_obligations_requirement ON obligations(rule_id, r
 CREATE INDEX IF NOT EXISTS idx_sync_queue_task_op ON sync_queue(task_id, operation, id);
 `,
 	},
+	{
+		version: 8,
+		// Completeness Phase 4: the last run of an obligation's command check
+		// (JSON session.CommandCheck), kept so a pass counts until the next run.
+		sql: `
+ALTER TABLE obligations ADD COLUMN command_check TEXT;
+`,
+	},
 }
 
 func runMigrations(db *sql.DB) error {

@@ -40,7 +40,7 @@ func TestMergeObligations_Attestations(t *testing.T) {
 		o := stored("r", "e2e", "A", ObligationAttested)
 		o.VerifiedLevels = []string{"attest"}
 		f := finding("r", "e2e", "A", false)
-		f.ChecksPassed, f.Levels = true, []string{"structural"}
+		f.ChecksPassed, f.Levels, f.AttestPrompt = true, []string{"structural"}, "Name the spec"
 		mr := mergeObligations("s", []*Obligation{o}, evalWith(f), now)
 		if o.Status != ObligationSatisfied || o.SatisfiedAt == nil || !slices.Equal(o.VerifiedLevels, []string{"structural", "attest"}) || len(mr.upserts) != 1 {
 			t.Errorf("attested + checks = %+v", o)
@@ -53,7 +53,9 @@ func TestMergeObligations_Attestations(t *testing.T) {
 	t.Run("failing checks fall back to the attestation, never to open", func(t *testing.T) {
 		o := stored("r", "e2e", "A", ObligationSatisfied)
 		o.VerifiedLevels = []string{"structural", "attest"}
-		mr := mergeObligations("s", []*Obligation{o}, evalWith(finding("r", "e2e", "A", false)), now)
+		f := finding("r", "e2e", "A", false)
+		f.AttestPrompt = "Name the spec"
+		mr := mergeObligations("s", []*Obligation{o}, evalWith(f), now)
 		if o.Status != ObligationAttested || o.SatisfiedAt != nil || !slices.Equal(o.VerifiedLevels, []string{"attest"}) || mr.newlyOpen[o.ID] {
 			t.Errorf("attested, checks broke = %+v", o)
 		}

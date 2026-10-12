@@ -244,6 +244,9 @@ func (m *mockStore) UpsertObligation(ctx context.Context, o *Obligation) error {
 			have.Source, have.Severity, have.Describe = o.Source, o.Severity, o.Describe
 			have.Expected, have.Status, have.VerifiedLevels = o.Expected, o.Status, o.VerifiedLevels
 			have.SatisfiedAt, have.UpdatedAt = o.SatisfiedAt, o.UpdatedAt
+			if o.CommandCheck != nil {
+				have.CommandCheck = o.CommandCheck
+			}
 			o.ID = have.ID
 			return nil
 		}

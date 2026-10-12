@@ -234,7 +234,7 @@ rules:
 | `added` | new compared to `base_sha` (including untracked) |
 | `modified` | present at `base_sha` and changed |
 | `changed` | added or modified |
-| `deleted` | removed (reserved for Phase 4: "deleted screen → delete its stories") |
+| `deleted` | removed, or the old path of a rename (Phase 4): "deleted screen → delete its stories", checked with `absent` |
 
 `exclude` takes a list of globs that suppress the trigger.
 
@@ -257,7 +257,7 @@ rules:
 | `severity` | `required` (affects the gate) or `recommended` (reported only) |
 | `describe` | Human text, templated; used in tool responses, `AGENTS.md`, and the ClickUp checklist |
 | `only_if` | Precondition on the changed file set; if it's false, no obligation is created |
-| `verify` | File checks (§4): `exists`, `changed`, `contains`, `contains_any`, `contains_in` (check a file other than the one in `exists`), `min_matches`, `any_of`, `all_of` |
+| `verify` | File checks (§4): `exists`, `absent` (nothing matches; Phase 4, for `deleted` triggers), `changed`, `contains`, `contains_any`, `contains_in` (check a file other than the one in `exists`), `min_matches`, `any_of`, `all_of` |
 | `attest` | Prompt text; if present, the obligation also needs an attestation |
 | `attest_when` | `always` (default) or `no_command`: attestation is required only when `run` can't execute (command checks disabled, or no command could be resolved for the stack), so it stands in for the command check |
 | `run` | Optional command check (§4). Either `{ command: <name>, args: [...] }`, referring to the stack's resolved command (args are shell-quoted and appended), or a literal string (for project overrides) |

@@ -127,7 +127,14 @@ func (e *IncompleteSessionError) Error() string {
 	fmt.Fprintf(&b, "cannot complete session %s: %d required obligation(s) open (completion gate: block):", e.SessionID, len(e.Open))
 	for _, o := range e.Open {
 		fmt.Fprintf(&b, "\n  - %s: %s", o.ObligationID, o.Describe)
-		if o.Expected != "" {
+		switch c := o.Command; {
+		case c != nil:
+			fmt.Fprintf(&b, " (command `%s` in %s: %s", c.Command, c.Root, c.Result)
+			if line := lastLine(c.Output); line != "" {
+				fmt.Fprintf(&b, ": %s", line)
+			}
+			b.WriteString(")")
+		case o.Expected != "":
 			fmt.Fprintf(&b, " (expected: %s)", o.Expected)
 		}
 		if slices.Contains(e.Unrecorded, o.ObligationID) {
@@ -377,7 +384,7 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if s.completeness == nil {
 		return nil, unchecked("completeness is not enabled")
 	}
-	st, mr, err := s.evaluateUnsaved(ctx, sess)
+	st, mr, err := s.evaluateUnsaved(ctx, sess, false)
 	switch {
 	case err != nil:
 		return nil, unchecked("the evaluation failed: " + err.Error())
@@ -407,6 +414,9 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	case f == nil:
 		return nil, fmt.Errorf("%w: obligation %q (%s) wasn't checked in this evaluation (its subject isn't among the session's changes), so it can't be attested; do the work, or call tf_waive with a rationale if it doesn't apply",
 			ErrNotAttestable, obligationID, o.Describe)
+	case f.AttestPrompt == "" && f.Command != nil:
+		return nil, fmt.Errorf("%w: obligation %q (%s) is checked by running `%s` in %s, which tf_verify does now and tf_stop does at completion; fix what makes it fail, or call tf_waive with a rationale if it doesn't apply",
+			ErrNotAttestable, obligationID, o.Describe, f.Command.Line, f.Command.Root)
 	case f.AttestPrompt == "":
 		msg := fmt.Sprintf("obligation %q (%s) is checked from the project's files and asks for no attestation", obligationID, o.Describe)
 		if len(o.Expected) > 0 {
@@ -417,8 +427,10 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 
 	// With the attestation on record, passing checks satisfy the obligation;
 	// otherwise the claim stands alone (as mergeObligations would decide).
-	status, levels, now := ObligationAttested, withAttest(f.Levels), time.Now()
-	if f.ChecksPassed {
+	_, checksPassed, levels, _ := f.withCommand(o.CommandCheck)
+	status, now := ObligationAttested, time.Now()
+	levels = withAttest(levels)
+	if checksPassed {
 		status = ObligationSatisfied
 	}
 	if err := s.store.AttestObligation(ctx, o.ID, evidence, levels, status, now); err != nil {

@@ -216,14 +216,13 @@ rules:
 		"added":    {"src/moved.ts", "src/new.ts"},
 		"modified": {"src/edited.ts"},
 		"changed":  {"src/edited.ts", "src/moved.ts", "src/new.ts"},
+		// A rename deletes its old path.
+		"deleted": {"src/gone.ts", "src/old.ts"},
 	}
 	for rule, subjects := range want {
 		if !slices.Equal(got[rule], subjects) {
 			t.Errorf("%s fired for %v, want %v", rule, got[rule], subjects)
 		}
-	}
-	if len(got["deleted"]) != 0 {
-		t.Errorf("deleted triggers must not act yet, fired for %v", got["deleted"])
 	}
 }
 

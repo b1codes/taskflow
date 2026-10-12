@@ -717,12 +717,14 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 
 	// A finished session's obligations are final; only evaluate work that
 	// was still in progress. The evaluation is merged in memory only, and
-	// written once the gate lets the stop go ahead.
+	// written once the gate lets the stop go ahead. Completing it runs the
+	// command checks first, when they're enabled; a refused stop keeps
+	// nothing of them but what the error reports.
 	var st *completenessState
 	var pending *mergeResult
 	var evalErr error
 	if sess.Status == StatusActive || sess.Status == StatusPaused {
-		st, pending, evalErr = s.evaluateUnsaved(ctx, sess)
+		st, pending, evalErr = s.evaluateUnsaved(ctx, sess, tStatus == StatusCompleted)
 		if evalErr != nil {
 			fmt.Fprintf(os.Stderr, "[session] completeness evaluation failed for session %s: %v\n", sess.ID, evalErr)
 		}

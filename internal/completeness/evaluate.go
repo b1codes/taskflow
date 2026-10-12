@@ -37,7 +37,9 @@ type Finding struct {
 	Source   string
 	Severity string
 	Describe string
-	Expected []string // rendered paths/globs, relative to the project
+	// Expected lists the rendered paths/globs the checks look at, relative
+	// to the project, for display; an absent: one is prefixed AbsentPrefix.
+	Expected []string
 	// Satisfied means the requirement is met: its checks passed and it needs
 	// no attestation.
 	Satisfied bool
@@ -49,6 +51,30 @@ type Finding struct {
 	// AttestPrompt is set when the requirement also needs an attestation,
 	// which keeps it from being satisfied by file checks alone.
 	AttestPrompt string
+	// Command is the requirement's command check, set only when commands are
+	// enabled (Options.Commands) and one resolved. Satisfied and ChecksPassed
+	// leave it out: the caller runs it, and the requirement is met only once
+	// it passes too.
+	Command *CommandSpec
+}
+
+// CommandSpec is a command check to run: a command line taken only from the
+// manifest and the project overrides (args shell-quoted), never from tool
+// arguments.
+type CommandSpec struct {
+	Line string
+	// Root is the stack root it runs in, relative to the project.
+	Root string
+	// Env is merged over the inherited environment.
+	Env map[string]string
+}
+
+// Options tune an evaluation.
+type Options struct {
+	// Commands means command checks (run:) are executed by the caller: a
+	// requirement whose command resolves gets Finding.Command, and an
+	// attest_when: no_command attestation is no longer asked for it.
+	Commands bool
 }
 
 // RuleSummary describes a rule for reports.
@@ -107,15 +133,16 @@ const noCommand = "the project's test suite"
 // use it.
 const SubjectFileRequirement = "subject-file"
 
-// commandsExecuted reports whether command checks (run:) are executed. They
-// aren't yet, so an attest_when: no_command attestation always stands in for
-// the command it can't run.
-const commandsExecuted = false
+// Evaluate is EvaluateWith command checks off: a requirement with an attest
+// prompt always needs an attestation, and for attest_when: no_command the
+// attestation stands in for the command that isn't run.
+func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck) *Result {
+	return EvaluateWith(projectPath, m, o, changes, recheck, Options{})
+}
 
-// Evaluate checks changes against m. Paths in changes are relative to
-// projectPath. Command checks (run:) are not executed, so a requirement with
-// an attest prompt always needs an attestation: for attest_when: no_command
-// the attestation stands in for the command it can't run yet.
+// EvaluateWith checks changes against m. Paths in changes are relative to
+// projectPath. Nothing is executed: with opts.Commands, findings carry the
+// command checks for the caller to run.
 //
 // recheck lists earlier findings to verify again even when their subject
 // isn't in changes; a recheck that still applies is reported as found, so the
@@ -123,7 +150,7 @@ const commandsExecuted = false
 // doesn't exist, others only while it does. A recheck the manifest can no
 // longer apply to at all is reported in Result.Dropped instead, so the caller
 // can void its obligations whatever the change set.
-func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck) *Result {
+func EvaluateWith(projectPath string, m *Manifest, o *Overrides, changes []Change, recheck []Recheck, opts Options) *Result {
 	res := &Result{Stacks: ResolveStacks(projectPath, m, o)}
 	stacks := map[string]*ResolvedStack{}
 	for i := range res.Stacks {
@@ -164,6 +191,7 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			rootAbs:     filepath.Join(projectPath, filepath.FromSlash(root)),
 			changes:     relativeTo(root, sorted),
 			cache:       cache,
+			commands:    opts.Commands,
 		}
 		base := map[string]string{"stack": r.Stack, "root": root}
 
@@ -182,7 +210,7 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 				}
 			}
 			for _, ch := range c.changes {
-				if _, ok := r.match(ch); ok {
+				if len(r.fire(ch)) > 0 {
 					fired = true
 					break
 				}
@@ -205,22 +233,27 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			res.Findings = append(res.Findings, c.check(r, rs, c.projectRel(rel), rel, vars)...)
 		}
 		for _, ch := range c.changes {
-			if caps, ok := r.match(ch); ok {
-				fileFindings(ch.Path, caps)
+			for _, f := range r.fire(ch) {
+				if !checked[f.path] {
+					fileFindings(f.path, f.caps)
+				}
 			}
 		}
 		// A recheck's trigger fired in an earlier evaluation; it still applies
-		// while the file fits the rule and, unless it was declared, exists.
+		// while the file fits the rule and, unless it was declared, is still
+		// as its trigger found it.
 		for _, rc := range rechecks[r.ID] {
 			rel, ok := c.rootRel(rc.Subject)
 			if !ok {
 				drop(rc, fmt.Sprintf("it is outside stack %s's root %q", r.Stack, root))
 				continue
 			}
-			caps, ok := r.matchPath(rel)
+			caps, ok := r.matchPath(rel, false)
 			if !ok {
-				drop(rc, "it no longer fits the rule's triggers")
-				continue
+				if caps, ok = r.matchPath(rel, true); !ok {
+					drop(rc, "it no longer fits the rule's triggers")
+					continue
+				}
 			}
 			if rc.SubjectFile {
 				res.Findings = append(res.Findings, c.subjectFile(r, rc.Subject, rel, caps, base))
@@ -228,13 +261,13 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 			if checked[rel] {
 				continue
 			}
-			// No trigger fires on a deleted file (deleted: is parsed but not
-			// acted on, and changed: skips deletions), so an undeclared
-			// subject existed when it was found, and once it's gone so is the
-			// work. Acting on deleted: triggers would need their subjects
-			// checked without the file.
+			// An undeclared subject still applies while its file is as its
+			// trigger found it: present for added/modified/changed, gone for
+			// deleted. Otherwise the work it named is gone too (the file was
+			// deleted, or restored).
 			if !rc.Declared {
-				if _, err := statInRoot(c.rootAbs, rel); err != nil {
+				_, err := statInRoot(c.rootAbs, rel)
+				if caps, ok = r.matchPath(rel, err != nil); !ok {
 					continue
 				}
 			}
@@ -249,49 +282,70 @@ func Evaluate(projectPath string, m *Manifest, o *Overrides, changes []Change, r
 	return res
 }
 
-// match reports whether ch fires one of r's triggers, with its captures.
-// Deleted triggers are parsed but not acted on yet.
-func (r *Rule) match(ch Change) (map[string]string, bool) {
-	for _, ex := range r.exclude {
-		if _, ok := ex.Match(ch.Path); ok {
-			return nil, false
-		}
-	}
-	for _, t := range r.triggers {
-		var fires bool
-		switch t.kind {
-		case "added":
-			// A renamed file is new at its path compared to the base.
-			fires = ch.Type == Added || ch.Type == Renamed
-		case "modified":
-			fires = ch.Type == Modified
-		case "changed":
-			fires = ch.Type != Deleted
-		}
-		if !fires {
-			continue
-		}
-		if caps, ok := t.pattern.Match(ch.Path); ok {
-			return caps, true
-		}
-	}
-	return nil, false
+// firing is a subject a change fires a rule's trigger on.
+type firing struct {
+	path string
+	caps map[string]string
 }
 
-// matchPath reports whether path fits one of r's acted-on triggers whatever
-// its change type, with the captures.
-func (r *Rule) matchPath(p string) (map[string]string, bool) {
+// fire returns the subjects ch fires r's triggers on: its path for added,
+// modified, and changed triggers, and for deleted ones the file that is gone,
+// which for a rename is its old path. A rename can fire both.
+func (r *Rule) fire(ch Change) []firing {
+	var out []firing
+	present := ch.Type != Deleted
+	if present {
+		if caps, ok := r.matchKind(ch.Path, func(kind string) bool {
+			switch kind {
+			case "added":
+				// A renamed file is new at its path compared to the base.
+				return ch.Type == Added || ch.Type == Renamed
+			case "modified":
+				return ch.Type == Modified
+			case "changed":
+				return true
+			}
+			return false
+		}); ok {
+			out = append(out, firing{ch.Path, caps})
+		}
+	}
+	gone := ""
+	switch {
+	case ch.Type == Deleted:
+		gone = ch.Path
+	case ch.Type == Renamed && ch.OldPath != "":
+		gone = ch.OldPath
+	}
+	if gone != "" {
+		if caps, ok := r.matchPath(gone, true); ok {
+			out = append(out, firing{gone, caps})
+		}
+	}
+	return out
+}
+
+// matchPath reports whether p fits one of r's deleted triggers (deleted
+// set) or else one of its added, modified, or changed ones, whatever its
+// change type, with the captures.
+func (r *Rule) matchPath(p string, deleted bool) (map[string]string, bool) {
+	return r.matchKind(p, func(kind string) bool { return (kind == "deleted") == deleted })
+}
+
+// matchKind matches p against r's triggers of the kinds use accepts, unless
+// one of r's excludes matches it.
+func (r *Rule) matchKind(p string, use func(kind string) bool) (map[string]string, bool) {
 	for _, ex := range r.exclude {
 		if _, ok := ex.Match(p); ok {
 			return nil, false
 		}
 	}
 	for _, t := range r.triggers {
-		switch t.kind {
-		case "added", "modified", "changed":
-			if caps, ok := t.pattern.Match(p); ok {
-				return caps, true
-			}
+		if !use(t.kind) {
+			continue
+		}
+		if caps, ok := t.pattern.Match(p); ok {
+			return caps, true
 		}
 	}
 	return nil, false
@@ -312,7 +366,9 @@ func summarize(r *Rule) RuleSummary {
 	return s
 }
 
-// relativeTo returns the changes under root, with paths relative to it.
+// relativeTo returns the changes under root, with paths relative to it. A
+// rename across root's edge is, inside it, an addition (moved in, with no
+// old path) or a deletion (moved out).
 func relativeTo(root string, changes []Change) []Change {
 	if root == "." {
 		return changes
@@ -320,9 +376,21 @@ func relativeTo(root string, changes []Change) []Change {
 	prefix := strings.TrimSuffix(root, "/") + "/"
 	var out []Change
 	for _, ch := range changes {
-		if rel, ok := strings.CutPrefix(ch.Path, prefix); ok {
+		rel, in := strings.CutPrefix(ch.Path, prefix)
+		old, oldIn := "", false
+		if ch.OldPath != "" {
+			old, oldIn = strings.CutPrefix(ch.OldPath, prefix)
+		}
+		switch {
+		case in:
 			ch.Path = rel
+			ch.OldPath = old
+			if !oldIn {
+				ch.OldPath = ""
+			}
 			out = append(out, ch)
+		case oldIn:
+			out = append(out, Change{Path: old, Type: Deleted})
 		}
 	}
 	return out
@@ -336,6 +404,7 @@ type checker struct {
 	rootAbs     string
 	changes     []Change
 	cache       *fsCache
+	commands    bool // Options.Commands
 }
 
 func (c *checker) projectRel(rel string) string {
@@ -388,7 +457,13 @@ func (c *checker) check(r *Rule, rs *ResolvedStack, subject, subjectPath string,
 			}
 		}
 		f.ChecksPassed = f.Satisfied
-		if needsAttestation(q, rs) {
+		if c.commands && q.Run != nil && qvars["command"] != noCommand {
+			f.Command = &CommandSpec{Line: qvars["command"], Root: c.root}
+			if rs != nil {
+				f.Command.Env = rs.Env
+			}
+		}
+		if needsAttestation(q, rs, c.commands) {
 			f.AttestPrompt, _ = render(q.Attest, qvars)
 			f.Satisfied = false
 		}
@@ -426,14 +501,14 @@ func (c *checker) subjectFile(r *Rule, subject, rel string, caps, base map[strin
 // needsAttestation reports whether q needs an attestation to be met:
 // always for attest_when: always, and for no_command while its command check
 // can't run (commands aren't executed, or none resolved for the stack).
-func needsAttestation(q *Requirement, rs *ResolvedStack) bool {
+func needsAttestation(q *Requirement, rs *ResolvedStack, commands bool) bool {
 	if q.Attest == "" {
 		return false
 	}
 	if q.AttestWhen != AttestNoCommand {
 		return true
 	}
-	return !commandsExecuted || q.Run == nil || commandFor(q, rs, nil) == noCommand
+	return !commands || q.Run == nil || commandFor(q, rs, nil) == noCommand
 }
 
 // commandFor renders {command}: the requirement's run command (with its
@@ -482,6 +557,16 @@ func (c *checker) verify(v *Verify, vars map[string]string, subjectPath string) 
 			return false
 		}
 		targets, haveTargets = matches, true
+	}
+	if v.Absent != "" {
+		pat, missing := renderPath(v.Absent, vars)
+		if len(missing) > 0 {
+			return false
+		}
+		matches, err := c.cache.glob(c.rootAbs, pat)
+		if err != nil || len(matches) > 0 {
+			return false
+		}
 	}
 	if v.Changed != "" {
 		matches := c.changedMatching(v.Changed, vars)
@@ -588,21 +673,29 @@ func (c *checker) changedMatching(tmpl string, vars map[string]string) []string 
 }
 
 // expected lists the rendered paths and globs v checks, relative to the
-// project, for showing the agent where the work is expected.
+// project, for showing the agent where the work is expected. An absent:
+// pattern is the opposite of where work is expected, so it is listed as
+// "must not exist: <path>" rather than as a bare path the agent would
+// take for a file to create.
 func (c *checker) expected(v *Verify, vars map[string]string) []string {
 	var out []string
 	seen := map[string]bool{}
+	add := func(prefix, tmpl string) {
+		if tmpl == "" {
+			return
+		}
+		p, _ := renderPath(tmpl, vars)
+		if p = prefix + c.projectRel(p); !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
 	var walk func(v *Verify)
 	walk = func(v *Verify) {
-		for _, tmpl := range []string{v.Exists, v.Changed, fileOf(v.ContainsIn), fileOfMM(v.MinMatches)} {
-			if tmpl == "" {
-				continue
-			}
-			p, _ := renderPath(tmpl, vars)
-			if p = c.projectRel(p); !seen[p] {
-				seen[p] = true
-				out = append(out, p)
-			}
+		add("", v.Exists)
+		add(AbsentPrefix, v.Absent)
+		for _, tmpl := range []string{v.Changed, fileOf(v.ContainsIn), fileOfMM(v.MinMatches)} {
+			add("", tmpl)
 		}
 		for i := range v.AnyOf {
 			walk(&v.AnyOf[i])
@@ -614,6 +707,10 @@ func (c *checker) expected(v *Verify, vars map[string]string) []string {
 	walk(v)
 	return out
 }
+
+// AbsentPrefix marks an Expected entry that names a path that must not
+// exist (an absent: check) rather than one where work is expected.
+const AbsentPrefix = "must not exist: "
 
 func fileOf(ci *ContainsIn) string {
 	if ci == nil {

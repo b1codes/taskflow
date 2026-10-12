@@ -15,6 +15,9 @@ type fakeEvaluator struct {
 	baseSHA string
 	eval    *Evaluation // nil = no manifest
 	calls   int
+	// run answers command checks; nil passes every one. ran records them.
+	run func(spec CommandSpec) CommandCheck
+	ran []CommandSpec
 	// plan resolves a plan item to its subject and the findings for it;
 	// nil rejects every item.
 	plan func(item PlanItem) (PlannedSubject, []CompletenessFinding, error)
@@ -40,7 +43,22 @@ func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*O
 		return nil, nil
 	}
 	c := *f.eval
+	// Like the real evaluator, each evaluation has its own findings.
+	c.Findings = slices.Clone(f.eval.Findings)
 	return &c, nil
+}
+
+func (f *fakeEvaluator) RunCommands(ctx context.Context, sess *Session, specs []CommandSpec) []CommandCheck {
+	var out []CommandCheck
+	for _, spec := range specs {
+		f.ran = append(f.ran, spec)
+		if f.run != nil {
+			out = append(out, f.run(spec))
+			continue
+		}
+		out = append(out, CommandCheck{Command: spec.Line, Root: spec.Root, Passed: true, RanAt: time.Now()})
+	}
+	return out
 }
 
 func (f *fakeEvaluator) Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error) {
@@ -122,7 +140,9 @@ func TestMergeObligations(t *testing.T) {
 	t.Run("waived and attested are sticky", func(t *testing.T) {
 		waived, attested := stored("r", "story", "A", ObligationWaived), stored("r", "e2e", "A", ObligationAttested)
 		gone := stored("r", "story", "B", ObligationWaived)
-		mergeObligations("s", []*Obligation{waived, attested, gone}, evalWith(finding("r", "story", "A", false), finding("r", "e2e", "A", true)), now)
+		e2e := finding("r", "e2e", "A", false)
+		e2e.AttestPrompt = "Name the spec" // an attestation stands while it is asked for
+		mergeObligations("s", []*Obligation{waived, attested, gone}, evalWith(finding("r", "story", "A", false), e2e), now)
 		if waived.Status != ObligationWaived || attested.Status != ObligationAttested {
 			t.Errorf("sticky statuses changed: %s, %s", waived.Status, attested.Status)
 		}

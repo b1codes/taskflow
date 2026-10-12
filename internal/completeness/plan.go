@@ -73,7 +73,7 @@ func PlanSubject(m *Manifest, ruleID string, vars map[string]string) (*PlannedSu
 	}
 
 	rel, _ := renderPath(p.String(), vars)
-	if _, ok := r.matchPath(rel); !ok {
+	if _, ok := r.matchPath(rel, false); !ok {
 		return nil, fmt.Errorf("rule %q doesn't apply to %s (excluded)", ruleID, rel)
 	}
 	root := "."

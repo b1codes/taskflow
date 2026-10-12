@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/b1codes/taskflow/internal/session"
@@ -46,6 +47,24 @@ type CompletenessConfig struct {
 	// obligations are open: report, review, or block. It is a floor: a
 	// manifest's gate can make it stricter, never looser.
 	Gate string `toml:"gate"`
+	// AllowCommands runs the manifest's command checks (run:) at a completing
+	// stop and with tf_verify / taskflow verify. Off, an attestation stands
+	// in for them where the manifest allows (attest_when: no_command).
+	AllowCommands bool `toml:"allow_commands"`
+	// CommandTimeoutS limits each command check, in seconds.
+	CommandTimeoutS int `toml:"command_timeout_s"`
+}
+
+// DefaultCommandTimeoutS is the command check time limit when config sets
+// none.
+const DefaultCommandTimeoutS = 300
+
+// CommandTimeout is CommandTimeoutS as a duration, the default when unset.
+func (c CompletenessConfig) CommandTimeout() time.Duration {
+	if c.CommandTimeoutS <= 0 {
+		return DefaultCommandTimeoutS * time.Second
+	}
+	return time.Duration(c.CommandTimeoutS) * time.Second
 }
 
 // GateMode parses Gate with session.ParseGateMode, the one check of gate
@@ -104,8 +123,16 @@ drain_timeout_s = 5
 #   block  = refuse to complete until the work is done, attested, or waived
 # This is a floor: a project manifest's "gate:" can make it stricter, never
 # looser, so an agent can't lower it by editing the repo.
+#
+# allow_commands runs the manifest's command checks (run:, e.g. the test
+# suite) when a session is completed and with tf_verify / taskflow verify,
+# in each stack's root, with a time limit of command_timeout_s seconds.
+# Commands come only from the project's manifest and overrides. Off, an
+# attestation stands in for them where the manifest allows.
 [completeness]
 gate = "review"
+allow_commands = false
+command_timeout_s = 300
 
 [database]
 path = "~/.taskflow/sessions.db"
@@ -183,7 +210,8 @@ func LoadFrom(configPath string) (*Config, error) {
 			DrainTimeoutS: 5,
 		},
 		Completeness: CompletenessConfig{
-			Gate: string(session.DefaultGate),
+			Gate:            string(session.DefaultGate),
+			CommandTimeoutS: DefaultCommandTimeoutS,
 		},
 		Database: DatabaseConfig{
 			Path: "~/.taskflow/sessions.db",
@@ -205,6 +233,9 @@ func LoadFrom(configPath string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Completeness.Gate = string(gate)
+	if cfg.Completeness.CommandTimeoutS < 0 {
+		return nil, fmt.Errorf("invalid config: completeness.command_timeout_s must be positive, got %d", cfg.Completeness.CommandTimeoutS)
+	}
 
 	if apiKey := os.Getenv("CLICKUP_API_KEY"); apiKey != "" {
 		cfg.ClickUp.APIKey = apiKey

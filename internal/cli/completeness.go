@@ -46,36 +46,78 @@ var completenessCmd = &cobra.Command{
 			return nil
 		}
 
-		if !report.Enabled {
-			fmt.Println("No completeness manifest (.agents/completeness.yaml or .taskflow/completeness.yaml) in this session's project.")
-			return nil
-		}
-		fmt.Printf("Completeness for session %s (%s)\n", report.SessionID, report.Manifest)
-		if report.Error != "" {
-			fmt.Printf("  ✗ %s\n", report.Error)
-		}
-		sum := report.Summary
-		fmt.Printf("  open: %d · satisfied: %d · attested: %d · waived: %d\n", sum.Open, sum.Satisfied, sum.Attested, sum.Waived)
-		for _, o := range report.Obligations {
-			fmt.Printf("  %s %s [%s, %s]\n", statusMark(o.Status), o.Describe, o.Rule+"/"+o.Requirement, o.Severity)
-			if o.Status == session.ObligationOpen && o.Expected != "" {
-				fmt.Printf("      expected: %s\n", o.Expected)
-			}
-		}
-		for _, s := range report.Stacks {
-			for _, name := range sortedCommandNames(s.Commands) {
-				line := "(unresolved)"
-				if c := s.Commands[name]; c != nil {
-					line = *c
-				}
-				fmt.Printf("  stack %s (%s) %s: %s\n", s.ID, s.Root, name, line)
-			}
-		}
-		for _, w := range report.Warnings {
-			fmt.Printf("  ! %s\n", w)
-		}
+		printReport(report)
 		return nil
 	},
+}
+
+// printReport prints a completeness report as text.
+func printReport(report *session.CompletenessReport) {
+	if !report.Enabled {
+		fmt.Println("No completeness manifest (.agents/completeness.yaml or .taskflow/completeness.yaml) in this session's project.")
+		return
+	}
+	fmt.Printf("Completeness for session %s (%s)\n", report.SessionID, report.Manifest)
+	if report.Error != "" {
+		fmt.Printf("  ✗ %s\n", report.Error)
+	}
+	sum := report.Summary
+	fmt.Printf("  open: %d · satisfied: %d · attested: %d · waived: %d\n", sum.Open, sum.Satisfied, sum.Attested, sum.Waived)
+	for _, o := range report.Obligations {
+		fmt.Printf("  %s %s [%s, %s]\n", statusMark(o.Status), o.Describe, o.Rule+"/"+o.Requirement, o.Severity)
+		if o.Status == session.ObligationOpen && o.Expected != "" {
+			fmt.Printf("      expected: %s\n", o.Expected)
+		}
+		printCommandView(o.Command)
+	}
+	for _, c := range report.Commands {
+		mark := "✗"
+		if c.Passed {
+			mark = "✓"
+		}
+		fmt.Printf("  %s ran `%s` in %s", mark, c.Command, c.Root)
+		if !c.Passed {
+			fmt.Printf(" (exit %d)", c.ExitCode)
+			if c.Error != "" {
+				fmt.Printf(": %s", c.Error)
+			}
+		}
+		fmt.Println()
+	}
+	for _, s := range report.Stacks {
+		for _, name := range sortedCommandNames(s.Commands) {
+			line := "(unresolved)"
+			if c := s.Commands[name]; c != nil {
+				line = *c
+			}
+			fmt.Printf("  stack %s (%s) %s: %s\n", s.ID, s.Root, name, line)
+		}
+	}
+	if report.Enabled && !report.CommandsEnabled {
+		fmt.Println("  command checks: off (completeness.allow_commands)")
+	}
+	for _, w := range report.Warnings {
+		fmt.Printf("  ! %s\n", w)
+	}
+}
+
+// printCommandView prints an obligation's command check, with the end of a
+// failed run's output.
+func printCommandView(c *session.CommandView) {
+	if c == nil {
+		return
+	}
+	fmt.Printf("      command: `%s` in %s: %s\n", c.Command, c.Root, c.Result)
+	if c.Output == "" {
+		return
+	}
+	lines := strings.Split(strings.TrimRight(c.Output, "\n"), "\n")
+	if len(lines) > 10 {
+		lines = lines[len(lines)-10:]
+	}
+	for _, l := range lines {
+		fmt.Printf("        | %s\n", l)
+	}
 }
 
 func printContractCompleteness(c *session.ContractCompleteness) {

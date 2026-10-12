@@ -77,5 +77,42 @@ type Store interface {
 
 	GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error)
 
+	// DriftReport aggregates obligations per (source, rule, requirement)
+	// across sessions, for the completeness drift report. It leaves out void
+	// obligations, inherited copies (their source session counts them), and
+	// tf_plan's subject-file obligations, which no rule asks for.
+	DriftReport(ctx context.Context, filter DriftFilter) ([]*DriftRow, error)
+
 	Close() error
+}
+
+// DriftFilter narrows DriftReport.
+type DriftFilter struct {
+	// ProjectPath keeps one project's sessions; "" keeps every project.
+	ProjectPath string
+	// Since keeps obligations first seen at or after it; zero keeps all.
+	Since time.Time
+}
+
+// DriftRow is one requirement's obligations across sessions, by how each
+// one ended up.
+type DriftRow struct {
+	Source        string `json:"source"`
+	RuleID        string `json:"rule_id"`
+	RequirementID string `json:"requirement_id"`
+	Obligations   int    `json:"obligations"`
+	Sessions      int    `json:"sessions"`
+	// SatisfiedFirst were satisfied before the agent was ever reminded of
+	// them: AGENTS.md did the work.
+	SatisfiedFirst int `json:"satisfied_first"`
+	// SatisfiedAfterReminder were satisfied after at least one reminder.
+	SatisfiedAfterReminder int `json:"satisfied_after_reminder"`
+	Attested               int `json:"attested"`
+	Waived                 int `json:"waived"`
+	// OpenAtStop were open when their session was completed or archived.
+	OpenAtStop int `json:"open_at_stop"`
+	// OpenInProgress are open in sessions still active or paused.
+	OpenInProgress int `json:"open_in_progress"`
+	// WaiverRationales are the waived obligations' rationales.
+	WaiverRationales []string `json:"waiver_rationales,omitempty"`
 }

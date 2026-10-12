@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,10 +16,12 @@ import (
 )
 
 // ObligationStatus is the state of one obligation. Waived is set by tf_waive
-// and evaluation never changes it. Attested is set by tf_attest; evaluation
-// then moves the obligation between attested (the claim stands alone) and
-// satisfied (the claim plus passing checks meet the requirement), never back
-// to open.
+// and evaluation never changes it. Attested is set by tf_attest; while the
+// requirement still asks for an attestation, evaluation then moves the
+// obligation between attested (the claim stands alone) and satisfied (the
+// claim plus passing checks meet the requirement), never back to open. Once
+// it no longer asks for one, the attestation lapses: the obligation is open
+// or satisfied by its checks alone.
 type ObligationStatus string
 
 const (
@@ -28,8 +32,12 @@ const (
 	ObligationVoid      ObligationStatus = "void"
 )
 
-// levelAttest is the verified level an attestation adds.
-const levelAttest = "attest"
+// levelAttest is the verified level an attestation adds, and levelCommand
+// the one a passing command check adds.
+const (
+	levelAttest  = "attest"
+	levelCommand = "command"
+)
 
 // Obligation is one requirement applied to one subject in one session.
 type Obligation struct {
@@ -49,9 +57,13 @@ type Obligation struct {
 	Planned          bool             `json:"planned"`
 	InheritedFrom    string           `json:"inherited_from"`
 	RemindedCount    int              `json:"reminded_count"`
-	FirstSeenAt      time.Time        `json:"first_seen_at"`
-	SatisfiedAt      *time.Time       `json:"satisfied_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	// CommandCheck is the last run of the obligation's command check. A pass
+	// counts only for the same command line, and only while the project is
+	// as it was when the command ran (CommandSpec.Fingerprint).
+	CommandCheck *CommandCheck `json:"command_check,omitempty"`
+	FirstSeenAt  time.Time     `json:"first_seen_at"`
+	SatisfiedAt  *time.Time    `json:"satisfied_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 func (o *Obligation) key() string {
@@ -70,6 +82,17 @@ func subjectKey(ruleID, subject string) string {
 // the attestation when its checks later pass and it becomes satisfied.
 func (o *Obligation) attested() bool {
 	return o.Status == ObligationAttested || slices.Contains(o.VerifiedLevels, levelAttest)
+}
+
+// standingEvidence is o's evidence while it stands: a waiver's rationale, or
+// an attestation that still counts. A lapsed attestation's evidence is kept
+// on record but not shown, so it isn't mistaken for what meets the
+// requirement now.
+func (o *Obligation) standingEvidence() string {
+	if o.Status == ObligationWaived || o.attested() {
+		return o.Evidence
+	}
+	return ""
 }
 
 // withAttest returns levels plus the attest level.
@@ -97,10 +120,130 @@ type CompletenessFinding struct {
 	Levels       []string
 	// AttestPrompt is set when the requirement needs an attestation.
 	AttestPrompt string
+	// Command is the requirement's command check, set only while command
+	// checks are enabled and one resolved. Satisfied and ChecksPassed leave
+	// it out: the requirement is met only once it passes too.
+	Command *CommandSpec
+	// CommandResult is the command run for this evaluation (tf_verify, or a
+	// completing stop); nil when it wasn't run, and the obligation's last run
+	// stands.
+	CommandResult *CommandCheck
 }
 
 func (f *CompletenessFinding) key() string {
 	return f.RuleID + "\x00" + f.RequirementID + "\x00" + f.Subject
+}
+
+// CommandSpec is a command check from the project's manifest or overrides,
+// never from tool arguments.
+type CommandSpec struct {
+	Line string
+	// Root is the directory it runs in, relative to the project.
+	Root string
+	// Env is merged over the inherited environment.
+	Env map[string]string
+	// Fingerprint identifies the state the command would run against: the
+	// whole repository's work tree and Env. The evaluator takes it only when
+	// a stored pass of the same command could be compared with it; it is ""
+	// otherwise, and when it can't be taken (no git), and then a pass counts
+	// only in the evaluation that ran it.
+	Fingerprint string
+}
+
+// runKey identifies one run: the same line in the same root with the same
+// env. Specs that differ in any of them are run separately.
+func (c *CommandSpec) runKey() string { return c.Root + "\x00" + c.Line + "\x00" + c.envKey() }
+
+// envKey identifies Env: a digest of its sorted pairs (so no value is
+// stored), "" when it is empty.
+func (c *CommandSpec) envKey() string {
+	if len(c.Env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(c.Env))
+	for k := range c.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k + "\x00" + c.Env[k] + "\x00"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CommandCheck is one run of a command check: exit status 0 passes.
+type CommandCheck struct {
+	Command  string `json:"command"`
+	Root     string `json:"root"`
+	Passed   bool   `json:"passed"`
+	ExitCode int    `json:"exit_code"`
+	// TimedOut means it was killed at the time limit.
+	TimedOut bool `json:"timed_out,omitempty"`
+	// Error says why it couldn't start, or why it was cut short; ExitCode is
+	// then -1.
+	Error string `json:"error,omitempty"`
+	// Output is the combined stdout and stderr, truncated to its end.
+	Output string    `json:"output,omitempty"`
+	RanAt  time.Time `json:"ran_at"`
+	// Fingerprint is the state it ran against, as the runner stamped it, or
+	// else the spec's when it ran.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// Env is the spec's envKey: a run counts only for the env it ran with.
+	Env string `json:"env,omitempty"`
+}
+
+// runs reports whether c is a run of spec: the same line, root, and env. A
+// run recorded without an env (before Env was kept) is a run only of a spec
+// with none.
+func (c *CommandCheck) runs(spec *CommandSpec) bool {
+	return c != nil && spec != nil && c.Command == spec.Line && c.Root == spec.Root && c.Env == spec.envKey()
+}
+
+// current reports whether c, a run of spec, ran against the state spec would
+// run against now: nothing under its root or in its env changed since. With
+// no fingerprint either way, it can't be told, so it isn't.
+func (c *CommandCheck) current(spec *CommandSpec) bool {
+	return c.runs(spec) && c.Fingerprint != "" && c.Fingerprint == spec.Fingerprint
+}
+
+// result is c's outcome in a few words.
+func (c *CommandCheck) result() string {
+	switch {
+	case c == nil:
+		return "not run yet"
+	case c.Passed:
+		return "passed"
+	case c.TimedOut:
+		return "timed out"
+	case c.Error != "":
+		return "failed: " + c.Error
+	}
+	return fmt.Sprintf("failed (exit %d)", c.ExitCode)
+}
+
+// withCommand folds f's command check into its result: with a command,
+// f is met (and its checks pass) only once the command passes, on this
+// evaluation's run, or else on prev, the obligation's last run, while it is
+// current: the same command line against the same project state. A pass
+// from before a change counts for nothing, so checks that don't run
+// commands (checkpoints, taskflow check) can't pass on stale results. It
+// returns the check to keep on the obligation.
+func (f *CompletenessFinding) withCommand(prev *CommandCheck) (satisfied, checksPassed bool, levels []string, check *CommandCheck) {
+	check = prev
+	fresh := f.CommandResult != nil
+	if fresh {
+		check = f.CommandResult
+	}
+	if f.Command == nil {
+		return f.Satisfied, f.ChecksPassed, f.Levels, check
+	}
+	passed := check.runs(f.Command) && check.Passed && (fresh || check.current(f.Command))
+	levels = f.Levels
+	if passed {
+		levels = append(slices.Clone(levels), levelCommand)
+	}
+	return f.Satisfied && passed, f.ChecksPassed && passed, levels, check
 }
 
 // StackInfo is a manifest stack with its commands resolved for the project.
@@ -169,6 +312,10 @@ type Evaluation struct {
 	Gate string
 	// Planned are the subjects of the plan items passed to Plan.
 	Planned []PlannedSubject
+	// CommandsEnabled means command checks are on (completeness.allow_commands
+	// in config): findings carry the ones that resolved, for tf_verify and a
+	// completing stop to run.
+	CommandsEnabled bool
 	// Dropped are rechecked (rule, subject) pairs the manifest can no longer
 	// apply to: the rule was removed or renamed, its stack is missing, or the
 	// subject is outside the stack root or no longer fits the rule. Their
@@ -201,6 +348,10 @@ type CompletenessEvaluator interface {
 	// without evaluating anything: whether completeness is on for callers
 	// that don't evaluate (Waive).
 	HasManifest(projectPath string) bool
+	// RunCommands runs command checks in the session's project, in order,
+	// one result per spec. A command that fails, times out, or can't start
+	// is a failed check, never an error, so it can't fail a stop.
+	RunCommands(ctx context.Context, sess *Session, specs []CommandSpec) []CommandCheck
 }
 
 // CompletenessSummary counts obligations by status (void ones aren't counted).
@@ -226,8 +377,22 @@ type ObligationView struct {
 	Attest string `json:"attest,omitempty"`
 	// Evidence is the attestation, or a waiver's rationale.
 	Evidence string `json:"evidence,omitempty"`
+	// Command is the obligation's command check, when one applies.
+	Command *CommandView `json:"command,omitempty"`
 	// FromSession is the session an inherited obligation was copied from.
 	FromSession string `json:"from_session,omitempty"`
+}
+
+// CommandView is an obligation's command check and how its last run went.
+type CommandView struct {
+	Command string `json:"command"`
+	Root    string `json:"root"`
+	// Result is "not run yet", "passed", "failed (exit N)", "timed out",
+	// "failed: …" (it couldn't start, or was killed), or "stale: …" (it
+	// passed, but the project changed since).
+	Result string `json:"result"`
+	// Output is the end of a failed run's output.
+	Output string `json:"output,omitempty"`
 }
 
 // CheckpointCompleteness is what changed since the agent last heard about
@@ -260,7 +425,9 @@ type ContractCompleteness struct {
 	Inherited     []ObligationView `json:"inherited,omitempty"`
 	SuggestedPlan *SuggestedPlan   `json:"suggested_plan,omitempty"`
 	Protocol      string           `json:"protocol"`
-	Warnings      []string         `json:"warnings,omitempty"`
+	// CommandsEnabled means command checks run at stop and with tf_verify.
+	CommandsEnabled bool     `json:"commands_enabled,omitempty"`
+	Warnings        []string `json:"warnings,omitempty"`
 }
 
 // CompletenessReport is the full report for tf_completeness.
@@ -273,7 +440,11 @@ type CompletenessReport struct {
 	Obligations []ObligationView    `json:"obligations"`
 	Stacks      []StackInfo         `json:"stacks,omitempty"`
 	Rules       []RuleInfo          `json:"rules,omitempty"`
-	Warnings    []string            `json:"warnings,omitempty"`
+	// CommandsEnabled means command checks run at stop and with tf_verify.
+	CommandsEnabled bool `json:"commands_enabled,omitempty"`
+	// Commands are the command checks this call ran (tf_verify).
+	Commands []CommandCheck `json:"commands,omitempty"`
+	Warnings []string       `json:"warnings,omitempty"`
 }
 
 // mergeResult is an evaluation merged into a session's stored obligations.
@@ -283,7 +454,8 @@ type mergeResult struct {
 	voided         []*Obligation // to mark void
 	newlyOpen      map[string]bool
 	newlySatisfied []*Obligation
-	attest         map[string]string // obligation ID → attest prompt
+	attest         map[string]string       // obligation ID → attest prompt
+	commands       map[string]*CommandSpec // obligation ID → command check
 }
 
 // mergeObligations folds an evaluation's findings into the stored
@@ -291,8 +463,12 @@ type mergeResult struct {
 //   - a new key is inserted as open or satisfied, and as planned when its
 //     subject was planned;
 //   - waived obligations are left alone (sticky);
-//   - attested ones are recomputed attested ⇄ satisfied: the attestation
-//     stands, and passing checks complete it;
+//   - attested ones are recomputed attested ⇄ satisfied while the finding
+//     still carries an attest prompt: the attestation stands, and passing
+//     checks complete it. Without one (the requirement no longer asks for
+//     an attestation, e.g. its command check now runs) the attestation
+//     lapses and they are recomputed open ⇄ satisfied like the rest, without
+//     the attest level; the evidence stays on record but isn't shown;
 //   - other existing ones are recomputed open ⇄ satisfied (a void one that
 //     is found again comes back);
 //   - stored keys that weren't found are voided (e.g. the file was reverted),
@@ -305,7 +481,7 @@ type mergeResult struct {
 //     evaluation is partial, since the manifest decides that, not the
 //     change set.
 func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, now time.Time) *mergeResult {
-	mr := &mergeResult{newlyOpen: map[string]bool{}, attest: map[string]string{}}
+	mr := &mergeResult{newlyOpen: map[string]bool{}, attest: map[string]string{}, commands: map[string]*CommandSpec{}}
 	byKey := make(map[string]*Obligation, len(stored))
 	dropped := make(map[string]bool, len(ev.Dropped))
 	for _, d := range ev.Dropped {
@@ -331,12 +507,17 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 			continue
 		}
 		found[k] = true
+		o, ok := byKey[k]
+		var prevCheck *CommandCheck
+		if ok {
+			prevCheck = o.CommandCheck
+		}
+		satisfied, checksPassed, levels, check := f.withCommand(prevCheck)
 		status := ObligationOpen
-		if f.Satisfied {
+		if satisfied {
 			status = ObligationSatisfied
 		}
 
-		o, ok := byKey[k]
 		if !ok {
 			o = &Obligation{
 				ID:             uuid.New().String(),
@@ -349,7 +530,8 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 				Describe:       f.Describe,
 				Expected:       f.Expected,
 				Status:         status,
-				VerifiedLevels: f.Levels,
+				VerifiedLevels: levels,
+				CommandCheck:   check,
 				Planned:        planned[subjectKey(f.RuleID, f.Subject)],
 				FirstSeenAt:    now,
 				UpdatedAt:      now,
@@ -364,19 +546,34 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 			if f.AttestPrompt != "" {
 				mr.attest[o.ID] = f.AttestPrompt
 			}
+			if f.Command != nil {
+				mr.commands[o.ID] = f.Command
+			}
 			continue
 		}
 		if f.AttestPrompt != "" {
 			mr.attest[o.ID] = f.AttestPrompt
 		}
+		if f.Command != nil {
+			mr.commands[o.ID] = f.Command
+		}
 
 		changed := o.Source != f.Source || o.Severity != f.Severity || o.Describe != f.Describe || !slices.Equal(o.Expected, f.Expected)
 		o.Source, o.Severity, o.Describe, o.Expected = f.Source, f.Severity, f.Describe, f.Expected
+		if f.CommandResult != nil && o.Status != ObligationWaived {
+			o.CommandCheck = f.CommandResult
+			changed = true
+		}
 		switch {
 		case o.Status == ObligationWaived:
-		case o.attested():
-			levels, next := withAttest(f.Levels), ObligationAttested
-			if f.ChecksPassed {
+		case o.attested() && f.AttestPrompt != "":
+			// The attestation stands only while the requirement asks for
+			// one. Once it doesn't (e.g. attest_when: no_command now that
+			// its command runs, or an inherited attestation), the default
+			// case decides by the checks alone and drops the attest level,
+			// as Attest would refuse such a finding.
+			levels, next := withAttest(levels), ObligationAttested
+			if checksPassed {
 				next = ObligationSatisfied
 			}
 			if !slices.Equal(o.VerifiedLevels, levels) {
@@ -394,8 +591,8 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 			}
 		default:
 			prev := o.Status
-			if !slices.Equal(o.VerifiedLevels, f.Levels) {
-				o.VerifiedLevels = f.Levels
+			if !slices.Equal(o.VerifiedLevels, levels) {
+				o.VerifiedLevels = levels
 				changed = true
 			}
 			if prev != status {
@@ -444,6 +641,9 @@ type completenessState struct {
 	newlyOpen      map[string]bool
 	newlySatisfied []*Obligation
 	attest         map[string]string
+	commands       map[string]*CommandSpec // obligation ID → command check
+	// runs are the command checks run for this evaluation.
+	runs []CommandCheck
 	// readErr is set when the stored obligations couldn't be read; the state
 	// then can't say what is owed, and must not claim nothing is.
 	readErr string
@@ -487,7 +687,7 @@ func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, me
 		return &completenessState{eval: ev, readErr: "stored obligations couldn't be read: " + listErr.Error()}, nil
 	}
 	if !merge {
-		return &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}, nil
+		return &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}, commands: map[string]*CommandSpec{}}, nil
 	}
 	return s.applyEvaluation(ctx, sess, stored, ev), nil
 }
@@ -507,7 +707,7 @@ func (s *Service) applyEvaluation(ctx context.Context, sess *Session, stored []*
 // (stored obligations are then left as they are); persistMerge writes it.
 // Until then, obligations the merge inserted are marked unsaved in the state.
 func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*completenessState, *mergeResult) {
-	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}}
+	st := &completenessState{eval: ev, obligations: stored, newlyOpen: map[string]bool{}, attest: map[string]string{}, commands: map[string]*CommandSpec{}}
 	if ev.Error != "" {
 		return st, nil
 	}
@@ -520,6 +720,7 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 	st.newlyOpen = mr.newlyOpen
 	st.newlySatisfied = mr.newlySatisfied
 	st.attest = mr.attest
+	st.commands = mr.commands
 	st.unsaved = map[string]bool{}
 	for _, o := range mr.upserts {
 		if !have[o.ID] {
@@ -570,6 +771,10 @@ func (s *Service) writeMerge(ctx context.Context, st *completenessState, mr *mer
 				delete(st.attest, id)
 				st.attest[o.ID] = prompt
 			}
+			if spec, ok := st.commands[id]; ok {
+				delete(st.commands, id)
+				st.commands[o.ID] = spec
+			}
 		}
 	}
 	for _, o := range mr.voided {
@@ -585,14 +790,88 @@ func (s *Service) writeMerge(ctx context.Context, st *completenessState, mr *mer
 // evaluateUnsaved is tryEvaluateCompleteness merging in memory only: it
 // returns the merge for persistMerge to write once the caller decides to go
 // ahead (Stop, after the completion gate). The merge is nil when there is
-// nothing to write.
-func (s *Service) evaluateUnsaved(ctx context.Context, sess *Session) (*completenessState, *mergeResult, error) {
+// nothing to write. With run set and command checks enabled, the findings'
+// command checks are run first (runCommandChecks), so the merge has their
+// results. Runs can take minutes, so the obligations are then read again and
+// the merge is made against that read: a waiver or attestation made while
+// they ran is kept rather than overwritten from the read before. A failed
+// re-read leaves the state unchecked (readErr), with nothing to write.
+func (s *Service) evaluateUnsaved(ctx context.Context, sess *Session, run bool) (*completenessState, *mergeResult, error) {
 	st, err := s.tryEvaluateCompleteness(ctx, sess, false)
 	if st == nil || err != nil || st.readErr != "" {
 		return st, nil, err
 	}
-	merged, mr := mergeEvaluation(sess, st.obligations, st.eval)
+	stored := st.obligations
+	var runs []CommandCheck
+	if run && st.eval.Error == "" && st.eval.CommandsEnabled {
+		runs = s.runCommandChecks(ctx, sess, st.eval, st.obligations)
+		if len(runs) > 0 {
+			fresh, err := s.store.ListObligations(ctx, sess.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[session] failed to list obligations for session %s after running command checks: %v\n", sess.ID, err)
+				return &completenessState{eval: st.eval, runs: runs, readErr: "stored obligations couldn't be read after the command checks ran: " + err.Error()}, nil, nil
+			}
+			stored = fresh
+		}
+	}
+	merged, mr := mergeEvaluation(sess, stored, st.eval)
+	merged.runs = runs
 	return merged, mr, nil
+}
+
+// runCommandChecks runs the command checks of ev's findings, once per
+// distinct command line, root, and env (runKey), and attaches each result to
+// the findings with that spec.
+// Waived obligations' checks aren't run. It returns the runs.
+func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evaluation, stored []*Obligation) []CommandCheck {
+	waived := map[string]bool{}
+	for _, o := range stored {
+		if o.Status == ObligationWaived {
+			waived[o.key()] = true
+		}
+	}
+	var specs []CommandSpec
+	index := map[string]int{}
+	for i := range ev.Findings {
+		f := &ev.Findings[i]
+		if f.Command == nil || waived[f.key()] {
+			continue
+		}
+		if _, ok := index[f.Command.runKey()]; !ok {
+			index[f.Command.runKey()] = len(specs)
+			specs = append(specs, *f.Command)
+		}
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	runs := s.completeness.RunCommands(ctx, sess, specs)
+	if len(runs) != len(specs) {
+		// A broken evaluator mustn't pass anything: each spec fails.
+		runs = make([]CommandCheck, len(specs))
+		for i, spec := range specs {
+			runs[i] = CommandCheck{Command: spec.Line, Root: spec.Root, ExitCode: -1, Error: "the command runner returned no result", RanAt: time.Now()}
+		}
+	}
+	// The state each run is tied to is the one the runner stamped on it (the
+	// state the runs left behind, unless they ran while the project's
+	// content changed), or else the spec's, taken before it ran: either way
+	// a change made while it ran makes it stale.
+	for i := range runs {
+		if runs[i].Fingerprint == "" {
+			runs[i].Fingerprint = specs[i].Fingerprint
+		}
+		runs[i].Env = specs[i].envKey()
+	}
+	for i := range ev.Findings {
+		f := &ev.Findings[i]
+		if f.Command == nil || waived[f.key()] {
+			continue
+		}
+		run := runs[index[f.Command.runKey()]]
+		f.CommandResult = &run
+	}
+	return runs
 }
 
 // errText is the evaluation's manifest error, or why the obligations
@@ -632,9 +911,23 @@ func (st *completenessState) view(o *Obligation, withStatus bool) ObligationView
 		Subject:      o.Subject,
 		Attest:       st.attest[o.ID],
 	}
+	if spec := st.commands[o.ID]; spec != nil {
+		check := o.CommandCheck
+		if !check.runs(spec) {
+			check = nil
+		}
+		v.Command = &CommandView{Command: spec.Line, Root: spec.Root, Result: check.result()}
+		switch {
+		case check == nil:
+		case !check.Passed:
+			v.Command.Output = check.Output
+		case !check.current(spec) && !st.ranNow(check):
+			v.Command.Result = "stale: it passed, but the project changed since; run tf_verify again"
+		}
+	}
 	if withStatus {
 		v.Status = o.Status
-		v.Evidence = o.Evidence
+		v.Evidence = o.standingEvidence()
 	}
 	return v
 }
@@ -734,16 +1027,21 @@ func (st *completenessState) contractView(gate GateMode) *ContractCompleteness {
 	if rules == nil {
 		rules = []RuleInfo{}
 	}
+	protocol := completenessProtocol
+	if st.eval.CommandsEnabled {
+		protocol += " " + commandsProtocol
+	}
 	return &ContractCompleteness{
-		Manifest: st.eval.Manifest,
-		Error:    st.errText(),
-		Gate:     gate,
-		Stacks:   stacks,
-		Rules:    rules,
-		Summary:  st.summary(),
-		Open:     st.views(st.open(), false),
-		Protocol: completenessProtocol,
-		Warnings: st.eval.Warnings,
+		Manifest:        st.eval.Manifest,
+		Error:           st.errText(),
+		Gate:            gate,
+		Stacks:          stacks,
+		Rules:           rules,
+		Summary:         st.summary(),
+		Open:            st.views(st.open(), false),
+		Protocol:        protocol,
+		CommandsEnabled: st.eval.CommandsEnabled,
+		Warnings:        st.eval.Warnings,
 	}
 }
 
@@ -752,6 +1050,9 @@ func (st *completenessState) contractView(gate GateMode) *ContractCompleteness {
 const completenessProtocol = "Taskflow checks these at every tf_checkpoint and before tf_stop. " +
 	"Do the work, or call tf_attest with evidence when it can't be checked from files (e.g. which tests cover it). " +
 	"If a requirement genuinely does not apply, call tf_waive with a rationale; it will be posted to the ClickUp task as a decision."
+
+// commandsProtocol is added while command checks are enabled.
+const commandsProtocol = "Command checks (an obligation's `command`, e.g. the test suite) run when you complete the session with tf_stop; call tf_verify to run them sooner. A failing command keeps its obligation open."
 
 var statusRank = map[ObligationStatus]int{ObligationOpen: 0, ObligationAttested: 1, ObligationWaived: 2, ObligationSatisfied: 3}
 
@@ -766,11 +1067,25 @@ func (st *completenessState) report(sessionID string) *CompletenessReport {
 		Stacks:      st.eval.Stacks,
 		Rules:       st.eval.Rules,
 		Warnings:    st.eval.Warnings,
+
+		CommandsEnabled: st.eval.CommandsEnabled,
+		Commands:        st.runs,
 	}
 	for _, o := range st.visible() {
 		r.Obligations = append(r.Obligations, st.view(o, true))
 	}
 	return r
+}
+
+// ranNow reports whether c is one of this evaluation's runs, which count
+// whether or not they have a fingerprint.
+func (st *completenessState) ranNow(c *CommandCheck) bool {
+	for i := range st.runs {
+		if r := &st.runs[i]; r.Command == c.Command && r.Root == c.Root && r.Env == c.Env && r.RanAt.Equal(c.RanAt) {
+			return true
+		}
+	}
+	return false
 }
 
 // visible returns the non-void obligations, open first.
@@ -846,13 +1161,31 @@ func (st *completenessState) reportTable() string {
 			verified = strings.Join(o.VerifiedLevels, ", ") + " ✓"
 		}
 		evidence := "—"
-		if o.Evidence != "" {
-			evidence = o.Evidence
+		if e := o.standingEvidence(); e != "" {
+			evidence = e
+		} else if c, spec := o.CommandCheck, st.commands[o.ID]; c != nil && spec != nil {
+			result := c.result()
+			if c.Passed && !c.current(spec) && !st.ranNow(c) {
+				result = "stale (passed before the latest changes)"
+			}
+			evidence = fmt.Sprintf("`%s`: %s", c.Command, result)
+			if !c.Passed {
+				if line := lastLine(c.Output); line != "" {
+					evidence += ": " + line
+				}
+			}
 		}
 		fmt.Fprintf(&b, "| %s | `%s` | %s | %s | %s | %s |\n",
 			cell(o.Describe), cell(o.Subject), o.Severity, o.Status, verified, cell(evidence))
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// lastLine is the last non-blank line of s, where test runners print their
+// summary.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 // cell keeps text inside one markdown table cell.

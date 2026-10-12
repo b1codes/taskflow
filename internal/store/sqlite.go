@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/b1codes/taskflow/internal/completeness"
 	"github.com/b1codes/taskflow/internal/session"
 	"github.com/google/uuid"
 	"modernc.org/sqlite"
@@ -472,8 +474,9 @@ func (s *SQLiteStore) ListDecisionsBySession(ctx context.Context, sessionID stri
 // Obligations
 func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligation) error {
 	query := `INSERT INTO obligations (id, session_id, rule_id, requirement_id, subject, source, severity, describe, expected,
-		status, verified_levels, evidence, waiver_decision_id, planned, inherited_from, reminded_count, first_seen_at, satisfied_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		status, verified_levels, evidence, waiver_decision_id, planned, inherited_from, reminded_count, first_seen_at, satisfied_at, updated_at,
+		command_check)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(session_id, rule_id, requirement_id, subject) DO UPDATE SET
 		source = excluded.source,
 		severity = excluded.severity,
@@ -482,7 +485,8 @@ func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligatio
 		status = excluded.status,
 		verified_levels = excluded.verified_levels,
 		satisfied_at = excluded.satisfied_at,
-		updated_at = excluded.updated_at
+		updated_at = excluded.updated_at,
+		command_check = COALESCE(excluded.command_check, obligations.command_check)
 	RETURNING id`
 	var planned int
 	if o.Planned {
@@ -490,7 +494,8 @@ func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligatio
 	}
 	err := s.db.QueryRowContext(ctx, query, o.ID, o.SessionID, o.RuleID, o.RequirementID, o.Subject, o.Source, o.Severity, o.Describe,
 		jsonMarshal(o.Expected), string(o.Status), jsonMarshal(o.VerifiedLevels), o.Evidence, nullString(o.WaiverDecisionID),
-		planned, nullString(o.InheritedFrom), o.RemindedCount, o.FirstSeenAt, o.SatisfiedAt, o.UpdatedAt).Scan(&o.ID)
+		planned, nullString(o.InheritedFrom), o.RemindedCount, o.FirstSeenAt, o.SatisfiedAt, o.UpdatedAt,
+		commandCheckJSON(o.CommandCheck)).Scan(&o.ID)
 	if err != nil {
 		return fmt.Errorf("failed to upsert obligation: %w", err)
 	}
@@ -500,7 +505,7 @@ func (s *SQLiteStore) UpsertObligation(ctx context.Context, o *session.Obligatio
 func (s *SQLiteStore) ListObligations(ctx context.Context, sessionID string) ([]*session.Obligation, error) {
 	query := `SELECT id, session_id, rule_id, requirement_id, subject, COALESCE(source, ''), severity, describe, COALESCE(expected, ''),
 		status, COALESCE(verified_levels, ''), COALESCE(evidence, ''), COALESCE(waiver_decision_id, ''), planned,
-		COALESCE(inherited_from, ''), reminded_count, first_seen_at, satisfied_at, updated_at
+		COALESCE(inherited_from, ''), reminded_count, first_seen_at, satisfied_at, updated_at, COALESCE(command_check, '')
 	FROM obligations WHERE session_id = ? ORDER BY first_seen_at ASC, rule_id, subject, requirement_id`
 	rows, err := s.db.QueryContext(ctx, query, sessionID)
 	if err != nil {
@@ -511,12 +516,12 @@ func (s *SQLiteStore) ListObligations(ctx context.Context, sessionID string) ([]
 	var obligations []*session.Obligation
 	for rows.Next() {
 		var o session.Obligation
-		var expected, levels, status string
+		var expected, levels, status, commandCheck string
 		var planned int
 		var satisfiedAt sql.NullTime
 		err := rows.Scan(&o.ID, &o.SessionID, &o.RuleID, &o.RequirementID, &o.Subject, &o.Source, &o.Severity, &o.Describe, &expected,
 			&status, &levels, &o.Evidence, &o.WaiverDecisionID, &planned,
-			&o.InheritedFrom, &o.RemindedCount, &o.FirstSeenAt, &satisfiedAt, &o.UpdatedAt)
+			&o.InheritedFrom, &o.RemindedCount, &o.FirstSeenAt, &satisfiedAt, &o.UpdatedAt, &commandCheck)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan obligation row: %w", err)
 		}
@@ -527,9 +532,22 @@ func (s *SQLiteStore) ListObligations(ctx context.Context, sessionID string) ([]
 		if satisfiedAt.Valid {
 			o.SatisfiedAt = &satisfiedAt.Time
 		}
+		if commandCheck != "" {
+			o.CommandCheck = &session.CommandCheck{}
+			jsonUnmarshal(commandCheck, o.CommandCheck)
+		}
 		obligations = append(obligations, &o)
 	}
 	return obligations, rows.Err()
+}
+
+// commandCheckJSON stores a command check as JSON; nil stays NULL, which
+// UpsertObligation reads as "keep the stored one".
+func commandCheckJSON(c *session.CommandCheck) any {
+	if c == nil {
+		return nil
+	}
+	return jsonMarshal(c)
 }
 
 func (s *SQLiteStore) UpdateObligationStatus(ctx context.Context, id string, status session.ObligationStatus, at time.Time) error {
@@ -1029,6 +1047,98 @@ func (s *SQLiteStore) ResetStaleInFlight(ctx context.Context, olderThan time.Dur
 		return 0, fmt.Errorf("failed to reset stale in-flight items: %w", err)
 	}
 	return res.RowsAffected()
+}
+
+// DriftReport selects the obligations in SQL and filters by time and
+// aggregates in Go: timestamps are stored as text with their zone offset, so
+// comparing them in SQL isn't reliable.
+func (s *SQLiteStore) DriftReport(ctx context.Context, filter DriftFilter) ([]*DriftRow, error) {
+	query := `SELECT COALESCE(o.source, ''), o.rule_id, o.requirement_id, o.session_id, o.status, o.reminded_count,
+		COALESCE(o.evidence, ''), o.first_seen_at, s.status, s.project_path
+	FROM obligations o JOIN sessions s ON s.id = o.session_id
+	WHERE o.status != 'void' AND o.inherited_from IS NULL AND o.requirement_id != ?
+	ORDER BY o.first_seen_at`
+	rows, err := s.db.QueryContext(ctx, query, completeness.SubjectFileRequirement)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query obligations for the drift report: %w", err)
+	}
+	defer rows.Close()
+
+	byKey := map[string]*DriftRow{}
+	sessions := map[string]map[string]bool{}
+	var out []*DriftRow
+	for rows.Next() {
+		var source, ruleID, reqID, sessionID, status, evidence, sessStatus, project string
+		var reminded int
+		var firstSeen time.Time
+		if err := rows.Scan(&source, &ruleID, &reqID, &sessionID, &status, &reminded, &evidence, &firstSeen, &sessStatus, &project); err != nil {
+			return nil, fmt.Errorf("failed to scan obligation for the drift report: %w", err)
+		}
+		if !filter.Since.IsZero() && firstSeen.Before(filter.Since) {
+			continue
+		}
+		if filter.ProjectPath != "" && !sameProject(project, filter.ProjectPath) {
+			continue
+		}
+		k := source + "\x00" + ruleID + "\x00" + reqID
+		r := byKey[k]
+		if r == nil {
+			r = &DriftRow{Source: source, RuleID: ruleID, RequirementID: reqID}
+			byKey[k] = r
+			sessions[k] = map[string]bool{}
+			out = append(out, r)
+		}
+		r.Obligations++
+		sessions[k][sessionID] = true
+		r.Sessions = len(sessions[k])
+		finished := sessStatus == string(session.StatusCompleted) || sessStatus == string(session.StatusArchived)
+		switch session.ObligationStatus(status) {
+		case session.ObligationSatisfied:
+			if reminded == 0 {
+				r.SatisfiedFirst++
+			} else {
+				r.SatisfiedAfterReminder++
+			}
+		case session.ObligationAttested:
+			r.Attested++
+		case session.ObligationWaived:
+			r.Waived++
+			if evidence != "" {
+				r.WaiverRationales = append(r.WaiverRationales, evidence)
+			}
+		case session.ObligationOpen:
+			if finished {
+				r.OpenAtStop++
+			} else {
+				r.OpenInProgress++
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Source != b.Source {
+			return a.Source < b.Source
+		}
+		if a.RuleID != b.RuleID {
+			return a.RuleID < b.RuleID
+		}
+		return a.RequirementID < b.RequirementID
+	})
+	return out, nil
+}
+
+// sameProject reports whether a session's stored project path is want,
+// comparing cleaned paths (want as given, or made absolute).
+func sameProject(stored, want string) bool {
+	stored = filepath.Clean(stored)
+	if stored == filepath.Clean(want) {
+		return true
+	}
+	abs, err := filepath.Abs(want)
+	return err == nil && stored == abs
 }
 
 func (s *SQLiteStore) GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error) {
