@@ -37,6 +37,10 @@ type Store interface {
 	DequeuePending(ctx context.Context, limit int) ([]*session.SyncOp, error)
 	MarkInFlight(ctx context.Context, id int64) error
 	MarkDone(ctx context.Context, id int64) error
+	// MarkSkipped marks the op SKIPPED, finished without applying anything
+	// because a later op superseded it (see HasNewerOp); reason is kept as
+	// its error_msg.
+	MarkSkipped(ctx context.Context, id int64, reason string) error
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 	// MarkFailedPermanent marks the op FAILED with retries set to max_retries
 	// so ListRetryable never returns it, for errors that cannot succeed on
@@ -47,8 +51,11 @@ type Store interface {
 	// HasNewerOp reports whether a later op of the same operation for the
 	// same task as op is done or still to run (pending, in flight, or failed
 	// with retries left), so an op carrying full state can be skipped for it:
-	// retrying it after a later one applied would undo the later state. Only
-	// a later op that failed for good doesn't count.
+	// retrying it after a later one applied would undo the later state. A
+	// later op that failed for good or was itself SKIPPED doesn't count: it
+	// applied nothing, and what it was skipped for may since have failed for
+	// good, so op then applies its own (older, but real) state rather than
+	// leaving none applied.
 	HasNewerOp(ctx context.Context, op *session.SyncOp) (bool, error)
 	// ListSyncOps lists the task's ops of operation with an ID below beforeID
 	// (0 for no bound), newest first, at most limit of them.

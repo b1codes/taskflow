@@ -1222,6 +1222,74 @@ func TestHasNewerOp(t *testing.T) {
 	}
 }
 
+// A skipped op applied nothing, so it must not hold back an older op: if the
+// op it was skipped for fails for good, the older op is the only one left to
+// apply a state.
+func TestHasNewerOp_SkippedOpDoesNotSupersede(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	var ops []*session.SyncOp
+	for i := 0; i < 3; i++ {
+		op := session.SyncOp{Operation: session.OpSyncChecklist, TaskID: "task-a", Payload: `{}`, MaxRetries: 3, CreatedAt: time.Now()}
+		if err := st.EnqueueSync(ctx, op); err != nil {
+			t.Fatalf("EnqueueSync failed: %v", err)
+		}
+		if err := st.db.QueryRowContext(ctx, "SELECT MAX(id) FROM sync_queue").Scan(&op.ID); err != nil {
+			t.Fatalf("reading op id: %v", err)
+		}
+		ops = append(ops, &op)
+	}
+	op1, op2, op3 := ops[0], ops[1], ops[2]
+
+	// op1 is retrying; op2 is skipped for op3, which then fails for good.
+	if err := st.MarkFailed(ctx, op1.ID, "network error"); err != nil {
+		t.Fatalf("MarkFailed failed: %v", err)
+	}
+	if err := st.MarkSkipped(ctx, op2.ID, "superseded"); err != nil {
+		t.Fatalf("MarkSkipped failed: %v", err)
+	}
+	if !mustHasNewer(t, st, op1) {
+		t.Error("op3 still to run must hold back op1")
+	}
+	if err := st.MarkFailedPermanent(ctx, op3.ID, "rejected"); err != nil {
+		t.Fatalf("MarkFailedPermanent failed: %v", err)
+	}
+	if mustHasNewer(t, st, op1) {
+		t.Error("a skipped op and a permanently failed one must not hold back op1, or no state is ever applied")
+	}
+
+	got, err := st.ListSyncOps(ctx, "task-a", session.OpSyncChecklist, 0, 10)
+	if err != nil {
+		t.Fatalf("ListSyncOps failed: %v", err)
+	}
+	if len(got) != 3 || got[1].ID != op2.ID || got[1].Status != "SKIPPED" || got[1].ErrorMsg != "superseded" {
+		t.Errorf("op2 = %+v, want SKIPPED with its reason", got[1])
+	}
+	if n, err := st.CountPendingByTaskID(ctx, "task-a"); err != nil || n != 0 {
+		t.Errorf("pending = %d (err: %v), want a skipped op not counted", n, err)
+	}
+	if retry, err := st.ListRetryable(ctx); err != nil || len(retry) != 0 {
+		// op1's backoff hasn't elapsed; a skipped op is never retryable.
+		t.Errorf("retryable = %d (err: %v)", len(retry), err)
+	}
+}
+
+func mustHasNewer(t *testing.T, st *SQLiteStore, op *session.SyncOp) bool {
+	t.Helper()
+	got, err := st.HasNewerOp(context.Background(), op)
+	if err != nil {
+		t.Fatalf("HasNewerOp failed: %v", err)
+	}
+	return got
+}
+
 func TestListSyncOps(t *testing.T) {
 	t.Parallel()
 

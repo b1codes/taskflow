@@ -334,9 +334,12 @@ func (s *Service) Waive(ctx context.Context, sessionID, obligationID, rationale 
 		return nil, fmt.Errorf("failed to waive obligation: %w", err)
 	}
 	o.Status, o.WaiverDecisionID, o.Evidence = ObligationWaived, d.ID, rationale
-	// Waiving always renames the item. Waive doesn't evaluate, so this is
-	// its only checklist op.
-	s.enqueueChecklist(ctx, sess, st.obligations, true)
+	// Waiving renames the item. Waive doesn't evaluate, so this is its only
+	// checklist op, but only while completeness is on: with no evaluator or
+	// manifest the checklist isn't kept, though the waiver still stands.
+	if s.completeness != nil && s.completeness.HasManifest(sess.ProjectPath) {
+		s.enqueueChecklist(ctx, sess, st.obligations)
+	}
 	res := s.obligationResult(ctx, st, o)
 	res.DecisionID = d.ID
 	return res, nil
@@ -389,9 +392,8 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	// ahead, but its checklist is queued once, on the way out, so that one
 	// op carries the attestation too. A failed write queues nothing (see
 	// persistMerge).
-	checklistChanged := mr.checklistChanged
 	if s.writeMerge(ctx, st, mr) == nil {
-		defer func() { s.enqueueChecklist(ctx, sess, st.obligations, checklistChanged) }()
+		defer func() { s.enqueueChecklist(ctx, sess, st.obligations) }()
 	}
 	o, err := st.resolvable(sess.ID, obligationID)
 	if err != nil {
@@ -422,16 +424,12 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if err := s.store.AttestObligation(ctx, o.ID, evidence, levels, status, now); err != nil {
 		return nil, fmt.Errorf("failed to attest obligation: %w", err)
 	}
-	before := checklistItem(o)
 	o.Status, o.Evidence, o.VerifiedLevels, o.UpdatedAt = status, evidence, levels, now
 	o.WaiverDecisionID = "" // an attestation takes back a waiver
 	o.SatisfiedAt = nil
 	if status == ObligationSatisfied {
 		o.SatisfiedAt = &now
 	}
-	// Evidence isn't part of the item, so replacing an attestation's
-	// evidence changes nothing.
-	checklistChanged = checklistChanged || checklistItem(o) != before
 	return s.obligationResult(ctx, st, o), nil
 }
 
@@ -586,7 +584,6 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	// task's latest checklist op already carries it, so it shows the planned
 	// work as soon as the plan is made.
 	st, mr := mergeEvaluation(sess, stored, ev)
-	mr.checklistChanged = true
 	if err := s.persistMerge(ctx, sess, st, mr); err != nil {
 		return nil, fmt.Errorf("failed to save the plan's obligations, so the plan wasn't recorded; call tf_plan again: %w", err)
 	}

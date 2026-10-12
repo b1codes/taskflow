@@ -274,3 +274,26 @@ rules:
 		t.Errorf("dropped = %+v, want old-unit/src/Renamed.ts", ev.Dropped)
 	}
 }
+
+func TestCompletenessEvaluator_HasManifest(t *testing.T) {
+	t.Parallel()
+	e := NewCompletenessEvaluator()
+	dir := t.TempDir()
+	if e.HasManifest(dir) {
+		t.Error("a project without a manifest has none")
+	}
+	// Every manifest location counts, and so does an invalid manifest:
+	// completeness is on, just broken.
+	for _, rel := range []string{".taskflow/completeness.yaml", ".agents/completeness.yaml"} {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("not: [valid"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !e.HasManifest(dir) {
+			t.Errorf("%s is a manifest", rel)
+		}
+	}
+}

@@ -26,9 +26,12 @@ type ChecklistPayload struct {
 type ChecklistItem struct {
 	// Key is the obligation's rule/requirement/subject.
 	Key string `json:"key"`
-	// Match is the stable "[requirement] describe" part of Name, which finds
-	// the item in ClickUp whatever its status text says (ChecklistItemMatches).
-	// It is normalized (NormalizeChecklistName), as ClickUp stores names.
+	// Match is the stable "[requirement] describe (subject)" part of Name,
+	// which finds the item in ClickUp whatever its status text says
+	// (ChecklistItemMatches). The subject keeps one requirement's items for
+	// different files apart; items named before it was added ("[requirement]
+	// describe") are found by the Match their Key had in earlier payloads. It
+	// is normalized (NormalizeChecklistName), as ClickUp stores names.
 	Match string `json:"match"`
 	// Name is Match plus its status after " — ": verify levels, attested,
 	// waived, or void.
@@ -39,12 +42,21 @@ type ChecklistItem struct {
 	Void bool `json:"void,omitempty"`
 }
 
+// checklistSubject is the " (subject)" part of an item's Match, so the same
+// requirement on two files makes two items that say which file each is
+// about. A rule with no stack has the subject "*", which names nothing.
+func checklistSubject(subject string) string {
+	if subject == "" || subject == "*" {
+		return ""
+	}
+	return " (" + subject + ")"
+}
+
 // checklistVoid is the status suffix of a void item. ClickUp item names are
 // plain text, so it is a word rather than a strikethrough.
 const checklistVoid = "void"
 
-// checklistItems is the checklist for obligations, in the order they were
-// first seen.
+// checklistItems is the checklist for obligations, in their order.
 func checklistItems(obligations []*Obligation) []ChecklistItem {
 	items := make([]ChecklistItem, 0, len(obligations))
 	for _, o := range obligations {
@@ -54,7 +66,7 @@ func checklistItems(obligations []*Obligation) []ChecklistItem {
 }
 
 func checklistItem(o *Obligation) ChecklistItem {
-	match := NormalizeChecklistName("[" + o.RequirementID + "] " + o.Describe)
+	match := NormalizeChecklistName("[" + o.RequirementID + "] " + o.Describe + checklistSubject(o.Subject))
 	it := ChecklistItem{
 		Key:   o.RuleID + "/" + o.RequirementID + "/" + o.Subject,
 		Match: match,
@@ -154,11 +166,12 @@ func isChecklistSuffix(s string) bool {
 // latest SYNC_CHECKLIST op carries a different checklist or failed for good,
 // or when there is no op yet. Comparing with what was queued, rather than
 // with the last merge, also repairs a checklist that drifted (its op ran out
-// of retries, or the session predates the checklist). An empty checklist is
-// never queued: a session's obligations are never deleted, so there is
-// nothing to clear. When the latest op can't be read, changed (the caller's
-// view of whether the checklist changed) decides.
-func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligations []*Obligation, changed bool) {
+// of retries, or the session predates the checklist). When the latest op
+// can't be read, the checklist is queued: a redundant op changes nothing in
+// ClickUp, and a missing one would leave it out of date. An empty checklist
+// is never queued: a session's obligations are never deleted, so there is
+// nothing to clear.
+func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligations []*Obligation) {
 	if len(obligations) == 0 {
 		return
 	}
@@ -167,13 +180,33 @@ func (s *Service) enqueueChecklist(ctx context.Context, sess *Session, obligatio
 	switch {
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "[session] failed to read the latest checklist op for task %s: %v\n", sess.TaskID, err)
-		if !changed {
-			return
-		}
 	case latest != nil && !(latest.Status == "FAILED" && latest.Retries >= latest.MaxRetries):
-		if b, err := json.Marshal(payload); err == nil && string(b) == latest.Payload {
+		var queued ChecklistPayload
+		if json.Unmarshal([]byte(latest.Payload), &queued) == nil && sameChecklist(queued, payload) {
 			return
 		}
 	}
 	s.enqueueSync(ctx, sess.TaskID, OpSyncChecklist, payload)
+}
+
+// sameChecklist reports whether a and b carry the same items, whatever their
+// order: obligations merged in memory come in finding order, and read back
+// from the store in the order they were first seen, which can differ for the
+// same checklist. The worker finds each item by its name, so the order only
+// decides where items it has to create go.
+func sameChecklist(a, b ChecklistPayload) bool {
+	if a.ChecklistName != b.ChecklistName || len(a.Items) != len(b.Items) {
+		return false
+	}
+	byKey := make(map[string]ChecklistItem, len(a.Items))
+	for _, it := range a.Items {
+		byKey[it.Key] = it
+	}
+	for _, it := range b.Items {
+		if have, ok := byKey[it.Key]; !ok || have != it {
+			return false
+		}
+		delete(byKey, it.Key) // each item pairs once, so a repeated key differs
+	}
+	return len(byKey) == 0
 }

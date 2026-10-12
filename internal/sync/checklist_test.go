@@ -372,6 +372,71 @@ func TestWorker_SyncChecklist_CoalescesToNewest(t *testing.T) {
 	if n, _ := st.CountPendingByTaskID(context.Background(), task); n != 0 {
 		t.Errorf("pending = %d", n)
 	}
+	if got := checklistOpStatuses(t, st, task); len(got) != 2 || got[0] != "SKIPPED" || got[1] != "DONE" {
+		t.Errorf("op statuses = %v, want the older op SKIPPED and the newer DONE", got)
+	}
+}
+
+// checklistOpStatuses lists the task's SYNC_CHECKLIST op statuses, oldest first.
+func checklistOpStatuses(t *testing.T, st store.Store, taskID string) []string {
+	t.Helper()
+	ops, err := st.ListSyncOps(context.Background(), taskID, session.OpSyncChecklist, 0, 50)
+	if err != nil {
+		t.Fatalf("ListSyncOps failed: %v", err)
+	}
+	out := make([]string, len(ops))
+	for i, op := range ops {
+		out[len(ops)-1-i] = op.Status
+	}
+	return out
+}
+
+// An op skipped for a newer one applied nothing, so when that newer one fails
+// for good, a retried older op must still apply its state instead of being
+// skipped too and leaving the checklist stale.
+func TestWorker_SyncChecklist_RetryNotHeldBackBySkippedOp(t *testing.T) {
+	t.Parallel()
+	const task = "task-cl-skipped-chain"
+	st := newChecklistStore(t, task)
+	fake, client := newFakeChecklists(t, task)
+
+	// op#1 fails transiently and waits out its backoff.
+	fake.reject = "GET /task/"
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "", false))
+	drain(t, st, client)
+
+	// op#2 is skipped for op#3, whose item write is then rejected for good.
+	fake.mu.Lock()
+	fake.reject = "POST /checklist/"
+	fake.mu.Unlock()
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "structural ✓", true))
+	enqueueChecklist(t, st, task, item("r/story/A", "[story] Stories for A", "attested", true))
+	drain(t, st, client)
+	if got := checklistOpStatuses(t, st, task); len(got) != 3 || got[1] != "SKIPPED" || got[2] != "FAILED" {
+		t.Fatalf("op statuses = %v, want op#2 SKIPPED and op#3 FAILED", got)
+	}
+
+	// op#1's retry is the only op left that can apply a state.
+	fake.mu.Lock()
+	fake.reject = ""
+	fake.mu.Unlock()
+	fake.state()
+	st.SetRetryBackoffBase(time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if n := drain(t, st, client); n != 1 {
+		t.Fatalf("expected op#1's retry to be processed, got %d", n)
+	}
+	cls, _ := fake.state()
+	if len(cls) != 1 {
+		t.Fatalf("checklists = %+v", cls)
+	}
+	got := itemNames(cls[0])
+	if resolved, ok := got["[story] Stories for A"]; len(got) != 1 || !ok || resolved {
+		t.Errorf("items = %v, want op#1's open item", got)
+	}
+	if got := checklistOpStatuses(t, st, task); got[0] != "DONE" {
+		t.Errorf("op#1 status = %s, want DONE", got[0])
+	}
 }
 
 func TestWorker_SyncChecklist_ErrorClassification(t *testing.T) {
@@ -469,9 +534,9 @@ func TestWorker_SyncChecklist_MatchesByEarlierMatchOfKey(t *testing.T) {
 	want := []clickup.ChecklistItem{
 		// Renamed: found by the Match its Key had in the earlier op.
 		{ID: "item-2", Name: "[story] Stories for module A — structural ✓", Resolved: true},
-		// An item matching the current Match wins over the earlier one,
-		// which is left alone.
-		{ID: "item-3", Name: "[test] Test for A"},
+		// The Key's own item wins over one that only matches its current
+		// Match (added by someone else), which is left alone.
+		{ID: "item-3", Name: "[test] Test for module A"},
 		{ID: "i-new-test", Name: "[test] Test for module A"},
 	}
 	got := cls[0].Items
@@ -483,7 +548,7 @@ func TestWorker_SyncChecklist_MatchesByEarlierMatchOfKey(t *testing.T) {
 			t.Errorf("item %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	if countPrefix(reqs, "POST ") != 0 || countPrefix(reqs, "PUT ") != 1 {
+	if countPrefix(reqs, "POST ") != 0 || countPrefix(reqs, "PUT ") != 2 {
 		t.Errorf("requests = %v", reqs)
 	}
 }
@@ -542,7 +607,7 @@ func TestWorker_SyncChecklist_ClickUpNormalizesNames(t *testing.T) {
 		}
 	})
 
-	t.Run("a retry doesn't create a duplicate", func(t *testing.T) {
+	t.Run("an item missing from the create response is read back", func(t *testing.T) {
 		t.Parallel()
 		const task = "task-cl-normalize-retry"
 		st := newChecklistStore(t, task)
@@ -551,13 +616,8 @@ func TestWorker_SyncChecklist_ClickUpNormalizesNames(t *testing.T) {
 		fake.omitCreated = true
 
 		enqueueChecklist(t, st, task, unnormalized)
-		if n := drain(t, st, client); n != 0 {
-			t.Fatalf("an item missing from the create response must fail the op, got %d processed", n)
-		}
-		st.SetRetryBackoffBase(time.Millisecond)
-		time.Sleep(5 * time.Millisecond)
 		if n := drain(t, st, client); n != 1 {
-			t.Fatalf("expected the retry to succeed, got %d processed", n)
+			t.Fatalf("expected 1 processed op, got %d", n)
 		}
 		cls, reqs := fake.state()
 		if got := itemNames(cls[0]); len(got) != 1 || !got[stored] {

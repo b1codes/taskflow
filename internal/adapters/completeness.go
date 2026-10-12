@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/b1codes/taskflow/internal/completeness"
@@ -44,6 +46,18 @@ func (e *CompletenessEvaluator) Evaluate(ctx context.Context, sess *session.Sess
 // completeness.PlanSubject), including the subject-file requirement.
 func (e *CompletenessEvaluator) Plan(ctx context.Context, sess *session.Session, stored []*session.Obligation, items []session.PlanItem) (*session.Evaluation, error) {
 	return e.evaluate(sess, stored, items)
+}
+
+// HasManifest reports whether one of completeness.ManifestPaths exists in the
+// project, without reading it. A path that can't be checked counts as there,
+// as completeness.Load reports it as an invalid manifest rather than none.
+func (e *CompletenessEvaluator) HasManifest(projectPath string) bool {
+	for _, rel := range completeness.ManifestPaths {
+		if _, err := os.Stat(filepath.Join(projectPath, filepath.FromSlash(rel))); !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*session.Obligation, items []session.PlanItem) (*session.Evaluation, error) {

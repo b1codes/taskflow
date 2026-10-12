@@ -197,6 +197,10 @@ type CompletenessEvaluator interface {
 	// requirement. Items the manifest can't plan return an error wrapping
 	// ErrInvalidPlan. Like Evaluate, it returns nil, nil with no manifest.
 	Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error)
+	// HasManifest reports whether the project has a manifest, valid or not,
+	// without evaluating anything: whether completeness is on for callers
+	// that don't evaluate (Waive).
+	HasManifest(projectPath string) bool
 }
 
 // CompletenessSummary counts obligations by status (void ones aren't counted).
@@ -280,11 +284,6 @@ type mergeResult struct {
 	newlyOpen      map[string]bool
 	newlySatisfied []*Obligation
 	attest         map[string]string // obligation ID → attest prompt
-	// checklistChanged is set by mergeEvaluation when the merge changes the
-	// session's Definition of Done checklist. It decides whether to queue
-	// the checklist only when the task's latest checklist op can't be read
-	// (see enqueueChecklist).
-	checklistChanged bool
 }
 
 // mergeObligations folds an evaluation's findings into the stored
@@ -516,10 +515,7 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 	for _, o := range stored {
 		have[o.ID] = true
 	}
-	// mergeObligations updates stored in place, so take the checklist first.
-	before := checklistItems(stored)
 	mr := mergeObligations(sess.ID, stored, ev, time.Now())
-	mr.checklistChanged = !slices.Equal(before, checklistItems(mr.obligations))
 	st.obligations = mr.obligations
 	st.newlyOpen = mr.newlyOpen
 	st.newlySatisfied = mr.newlySatisfied
@@ -542,7 +538,7 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 func (s *Service) persistMerge(ctx context.Context, sess *Session, st *completenessState, mr *mergeResult) error {
 	err := s.writeMerge(ctx, st, mr)
 	if mr != nil && err == nil {
-		s.enqueueChecklist(ctx, sess, st.obligations, mr.checklistChanged)
+		s.enqueueChecklist(ctx, sess, st.obligations)
 	}
 	return err
 }

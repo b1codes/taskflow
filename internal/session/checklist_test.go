@@ -15,21 +15,21 @@ func TestChecklistItem_Names(t *testing.T) {
 		want     string
 		resolved bool
 	}{
-		{"open", ObligationOpen, nil, "[e2e] e2e for A", false},
-		{"satisfied by checks", ObligationSatisfied, []string{"structural"}, "[e2e] e2e for A — structural ✓", true},
-		{"attested alone", ObligationAttested, []string{"attest"}, "[e2e] e2e for A — attested", true},
-		{"attested, checks passing", ObligationSatisfied, []string{"structural", "attest"}, "[e2e] e2e for A — attested, structural ✓", true},
-		{"waived", ObligationWaived, nil, "[e2e] e2e for A — waived", true},
-		{"void", ObligationVoid, []string{"structural"}, "[e2e] e2e for A — void", true},
-		{"waived, checks passing", ObligationWaived, []string{"structural"}, "[e2e] e2e for A — waived, structural ✓", true},
-		{"several levels", ObligationSatisfied, []string{"structural", "runtime check"}, "[e2e] e2e for A — structural, runtime-check ✓", true},
+		{"open", ObligationOpen, nil, "[e2e] e2e for A (A)", false},
+		{"satisfied by checks", ObligationSatisfied, []string{"structural"}, "[e2e] e2e for A (A) — structural ✓", true},
+		{"attested alone", ObligationAttested, []string{"attest"}, "[e2e] e2e for A (A) — attested", true},
+		{"attested, checks passing", ObligationSatisfied, []string{"structural", "attest"}, "[e2e] e2e for A (A) — attested, structural ✓", true},
+		{"waived", ObligationWaived, nil, "[e2e] e2e for A (A) — waived", true},
+		{"void", ObligationVoid, []string{"structural"}, "[e2e] e2e for A (A) — void", true},
+		{"waived, checks passing", ObligationWaived, []string{"structural"}, "[e2e] e2e for A (A) — waived, structural ✓", true},
+		{"several levels", ObligationSatisfied, []string{"structural", "runtime check"}, "[e2e] e2e for A (A) — structural, runtime-check ✓", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			o := stored("r", "e2e", "A", tt.status)
 			o.VerifiedLevels = tt.levels
 			it := checklistItem(o)
-			if it.Name != tt.want || it.Resolved != tt.resolved || it.Match != "[e2e] e2e for A" || it.Key != "r/e2e/A" {
+			if it.Name != tt.want || it.Resolved != tt.resolved || it.Match != "[e2e] e2e for A (A)" || it.Key != "r/e2e/A" {
 				t.Errorf("item = %+v, want name %q resolved %v", it, tt.want, tt.resolved)
 			}
 			if it.Void != (tt.status == ObligationVoid) {
@@ -174,7 +174,7 @@ func TestService_ChecklistOnWaiveAndAttest(t *testing.T) {
 	if len(cls) != before+1 {
 		t.Fatalf("attesting must queue the checklist once: %d ops after %d", len(cls), before)
 	}
-	if it := itemFor(cls[len(cls)-1], "react-screen/e2e/Page.tsx"); it == nil || it.Name != "[e2e] e2e for Page.tsx — attested" || !it.Resolved {
+	if it := itemFor(cls[len(cls)-1], "react-screen/e2e/Page.tsx"); it == nil || it.Name != "[e2e] e2e for Page.tsx (Page.tsx) — attested" || !it.Resolved {
 		t.Errorf("attested item = %+v", it)
 	}
 
@@ -190,7 +190,7 @@ func TestService_ChecklistOnWaiveAndAttest(t *testing.T) {
 		t.Fatalf("Waive: %v", err)
 	}
 	cls = store.checklists(t)
-	if it := itemFor(cls[len(cls)-1], "react-screen/story/Page.tsx"); it == nil || it.Name != "[story] story for Page.tsx — waived" || !it.Resolved {
+	if it := itemFor(cls[len(cls)-1], "react-screen/story/Page.tsx"); it == nil || it.Name != "[story] story for Page.tsx (Page.tsx) — waived" || !it.Resolved {
 		t.Errorf("waived item = %+v", it)
 	}
 }
@@ -329,14 +329,16 @@ func TestService_ChecklistLatestOpUnreadable(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	if n := len(store.checklists(t)); n != 1 {
-		t.Fatalf("a merge that changed the checklist must queue it: %d ops", n)
+		t.Fatalf("Start found new obligations: want 1 checklist op, got %d", n)
 	}
-	// Without the latest op to compare with, only a change queues.
+	// Without the latest op to compare with, the checklist is queued even
+	// though nothing changed: a redundant op is harmless, a missing one
+	// would leave ClickUp out of date.
 	if _, err := srv.Checkpoint(ctx, res.Session.ID, "no change", nil, false); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
-	if n := len(store.checklists(t)); n != 1 {
-		t.Errorf("an unchanged checklist was queued without the latest op: %d ops", n)
+	if n := len(store.checklists(t)); n != 2 {
+		t.Errorf("the checklist must be queued when the latest op can't be read: %d ops", n)
 	}
 }
 
@@ -391,7 +393,7 @@ func TestService_AttestQueuesOneChecklist(t *testing.T) {
 		t.Fatalf("Attest must queue exactly one checklist op: %d after %d", len(cls), before)
 	}
 	last := cls[len(cls)-1]
-	if it := itemFor(last, "react-screen/e2e/Page.tsx"); it == nil || it.Name != "[e2e] e2e for Page.tsx — attested" {
+	if it := itemFor(last, "react-screen/e2e/Page.tsx"); it == nil || it.Name != "[e2e] e2e for Page.tsx (Page.tsx) — attested" {
 		t.Errorf("the op must carry the attestation: %+v", it)
 	}
 	if itemFor(last, "react-screen/story/Page.tsx") == nil {
@@ -412,7 +414,7 @@ func TestChecklistItem_NormalizesWhitespace(t *testing.T) {
 	o := stored("r", "e2e", "A", ObligationAttested)
 	o.Describe = "End-to-end\n  test for A\n" // a YAML ">" block keeps the final newline
 	it := checklistItem(o)
-	if it.Match != "[e2e] End-to-end test for A" || it.Name != "[e2e] End-to-end test for A — attested" {
+	if it.Match != "[e2e] End-to-end test for A (A)" || it.Name != "[e2e] End-to-end test for A (A) — attested" {
 		t.Errorf("item = %+v", it)
 	}
 	if !ChecklistItemMatches("[e2e] End-to-end test for A — attested", "[e2e] End-to-end\ntest for A ") {
@@ -454,4 +456,143 @@ func itemFor(p ChecklistPayload, key string) *ChecklistItem {
 		}
 	}
 	return nil
+}
+
+func TestChecklistItem_SubjectKeepsItemsApart(t *testing.T) {
+	// One requirement with the same describe for two files.
+	a := checklistItem(&Obligation{RuleID: "r", RequirementID: "story", Subject: "src/A.tsx", Describe: "Stories", Status: ObligationSatisfied, VerifiedLevels: []string{"structural"}})
+	b := checklistItem(&Obligation{RuleID: "r", RequirementID: "story", Subject: "src/B.tsx", Describe: "Stories", Status: ObligationOpen})
+	if a.Match != "[story] Stories (src/A.tsx)" || b.Match != "[story] Stories (src/B.tsx)" {
+		t.Fatalf("matches = %q, %q: want the subject in each", a.Match, b.Match)
+	}
+	if a.Name != "[story] Stories (src/A.tsx) — structural ✓" || b.Name != "[story] Stories (src/B.tsx)" {
+		t.Errorf("names = %q, %q", a.Name, b.Name)
+	}
+	if ChecklistItemMatches(a.Name, b.Match) || ChecklistItemMatches(b.Name, a.Match) {
+		t.Error("one file's item must not match the other's")
+	}
+	// A subject that is a prefix of another's doesn't take its item.
+	ab := checklistItem(&Obligation{RuleID: "r", RequirementID: "story", Subject: "src/A.tsx.bak", Describe: "Stories", Status: ObligationOpen})
+	if ChecklistItemMatches(ab.Name, a.Match) || ChecklistItemMatches(a.Name, ab.Match) {
+		t.Error("src/A.tsx and src/A.tsx.bak must not match each other's items")
+	}
+
+	// A stack-scoped rule's subject is its stack; a rule with no stack has
+	// "*", which names nothing and is left out.
+	if it := checklistItem(&Obligation{RequirementID: "lint", Subject: "web", Describe: "Lint"}); it.Match != "[lint] Lint (web)" {
+		t.Errorf("stack subject: match = %q", it.Match)
+	}
+	for _, subject := range []string{"*", ""} {
+		if it := checklistItem(&Obligation{RequirementID: "lint", Subject: subject, Describe: "Lint"}); it.Match != "[lint] Lint" {
+			t.Errorf("subject %q: match = %q", subject, it.Match)
+		}
+	}
+
+	// Items named before the subject was added ("[story] Stories — …") are
+	// found by the Match their Key had in earlier payloads, which still
+	// matches them; the new Match doesn't, so they're never taken for
+	// another file's item.
+	const legacy = "[story] Stories — structural ✓"
+	if !ChecklistItemMatches(legacy, "[story] Stories") {
+		t.Error("an item named the old way must match its old Match")
+	}
+	if ChecklistItemMatches(legacy, a.Match) || ChecklistItemMatches(a.Name, "[story] Stories") {
+		t.Error("old and new names must not match each other's Match")
+	}
+}
+
+func TestService_ChecklistComparedWhateverItsOrder(t *testing.T) {
+	ctx := context.Background()
+	ev := &fakeEvaluator{eval: screenEval()}
+	srv, store, dir := newCompletenessService(t, ev)
+	res, err := srv.Start(ctx, "task-1", dir, false)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The queued op lists the items in another order (finding order, where
+	// the store reads them back in first-seen order).
+	op := store.latestChecklistOp(t)
+	var p ChecklistPayload
+	if err := json.Unmarshal([]byte(op.Payload), &p); err != nil || len(p.Items) != 2 {
+		t.Fatalf("payload = %s, %v", op.Payload, err)
+	}
+	p.Items[0], p.Items[1] = p.Items[1], p.Items[0]
+	b, _ := json.Marshal(p)
+	op.Payload = string(b)
+
+	if _, err := srv.Checkpoint(ctx, res.Session.ID, "no change", nil, false); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if n := len(store.checklists(t)); n != 1 {
+		t.Errorf("the same checklist in another order must not be queued again: %d ops", n)
+	}
+
+	// A real change is still queued.
+	ev.eval = evalWith(finding("react-screen", "story", "Page.tsx", true), finding("react-screen", "unit-test", "Page.tsx", true))
+	if _, err := srv.Checkpoint(ctx, res.Session.ID, "stories", nil, false); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if n := len(store.checklists(t)); n != 2 {
+		t.Errorf("a changed checklist must be queued: %d ops", n)
+	}
+}
+
+func TestSameChecklist(t *testing.T) {
+	x := ChecklistItem{Key: "r/a/A", Match: "[a] A", Name: "[a] A"}
+	y := ChecklistItem{Key: "r/b/B", Match: "[b] B", Name: "[b] B"}
+	yDone := y
+	yDone.Name, yDone.Resolved = "[b] B — waived", true
+	p := func(items ...ChecklistItem) ChecklistPayload {
+		return ChecklistPayload{ChecklistName: ChecklistName, Items: items}
+	}
+	for _, tt := range []struct {
+		name string
+		a, b ChecklistPayload
+		want bool
+	}{
+		{"same order", p(x, y), p(x, y), true},
+		{"other order", p(x, y), p(y, x), true},
+		{"an item changed", p(x, y), p(x, yDone), false},
+		{"an item missing", p(x, y), p(x), false},
+		{"a repeated key", p(x, y), p(x, x), false},
+		{"another checklist", p(x), ChecklistPayload{ChecklistName: "other", Items: []ChecklistItem{x}}, false},
+	} {
+		if got := sameChecklist(tt.a, tt.b); got != tt.want {
+			t.Errorf("%s: sameChecklist = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestService_WaiveQueuesNoChecklistWhenCompletenessIsOff(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name string
+		off  func(srv *Service, ev *fakeEvaluator)
+	}{
+		{"no manifest", func(_ *Service, ev *fakeEvaluator) { ev.eval = nil }},
+		{"no evaluator", func(srv *Service, _ *fakeEvaluator) { srv.WithCompleteness(nil) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := &fakeEvaluator{eval: screenEval()}
+			srv, store, dir := newCompletenessService(t, ev)
+			res, err := srv.Start(ctx, "task-1", dir, false)
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			sid := res.Session.ID
+			before := len(store.checklists(t))
+			tt.off(srv, ev)
+
+			wr, err := srv.Waive(ctx, sid, store.find(sid, "story").ID, "no stories for flagged pages")
+			if err != nil {
+				t.Fatalf("Waive: %v", err)
+			}
+			if wr.DecisionID == "" || store.find(sid, "story").Status != ObligationWaived {
+				t.Errorf("the waiver must still be recorded: %+v", wr)
+			}
+			if n := len(store.checklists(t)); n != before {
+				t.Errorf("with completeness off, Waive must not queue the checklist: %d ops after %d", n, before)
+			}
+		})
+	}
 }

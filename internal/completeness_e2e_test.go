@@ -399,10 +399,10 @@ func TestCompleteness_EndToEnd_PlanWaiveStop(t *testing.T) {
 	}
 	slices.Sort(names)
 	if want := []string{
-		"[story] Storybook stories for CheckoutPage — structural ✓",
-		"[subject-file] New screen: CheckoutPage.tsx — structural ✓",
-		"[suite] Full web test suite passes — attested",
-		"[unit-test] Component test for CheckoutPage — waived",
+		"[story] Storybook stories for CheckoutPage (src/features/payments/pages/CheckoutPage.tsx) — structural ✓",
+		"[subject-file] New screen: CheckoutPage.tsx (src/features/payments/pages/CheckoutPage.tsx) — structural ✓",
+		"[suite] Full web test suite passes (web) — attested",
+		"[unit-test] Component test for CheckoutPage (src/features/payments/pages/CheckoutPage.tsx) — waived",
 	}; checklist.ChecklistName != session.ChecklistName || !slices.Equal(names, want) {
 		t.Errorf("checklist %q = %q, want %q", checklist.ChecklistName, names, want)
 	}
