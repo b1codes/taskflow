@@ -1049,6 +1049,74 @@ func (s *SQLiteStore) ResetStaleInFlight(ctx context.Context, olderThan time.Dur
 	return res.RowsAffected()
 }
 
+// finishedSyncOp matches ops that will never run again: applied (DONE,
+// PARTIAL), superseded (SKIPPED), or failed for good.
+const finishedSyncOp = `(status IN ('DONE', 'PARTIAL', 'SKIPPED') OR (status = 'FAILED' AND retries >= max_retries))`
+
+// pruneBatch caps the IDs deleted per statement, under SQLite's variable limit.
+const pruneBatch = 500
+
+func (s *SQLiteStore) PruneSyncQueue(ctx context.Context, olderThan time.Duration, keepPerTask int) (int64, error) {
+	// Ranks count finished rows only, so each task keeps its newest
+	// keepPerTask finished checklist ops below any op still waiting. A
+	// finished row newer than a waiting op of its task is kept for
+	// HasNewerOp. Ages are compared in Go: timestamps are stored as text with
+	// their zone offset (see DriftReport).
+	query := `SELECT id, created_at, last_attempted_at FROM (
+		SELECT id, task_id, operation, created_at, last_attempted_at,
+			ROW_NUMBER() OVER (PARTITION BY task_id, operation ORDER BY id DESC) AS rank
+		FROM sync_queue WHERE ` + finishedSyncOp + `
+	) f
+	WHERE NOT (f.operation = ? AND f.rank <= ?)
+	AND NOT EXISTS (SELECT 1 FROM sync_queue w WHERE w.task_id = f.task_id AND w.operation = f.operation AND w.id < f.id
+		AND NOT (` + finishedSyncOp + `))`
+	rows, err := s.db.QueryContext(ctx, query, session.OpSyncChecklist, keepPerTask)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list prunable sync items: %w", err)
+	}
+	threshold := time.Now().Add(-olderThan)
+	var ids []any
+	for rows.Next() {
+		var id int64
+		var createdAt time.Time
+		var lastAttemptedAt sql.NullTime
+		if err := rows.Scan(&id, &createdAt, &lastAttemptedAt); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan prunable sync item: %w", err)
+		}
+		// An op is last touched when it's claimed; one never claimed ages
+		// from when it was queued.
+		at := createdAt
+		if lastAttemptedAt.Valid {
+			at = lastAttemptedAt.Time
+		}
+		if at.Before(threshold) {
+			ids = append(ids, id)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list prunable sync items: %w", err)
+	}
+
+	// Finished ops never run again and new ops only add rows above them, so
+	// what was prunable stays prunable; the status is checked again anyway.
+	var pruned int64
+	for len(ids) > 0 {
+		batch := ids[:min(len(ids), pruneBatch)]
+		ids = ids[len(batch):]
+		del := `DELETE FROM sync_queue WHERE id IN (?` + strings.Repeat(", ?", len(batch)-1) + `) AND ` + finishedSyncOp
+		res, err := s.db.ExecContext(ctx, del, batch...)
+		if err != nil {
+			return pruned, fmt.Errorf("failed to prune sync items: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		pruned += n
+	}
+	return pruned, nil
+}
+
 // DriftReport selects the obligations in SQL and filters by time and
 // aggregates in Go: timestamps are stored as text with their zone offset, so
 // comparing them in SQL isn't reliable.

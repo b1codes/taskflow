@@ -73,6 +73,14 @@ type Store interface {
 	// (0 for no bound), newest first, at most limit of them.
 	ListSyncOps(ctx context.Context, taskID, operation string, beforeID int64, limit int) ([]*session.SyncOp, error)
 	ResetStaleInFlight(ctx context.Context, olderThan time.Duration) (int64, error)
+	// PruneSyncQueue deletes finished ops (DONE, PARTIAL, SKIPPED, or failed
+	// for good) last touched more than olderThan ago and returns how many it
+	// deleted. Ops still waiting or in flight are never touched, and neither
+	// are the rows later reads depend on: each task's newest keepPerTask
+	// finished SYNC_CHECKLIST ops (the history the worker matches items
+	// against, and LatestSyncOp for session.enqueueChecklist), and any
+	// finished op newer than a waiting op of its task (HasNewerOp).
+	PruneSyncQueue(ctx context.Context, olderThan time.Duration, keepPerTask int) (int64, error)
 	SetRetryBackoffBase(d time.Duration)
 
 	GetSchemaInfo(ctx context.Context) (version int, tableCount int, err error)

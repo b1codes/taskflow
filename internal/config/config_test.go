@@ -170,3 +170,31 @@ func TestLoadCompletenessCommands(t *testing.T) {
 		t.Error("a negative timeout should fail to load")
 	}
 }
+
+func TestLoadSyncRetention(t *testing.T) {
+	load := func(t *testing.T, content string) (*Config, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatalf("failed to write config: %v", err)
+		}
+		return LoadFrom(configPath)
+	}
+
+	cfg, err := load(t, DefaultConfigContent)
+	if err != nil || cfg.Sync.Retention() != 30*24*time.Hour {
+		t.Errorf("defaults = %+v, %v; want 30 days", cfg.Sync, err)
+	}
+	// A config written before retention existed gets the default.
+	cfg, err = load(t, "[sync]\nmax_retries = 5\n")
+	if err != nil || cfg.Sync.RetentionDays != DefaultRetentionDays {
+		t.Errorf("config = %+v, %v; want the default retention", cfg.Sync, err)
+	}
+	cfg, err = load(t, "[sync]\nretention_days = 0\n")
+	if err != nil || cfg.Sync.Retention() != 0 {
+		t.Errorf("config = %+v, %v; want 0 to keep ops forever", cfg.Sync, err)
+	}
+	if _, err := load(t, "[sync]\nretention_days = -1\n"); err == nil {
+		t.Error("a negative retention should fail to load")
+	}
+}

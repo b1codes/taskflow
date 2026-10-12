@@ -1537,3 +1537,87 @@ func TestMarkDoneAndPartial(t *testing.T) {
 		t.Error("a newer PARTIAL op must hold back an older one")
 	}
 }
+
+func TestPruneSyncQueue(t *testing.T) {
+	t.Parallel()
+
+	st, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	old, recent := time.Now().Add(-40*24*time.Hour), time.Now().Add(-time.Hour)
+
+	// add inserts an op in a given state; lastAttempted nil leaves it unset.
+	add := func(name, operation, taskID, status string, retries int, createdAt time.Time, lastAttempted *time.Time) {
+		t.Helper()
+		_, err := st.db.ExecContext(ctx, `INSERT INTO sync_queue (operation, task_id, payload, status, retries, max_retries, created_at, last_attempted_at)
+			VALUES (?, ?, ?, ?, ?, 3, ?, ?)`, operation, taskID, name, status, retries, createdAt, lastAttempted)
+		if err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+	}
+
+	// Finished and old: pruned.
+	add("done-old", "POST_COMMENT", "task-a", "DONE", 0, old, &old)
+	add("partial-old", "UPDATE_STATUS", "task-a", "PARTIAL", 0, old, &old)
+	add("skipped-old", "UPDATE_STATUS", "task-a", "SKIPPED", 0, old, &old)
+	add("failed-for-good-old", "POST_COMMENT", "task-a", "FAILED", 3, old, &old)
+	add("never-claimed-old", "POST_COMMENT", "task-a", "DONE", 0, old, nil)
+	// Finished but recently touched: kept.
+	add("done-recent", "POST_COMMENT", "task-a", "DONE", 0, recent, &recent)
+	add("done-claimed-recently", "POST_COMMENT", "task-a", "DONE", 0, old, &recent)
+	// Still waiting or running, however old: kept.
+	add("pending-old", "POST_COMMENT", "task-b", "PENDING", 0, old, nil)
+	add("in-flight-old", "POST_COMMENT", "task-c", "IN_FLIGHT", 0, old, &old)
+	// A finished op older than a waiting one goes; one newer stays for HasNewerOp.
+	add("done-before-retryable", "UPDATE_STATUS", "task-d", "DONE", 0, old, &old)
+	add("retryable-old", "UPDATE_STATUS", "task-d", "FAILED", 1, old, &old)
+	add("done-after-retryable", "UPDATE_STATUS", "task-d", "DONE", 0, old, &old)
+	add("done-after-pending", "POST_COMMENT", "task-b", "DONE", 0, old, &old)
+	// Each task keeps its newest 2 finished checklist ops, whatever their
+	// age; a waiting checklist op doesn't take one of their places.
+	for _, name := range []string{"checklist-1", "checklist-2", "checklist-3", "checklist-4"} {
+		add(name, session.OpSyncChecklist, "task-e", "DONE", 0, old, &old)
+	}
+	add("checklist-pending", session.OpSyncChecklist, "task-e", "PENDING", 0, old, nil)
+	add("other-task-checklist", session.OpSyncChecklist, "task-f", "SKIPPED", 0, old, &old)
+
+	pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour, 2)
+	if err != nil {
+		t.Fatalf("PruneSyncQueue failed: %v", err)
+	}
+
+	rows, err := st.db.QueryContext(ctx, `SELECT payload FROM sync_queue ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var kept []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		kept = append(kept, name)
+	}
+	want := []string{
+		"done-recent", "done-claimed-recently",
+		"pending-old", "in-flight-old", "retryable-old",
+		"done-after-retryable", "done-after-pending",
+		"checklist-3", "checklist-4", "checklist-pending",
+		"other-task-checklist",
+	}
+	if strings.Join(kept, " ") != strings.Join(want, " ") {
+		t.Errorf("kept %v,\nwant %v", kept, want)
+	}
+	if pruned != 8 {
+		t.Errorf("pruned = %d, want 8", pruned)
+	}
+
+	// Pruning again finds nothing left to prune.
+	if pruned, err := st.PruneSyncQueue(ctx, 30*24*time.Hour, 2); err != nil || pruned != 0 {
+		t.Errorf("second prune = %d, %v; want 0", pruned, err)
+	}
+}

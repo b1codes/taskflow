@@ -936,3 +936,38 @@ func TestWorker_LookupBadRequest_IsRetried(t *testing.T) {
 		t.Fatalf("expected the op to be retryable after one attempt, got %+v", ops)
 	}
 }
+
+func TestWorker_Prune(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	// An op finished long ago: claimed and done 40 days back.
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	if err := st.EnqueueSync(ctx, session.SyncOp{Operation: "POST_COMMENT", TaskID: "task-1", Payload: `{}`, MaxRetries: 5, CreatedAt: old}); err != nil {
+		t.Fatalf("EnqueueSync failed: %v", err)
+	}
+	ops, err := st.ListSyncOps(ctx, "task-1", "POST_COMMENT", 0, 1)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("ListSyncOps = %+v, %v", ops, err)
+	}
+	if err := st.MarkDone(ctx, ops[0].ID, ""); err != nil {
+		t.Fatalf("MarkDone failed: %v", err)
+	}
+
+	// Retention 0 keeps finished ops forever.
+	if n, err := NewWorker(st, nil, &config.SyncConfig{}).Prune(ctx); err != nil || n != 0 {
+		t.Errorf("Prune with no retention = %d, %v; want 0", n, err)
+	}
+	if n, err := NewWorker(st, nil, &config.SyncConfig{RetentionDays: 60}).Prune(ctx); err != nil || n != 0 {
+		t.Errorf("Prune within retention = %d, %v; want 0", n, err)
+	}
+	if n, err := NewWorker(st, nil, &config.SyncConfig{RetentionDays: 30}).Prune(ctx); err != nil || n != 1 {
+		t.Errorf("Prune past retention = %d, %v; want 1", n, err)
+	}
+}

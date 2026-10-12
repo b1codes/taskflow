@@ -51,7 +51,29 @@ func (w *Worker) WithStatusMap(m config.StatusMapConfig) *Worker {
 	return w
 }
 
+// pruneInterval is how often Run prunes finished ops from the sync queue.
+const pruneInterval = 24 * time.Hour
+
+// Prune deletes finished ops older than the configured retention from the
+// sync queue, keeping each task's newest maxEarlierChecklistOps finished
+// checklist ops for earlierMatches; with no retention it deletes nothing.
+func (w *Worker) Prune(ctx context.Context) (int64, error) {
+	if w.config == nil || w.config.Retention() <= 0 {
+		return 0, nil
+	}
+	return w.store.PruneSyncQueue(ctx, w.config.Retention(), maxEarlierChecklistOps)
+}
+
+func (w *Worker) prune(ctx context.Context) {
+	if _, err := w.Prune(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[sync] prune error: %v\n", err)
+	}
+}
+
 func (w *Worker) Run(ctx context.Context) error {
+	w.prune(ctx)
+	lastPrune := time.Now()
+
 	if w.clickup == nil {
 		// With no ClickUp client configured, wait for shutdown without spinning
 		<-ctx.Done()
@@ -71,6 +93,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		default:
 			// Periodically reset any stale in-flight ops
 			_, _ = w.store.ResetStaleInFlight(ctx, 5*time.Minute)
+			if time.Since(lastPrune) >= pruneInterval {
+				w.prune(ctx)
+				lastPrune = time.Now()
+			}
 
 			processed, err := w.processBatch(ctx, 10)
 			if err != nil {

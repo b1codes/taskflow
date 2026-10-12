@@ -43,6 +43,14 @@ var syncCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Sync completed: %d items processed.\n", count)
+
+		pruned, err := worker.Prune(cmd.Context())
+		if err != nil {
+			return fmt.Errorf("failed to prune sync queue: %w", err)
+		}
+		if pruned > 0 {
+			fmt.Printf("Pruned %d finished items older than %d days.\n", pruned, cfg.Sync.RetentionDays)
+		}
 		return nil
 	},
 }
