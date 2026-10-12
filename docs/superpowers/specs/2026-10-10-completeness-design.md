@@ -575,12 +575,12 @@ A new sync operation, `SYNC_CHECKLIST`, carries the **full desired state** rathe
 
 The worker reconciles it:
 1. `GET /task/{id}` → find the checklist by name. If it's missing, `POST /task/{id}/checklist`.
-2. Match items by their `[requirement] describe` name; create any that are missing (`POST /checklist/{id}/checklist_item`) and update `resolved` where it differs (`PUT /checklist/{id}/checklist_item/{item_id}`).
-3. Don't delete items that are no longer present (`void` obligations); rename them with a `~~struck~~` prefix instead, so history stays visible.
+2. Match items by their stable `[requirement] describe` part (each payload item's `match`), not their full name: the name also carries a status suffix after ` — ` (verify levels and attestation, e.g. "[e2e] E2E coverage for CheckoutPage — attested, structural ✓"), which changes without the item becoming a different one. Exact names are matched first, and each ClickUp item is matched at most once, so obligations with the same text get one item each. Create any that are missing (`POST /checklist/{id}/checklist_item`) and update the name and `resolved` where they differ (`PUT /checklist/{id}/checklist_item/{item_id}`). An item is resolved when its obligation isn't open.
+3. Don't delete items that are no longer present (`void` obligations); rename them to `[requirement] describe — void` instead (ClickUp item names are plain text, so no strikethrough), so history stays visible. A void obligation with no item yet gets none.
 
 Since each op holds the full state, retries are safe, no ClickUp-returned IDs have to be stored, and the worker can skip a `SYNC_CHECKLIST` op when a newer one is pending for the same task.
 
-It's enqueued when an evaluation changes any obligation's status, or on `tf_plan`. Evaluations that change nothing enqueue nothing.
+It's enqueued when an evaluation changes any obligation's checklist item (its status, verify levels, or text), when `tf_waive`/`tf_attest` change one, and always on `tf_plan`. Evaluations that change nothing enqueue nothing.
 
 New `clickup.Client` methods: `GetTaskChecklists`, `CreateChecklist`, `CreateChecklistItem`, `UpdateChecklistItem`.
 

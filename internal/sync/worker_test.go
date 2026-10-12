@@ -298,7 +298,7 @@ func TestWorker_Reaper_RecoversStrandedInFlight(t *testing.T) {
 	opID := ops[0].ID
 
 	// Simulate crash during processing: op was marked in flight
-	if err := st.MarkInFlight(ctx, opID); err != nil {
+	if _, err := st.MarkInFlight(ctx, opID); err != nil {
 		t.Fatalf("MarkInFlight failed: %v", err)
 	}
 

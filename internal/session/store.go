@@ -36,6 +36,16 @@ type SessionStore interface {
 	ListDecisionsBySession(ctx context.Context, sessionID string) ([]*Decision, error)
 	CountPendingByTaskID(ctx context.Context, taskID string) (int, error)
 	EnqueueSync(ctx context.Context, op SyncOp) error
+	// CoalesceSyncOp queues op, which carries the full state its operation
+	// applies for the task: when the task's newest op of that operation is
+	// still waiting to run (pending, or failed with retries left), op's
+	// payload replaces that op's, so one op applies the latest state rather
+	// than a stale one being run, skipped, or retried first; otherwise op is
+	// inserted.
+	CoalesceSyncOp(ctx context.Context, op SyncOp) error
+	// LatestSyncOp returns the task's most recently queued op of operation,
+	// or nil when there is none.
+	LatestSyncOp(ctx context.Context, taskID, operation string) (*SyncOp, error)
 
 	SetSessionBaseSHA(ctx context.Context, id string, sha string) error
 	// UpsertObligation inserts o, or updates the obligation with the same

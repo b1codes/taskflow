@@ -18,6 +18,10 @@ type mockStore struct {
 	decisions   map[string][]*Decision
 	obligations map[string][]*Obligation
 	syncOps     []SyncOp
+	// latestErr fails LatestSyncOp.
+	latestErr error
+	// planStateErr fails SetSessionPlanState.
+	planStateErr error
 }
 
 func newMockStore() *mockStore {
@@ -190,6 +194,39 @@ func (m *mockStore) EnqueueSync(ctx context.Context, op SyncOp) error {
 	return nil
 }
 
+// CoalesceSyncOp moves the task's latest op of the same operation to the end
+// of the queue with op's payload while a test has marked it PENDING, as the
+// SQLite store does for an op still waiting to run. An op with no status is
+// taken as synced, so syncOps stays a log of what was queued.
+func (m *mockStore) CoalesceSyncOp(ctx context.Context, op SyncOp) error {
+	for i := len(m.syncOps) - 1; i >= 0; i-- {
+		if have := m.syncOps[i]; have.TaskID == op.TaskID && have.Operation == op.Operation {
+			if have.Status == "PENDING" {
+				have.Payload = op.Payload
+				m.syncOps = append(append(m.syncOps[:i:i], m.syncOps[i+1:]...), have)
+				return nil
+			}
+			break
+		}
+	}
+	return m.EnqueueSync(ctx, op)
+}
+
+func (m *mockStore) LatestSyncOp(ctx context.Context, taskID, operation string) (*SyncOp, error) {
+	if m.latestErr != nil {
+		return nil, m.latestErr
+	}
+	for i := len(m.syncOps) - 1; i >= 0; i-- {
+		if op := m.syncOps[i]; op.TaskID == taskID && op.Operation == operation {
+			if op.Status == "" {
+				op.Status = "DONE" // see CoalesceSyncOp
+			}
+			return &op, nil
+		}
+	}
+	return nil, nil
+}
+
 func (m *mockStore) SetSessionBaseSHA(ctx context.Context, id string, sha string) error {
 	s, ok := m.sessions[id]
 	if !ok {
@@ -261,6 +298,9 @@ func (m *mockStore) IncrementObligationReminders(ctx context.Context, ids []stri
 }
 
 func (m *mockStore) SetSessionPlanState(ctx context.Context, id string, state PlanState) error {
+	if m.planStateErr != nil {
+		return m.planStateErr
+	}
 	s, ok := m.sessions[id]
 	if !ok {
 		return errors.New("not found")

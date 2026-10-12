@@ -197,6 +197,10 @@ type CompletenessEvaluator interface {
 	// requirement. Items the manifest can't plan return an error wrapping
 	// ErrInvalidPlan. Like Evaluate, it returns nil, nil with no manifest.
 	Plan(ctx context.Context, sess *Session, stored []*Obligation, items []PlanItem) (*Evaluation, error)
+	// HasManifest reports whether the project has a manifest, valid or not,
+	// without evaluating anything: whether completeness is on for callers
+	// that don't evaluate (Waive).
+	HasManifest(projectPath string) bool
 }
 
 // CompletenessSummary counts obligations by status (void ones aren't counted).
@@ -494,7 +498,7 @@ func (s *Service) tryEvaluateCompleteness(ctx context.Context, sess *Session, me
 // persistMerge.
 func (s *Service) applyEvaluation(ctx context.Context, sess *Session, stored []*Obligation, ev *Evaluation) *completenessState {
 	st, mr := mergeEvaluation(sess, stored, ev)
-	_ = s.persistMerge(ctx, st, mr)
+	_ = s.persistMerge(ctx, sess, st, mr)
 	return st
 }
 
@@ -525,10 +529,25 @@ func mergeEvaluation(sess *Session, stored []*Obligation, ev *Evaluation) (*comp
 	return st, mr
 }
 
-// persistMerge writes a merge from mergeEvaluation: its upserts, then its
+// persistMerge writes a merge from mergeEvaluation (writeMerge) and, when
+// every write succeeds, queues the session's checklist for ClickUp unless
+// the task's latest checklist op already carries it (enqueueChecklist), so
+// a checklist that drifted is repaired even by a merge that changed
+// nothing. After a failure it isn't queued: the stored obligations still
+// differ from the merge, so the next evaluation finds the change again.
+func (s *Service) persistMerge(ctx context.Context, sess *Session, st *completenessState, mr *mergeResult) error {
+	err := s.writeMerge(ctx, st, mr)
+	if mr != nil && err == nil {
+		s.enqueueChecklist(ctx, sess, st.obligations)
+	}
+	return err
+}
+
+// writeMerge writes a merge from mergeEvaluation: its upserts, then its
 // voids. A failed write is logged and the others still go ahead; the
-// returned error joins every failure, nil when all were written.
-func (s *Service) persistMerge(ctx context.Context, st *completenessState, mr *mergeResult) error {
+// returned error joins every failure, nil when all were written (or there
+// is no merge: the manifest is invalid).
+func (s *Service) writeMerge(ctx context.Context, st *completenessState, mr *mergeResult) error {
 	if mr == nil {
 		return nil
 	}

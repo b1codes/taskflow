@@ -294,8 +294,8 @@ func TestService_Waive(t *testing.T) {
 	if o := store.obligation(story.ID); o.Status != ObligationWaived || o.WaiverDecisionID != ds[0].ID {
 		t.Errorf("stored = %+v", o)
 	}
-	if ops := store.ops(); ops[len(ops)-1] != "POST_DECISION" {
-		t.Errorf("the waiver must be posted to ClickUp as a decision: %v", ops)
+	if ops := store.ops(); !slices.Equal(ops[len(ops)-2:], []string{"POST_DECISION", OpSyncChecklist}) {
+		t.Errorf("the waiver must be posted to ClickUp as a decision, then shown in the checklist: %v", ops)
 	}
 	if _, err := srv.Waive(ctx, sid, story.ID, "again"); !errors.Is(err, ErrUnknownObligation) {
 		t.Errorf("waiving twice = %v", err)

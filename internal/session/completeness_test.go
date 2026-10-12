@@ -26,6 +26,11 @@ func (f *fakeEvaluator) BaseSHA(projectPath string) (string, error) {
 	return f.baseSHA, nil
 }
 
+// HasManifest is true when evaluations find a manifest.
+func (f *fakeEvaluator) HasManifest(projectPath string) bool {
+	return f.eval != nil
+}
+
 func (f *fakeEvaluator) Evaluate(ctx context.Context, sess *Session, stored []*Obligation) (*Evaluation, error) {
 	f.calls++
 	if f.err != nil {

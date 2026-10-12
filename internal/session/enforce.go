@@ -334,6 +334,12 @@ func (s *Service) Waive(ctx context.Context, sessionID, obligationID, rationale 
 		return nil, fmt.Errorf("failed to waive obligation: %w", err)
 	}
 	o.Status, o.WaiverDecisionID, o.Evidence = ObligationWaived, d.ID, rationale
+	// Waiving renames the item. Waive doesn't evaluate, so this is its only
+	// checklist op, but only while completeness is on: with no evaluator or
+	// manifest the checklist isn't kept, though the waiver still stands.
+	if s.completeness != nil && s.completeness.HasManifest(sess.ProjectPath) {
+		s.enqueueChecklist(ctx, sess, st.obligations)
+	}
 	res := s.obligationResult(ctx, st, o)
 	res.DecisionID = d.ID
 	return res, nil
@@ -371,7 +377,7 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 	if s.completeness == nil {
 		return nil, unchecked("completeness is not enabled")
 	}
-	st, err := s.tryEvaluateCompleteness(ctx, sess, true)
+	st, mr, err := s.evaluateUnsaved(ctx, sess)
 	switch {
 	case err != nil:
 		return nil, unchecked("the evaluation failed: " + err.Error())
@@ -381,6 +387,13 @@ func (s *Service) Attest(ctx context.Context, sessionID, obligationID, evidence 
 		return nil, unchecked(st.readErr)
 	case st.eval.Error != "":
 		return nil, unchecked(fmt.Sprintf("the completeness manifest %s is invalid: %s", st.eval.Manifest, st.eval.Error))
+	}
+	// The evaluation is written now, whether or not the attestation goes
+	// ahead, but its checklist is queued once, on the way out, so that one
+	// op carries the attestation too. A failed write queues nothing (see
+	// persistMerge).
+	if s.writeMerge(ctx, st, mr) == nil {
+		defer func() { s.enqueueChecklist(ctx, sess, st.obligations) }()
 	}
 	o, err := st.resolvable(sess.ID, obligationID)
 	if err != nil {
@@ -567,12 +580,18 @@ func (s *Service) Plan(ctx context.Context, sessionID string, items []PlanItem, 
 	}
 	// The plan is only recorded once all of its obligations are: a plan
 	// state with obligations missing would claim work is tracked that isn't.
+	// The checklist is pushed only once the plan is recorded, so ClickUp never
+	// shows a plan tf_plan reported as failed, whether or not the plan
+	// changed it, unless the task's latest checklist op already carries it.
 	st, mr := mergeEvaluation(sess, stored, ev)
-	if err := s.persistMerge(ctx, st, mr); err != nil {
+	if err := s.writeMerge(ctx, st, mr); err != nil {
 		return nil, fmt.Errorf("failed to save the plan's obligations, so the plan wasn't recorded; call tf_plan again: %w", err)
 	}
 	if err := s.store.SetSessionPlanState(ctx, sess.ID, PlanPlanned); err != nil {
 		return nil, fmt.Errorf("failed to save plan state: %w", err)
+	}
+	if mr != nil {
+		s.enqueueChecklist(ctx, sess, st.obligations)
 	}
 
 	subjects := map[string]bool{}
