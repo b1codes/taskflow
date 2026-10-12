@@ -336,7 +336,9 @@ rules:
 		}
 	}
 	e := NewCompletenessEvaluator().WithCommands(true, time.Minute)
-	stored := []*session.Obligation{{ID: "o", RuleID: "suite", RequirementID: "suite", Subject: "app", Status: session.ObligationOpen}}
+	// A stored pass to compare with: only then is the fingerprint taken.
+	stored := []*session.Obligation{{ID: "o", RuleID: "suite", RequirementID: "suite", Subject: "app", Status: session.ObligationSatisfied,
+		CommandCheck: &session.CommandCheck{Command: "make test", Root: "app", Passed: true, Fingerprint: "earlier"}}}
 	spec := func(dir string) (*session.CommandSpec, []string) {
 		t.Helper()
 		ev, err := e.Evaluate(context.Background(), &session.Session{ID: "s", ProjectPath: dir}, stored)

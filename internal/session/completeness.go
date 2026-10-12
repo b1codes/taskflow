@@ -789,10 +789,14 @@ func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evalu
 			runs[i] = CommandCheck{Command: spec.Line, Root: spec.Root, ExitCode: -1, Error: "the command runner returned no result", RanAt: time.Now()}
 		}
 	}
-	// The state each run is tied to is the spec's, taken before it ran: a
-	// change made while it ran makes it stale too.
+	// The state each run is tied to is the one the runner stamped on it (the
+	// state the runs left behind, unless they ran while the project's
+	// content changed), or else the spec's, taken before it ran: either way
+	// a change made while it ran makes it stale.
 	for i := range runs {
-		runs[i].Fingerprint = specs[i].Fingerprint
+		if runs[i].Fingerprint == "" {
+			runs[i].Fingerprint = specs[i].Fingerprint
+		}
 	}
 	for i := range ev.Findings {
 		f := &ev.Findings[i]

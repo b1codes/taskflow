@@ -28,12 +28,16 @@ const commandWaitDelay = 5 * time.Second
 // RunCommands runs each command check with sh -c in its stack root under the
 // session's project, with the stack's env merged over the inherited
 // environment, stdin closed, and the evaluator's time limit. It reports a
-// failed check rather than an error for anything that goes wrong.
+// failed check rather than an error for anything that goes wrong. Each
+// check's Fingerprint is the state the runs left behind (see
+// runSnapshot.stamp, completeness.go).
 func (e *CompletenessEvaluator) RunCommands(ctx context.Context, sess *session.Session, specs []session.CommandSpec) []session.CommandCheck {
+	snap := e.snapshot(sess.ProjectPath, specs)
 	out := make([]session.CommandCheck, 0, len(specs))
 	for _, spec := range specs {
 		out = append(out, runCommand(ctx, sess.ProjectPath, spec, e.timeout()))
 	}
+	snap.stamp(specs, out)
 	return out
 }
 
