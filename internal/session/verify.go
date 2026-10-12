@@ -36,13 +36,29 @@ func (s *Service) Verify(ctx context.Context, sessionID string) (*CompletenessRe
 	case !st.eval.CommandsEnabled:
 		return nil, fmt.Errorf("%w: set allow_commands = true under [completeness] in ~/.taskflow/config.toml to run them; until then, obligations that name a command ask for an attestation instead", ErrCommandsDisabled)
 	}
-	_ = s.persistMerge(ctx, sess, st, mr)
+	// Runs that weren't recorded don't count: a later check or stop would
+	// see the obligations as they were, so say so rather than "passed".
+	if err := s.persistMerge(ctx, sess, st, mr); err != nil {
+		return nil, fmt.Errorf("the command checks ran (%s), but their results couldn't be recorded, so they don't count; call tf_verify again: %w", runsSummary(st.runs), err)
+	}
 	r := st.report(sess.ID)
 	if len(st.runs) == 0 {
 		r.Warnings = append(r.Warnings, "no command checks apply to this session's obligations")
 	}
 	s.remind(ctx, st)
 	return r, nil
+}
+
+// runsSummary lists runs as "`line` in root: result", "; "-separated.
+func runsSummary(runs []CommandCheck) string {
+	if len(runs) == 0 {
+		return "none applied"
+	}
+	parts := make([]string, 0, len(runs))
+	for i := range runs {
+		parts = append(parts, fmt.Sprintf("`%s` in %s: %s", runs[i].Command, runs[i].Root, runs[i].result()))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // CheckResult is whether a session's required work is done, for hooks and
