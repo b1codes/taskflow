@@ -163,12 +163,12 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 		ev.Rules = append(ev.Rules, session.RuleInfo{ID: r.ID, Describe: r.Describe, Stack: r.Stack, Plannable: r.Plannable, Requires: r.Requires,
 			PlanHints: r.PlanHints, PlanVars: r.PlanVars})
 	}
-	fingerprints := map[string]string{}
+	var tree *string // the project's content hash, taken once per evaluation
 	for _, f := range res.Findings {
 		var cmd *session.CommandSpec
 		if f.Command != nil {
 			cmd = &session.CommandSpec{Line: f.Command.Line, Root: f.Command.Root, Env: f.Command.Env}
-			cmd.Fingerprint = e.fingerprint(sess.ProjectPath, cmd, fingerprints, ev)
+			cmd.Fingerprint = e.fingerprint(sess.ProjectPath, cmd, &tree, ev)
 		}
 		ev.Findings = append(ev.Findings, session.CompletenessFinding{
 			RuleID:        f.RuleID,
@@ -188,24 +188,24 @@ func (e *CompletenessEvaluator) evaluate(sess *session.Session, stored []*sessio
 	return ev, nil
 }
 
-// fingerprint identifies the state spec would run against: the content under
-// its root (gitctx.WorkTreeHash, once per root per evaluation) and its env.
-// It is "" when the content can't be hashed, with a warning, so a pass
+// fingerprint identifies the state spec would run against: the whole
+// repository's content (gitctx.WorkTreeHash, taken once per evaluation and
+// kept in *tree; a test suite can read code outside its stack root) and its
+// env. It is "" when the content can't be hashed, with a warning, so a pass
 // counts only in the evaluation that ran it.
-func (e *CompletenessEvaluator) fingerprint(projectPath string, spec *session.CommandSpec, byRoot map[string]string, ev *session.Evaluation) string {
-	tree, ok := byRoot[spec.Root]
-	if !ok {
-		h, err := gitctx.WorkTreeHash(projectPath, spec.Root)
+func (e *CompletenessEvaluator) fingerprint(projectPath string, spec *session.CommandSpec, tree **string, ev *session.Evaluation) string {
+	if *tree == nil {
+		h, err := gitctx.WorkTreeHash(projectPath)
 		if err != nil {
-			ev.Warnings = append(ev.Warnings, fmt.Sprintf("command check results in %s can't be tied to the project's state (%v), so a pass counts only for the run that made it: run tf_verify, or let tf_stop run them", spec.Root, err))
+			ev.Warnings = append(ev.Warnings, fmt.Sprintf("command check results can't be tied to the project's state (%v), so a pass counts only for the run that made it: run tf_verify, or let tf_stop run them", err))
 		}
-		byRoot[spec.Root], tree = h, h
+		*tree = &h
 	}
-	if tree == "" {
+	if **tree == "" {
 		return ""
 	}
 	sum := sha256.New()
-	fmt.Fprintf(sum, "tree %s\n", tree)
+	fmt.Fprintf(sum, "tree %s\n", **tree)
 	keys := make([]string, 0, len(spec.Env))
 	for k := range spec.Env {
 		keys = append(keys, k)

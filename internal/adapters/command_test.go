@@ -305,8 +305,8 @@ func TestCompletenessEvaluator_RunsStackCommands(t *testing.T) {
 	}
 }
 
-// Command specs carry a fingerprint of the state under their root and their
-// env, so a pass can't outlive a change; without git there is none.
+// Command specs carry a fingerprint of the repository's state and their env,
+// so a pass can't outlive a change; without git there is none.
 func TestCompletenessEvaluator_CommandFingerprint(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -356,9 +356,9 @@ rules:
 	if again, _ := spec(dir); first.Fingerprint == "" || again.Fingerprint != first.Fingerprint {
 		t.Fatalf("fingerprints %q, %q: want stable and non-empty", first.Fingerprint, again.Fingerprint)
 	}
-	write(dir, "README.md", "outside the stack root")
-	if s, _ := spec(dir); s.Fingerprint != first.Fingerprint {
-		t.Error("a change outside the root shouldn't change it")
+	write(dir, "shared/lib.go", "package shared")
+	if s, _ := spec(dir); s.Fingerprint == first.Fingerprint {
+		t.Error("a change outside the stack root should change it too: tests read shared code")
 	}
 	write(dir, "app/main.go", "package main // edited")
 	edited, _ := spec(dir)
