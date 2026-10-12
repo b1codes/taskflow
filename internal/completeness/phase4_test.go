@@ -37,7 +37,7 @@ func TestEvaluate_DeletedTrigger(t *testing.T) {
 		if f.Subject != "frontend/src/pages/Old.tsx" || f.Satisfied || f.Describe != "Remove the stories for Old" {
 			t.Errorf("finding = %+v", f)
 		}
-		if !slices.Equal(f.Expected, []string{"frontend/src/pages/Old.stories.tsx"}) {
+		if !slices.Equal(f.Expected, []string{AbsentPrefix + "frontend/src/pages/Old.stories.tsx"}) {
 			t.Errorf("expected = %v", f.Expected)
 		}
 	})

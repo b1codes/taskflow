@@ -37,7 +37,9 @@ type Finding struct {
 	Source   string
 	Severity string
 	Describe string
-	Expected []string // rendered paths/globs, relative to the project
+	// Expected lists the rendered paths/globs the checks look at, relative
+	// to the project, for display; an absent: one is prefixed AbsentPrefix.
+	Expected []string
 	// Satisfied means the requirement is met: its checks passed and it needs
 	// no attestation.
 	Satisfied bool
@@ -671,21 +673,29 @@ func (c *checker) changedMatching(tmpl string, vars map[string]string) []string 
 }
 
 // expected lists the rendered paths and globs v checks, relative to the
-// project, for showing the agent where the work is expected.
+// project, for showing the agent where the work is expected. An absent:
+// pattern is the opposite of where work is expected, so it is listed as
+// "must not exist: <path>" rather than as a bare path the agent would
+// take for a file to create.
 func (c *checker) expected(v *Verify, vars map[string]string) []string {
 	var out []string
 	seen := map[string]bool{}
+	add := func(prefix, tmpl string) {
+		if tmpl == "" {
+			return
+		}
+		p, _ := renderPath(tmpl, vars)
+		if p = prefix + c.projectRel(p); !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
 	var walk func(v *Verify)
 	walk = func(v *Verify) {
-		for _, tmpl := range []string{v.Exists, v.Absent, v.Changed, fileOf(v.ContainsIn), fileOfMM(v.MinMatches)} {
-			if tmpl == "" {
-				continue
-			}
-			p, _ := renderPath(tmpl, vars)
-			if p = c.projectRel(p); !seen[p] {
-				seen[p] = true
-				out = append(out, p)
-			}
+		add("", v.Exists)
+		add(AbsentPrefix, v.Absent)
+		for _, tmpl := range []string{v.Changed, fileOf(v.ContainsIn), fileOfMM(v.MinMatches)} {
+			add("", tmpl)
 		}
 		for i := range v.AnyOf {
 			walk(&v.AnyOf[i])
@@ -697,6 +707,10 @@ func (c *checker) expected(v *Verify, vars map[string]string) []string {
 	walk(v)
 	return out
 }
+
+// AbsentPrefix marks an Expected entry that names a path that must not
+// exist (an absent: check) rather than one where work is expected.
+const AbsentPrefix = "must not exist: "
 
 func fileOf(ci *ContainsIn) string {
 	if ci == nil {
