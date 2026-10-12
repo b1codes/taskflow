@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -21,8 +23,8 @@ const DefaultCommandTimeout = 300 * time.Second
 // test runners print their summary.
 const maxCommandOutput = 8 << 10
 
-// commandWaitDelay bounds how long a killed command's leftover children may
-// hold its output open.
+// commandWaitDelay bounds how long a killed shell may take to exit, and how
+// long anything that escaped its process group may then hold its output open.
 const commandWaitDelay = 5 * time.Second
 
 // RunCommands runs each command check with sh -c in its stack root under the
@@ -44,6 +46,9 @@ func (e *CompletenessEvaluator) timeout() time.Duration {
 	return DefaultCommandTimeout
 }
 
+// runCommand runs one check. The inherited environment loses taskflow's own
+// credentials (inheritedEnvDenylist), and whatever the shell leaves running
+// in its process group is killed once it exits.
 func runCommand(ctx context.Context, projectPath string, spec session.CommandSpec, timeout time.Duration) session.CommandCheck {
 	check := session.CommandCheck{Command: spec.Line, Root: spec.Root, RanAt: time.Now()}
 	fail := func(err string) session.CommandCheck {
@@ -62,16 +67,49 @@ func runCommand(ctx context.Context, projectPath string, spec session.CommandSpe
 		return fail(err.Error())
 	}
 	cmd.Dir = dir
-	cmd.Env = mergeEnv(os.Environ(), spec.Env)
-	buf := &tailBuffer{max: maxCommandOutput}
-	cmd.Stdout, cmd.Stderr = buf, buf
+	cmd.Env = mergeEnv(inheritedEnv(os.Environ()), spec.Env)
 	cmd.WaitDelay = commandWaitDelay
 
-	err = cmd.Run()
+	// The output goes to a pipe of our own rather than one exec copies from,
+	// so Wait returns as soon as the shell exits instead of waiting for
+	// whatever it left running in the background to let go of the pipe.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return fail(err.Error())
+	}
+	defer r.Close()
+	cmd.Stdout, cmd.Stderr = w, w
+	err = cmd.Start()
+	w.Close()
+	if err != nil {
+		return fail(err.Error())
+	}
+	buf := &tailBuffer{max: maxCommandOutput}
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		_, _ = io.Copy(buf, r)
+	}()
+
+	err = cmd.Wait()
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	// The shell is gone: anything it left behind in its process group (a
+	// backgrounded server, a watcher) goes with it, so it neither leaks nor
+	// holds the output open.
+	killGroup(cmd)
+	select {
+	case <-copied:
+	case <-time.After(commandWaitDelay):
+		// Something that left the group still holds the pipe: keep what
+		// it has written so far.
+		_ = r.SetReadDeadline(time.Now())
+		<-copied
+	}
 	check.Output = buf.String()
+
 	var exitErr *exec.ExitError
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case timedOut:
 		check.TimedOut = true
 		return fail(fmt.Sprintf("timed out after %s", timeout))
 	case err == nil:
@@ -82,6 +120,25 @@ func runCommand(ctx context.Context, projectPath string, spec session.CommandSpe
 		return fail(err.Error())
 	}
 	return check
+}
+
+// inheritedEnvDenylist names taskflow's own credentials, which a command
+// check doesn't get from taskflow's environment: its command line comes from
+// a manifest the agent can edit. A stack's env: may still set them on
+// purpose.
+var inheritedEnvDenylist = []string{
+	"CLICKUP_API_KEY", // ClickUp token (internal/config)
+}
+
+// inheritedEnv returns environ without the variables in inheritedEnvDenylist.
+func inheritedEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		if key, _, _ := strings.Cut(kv, "="); !slices.Contains(inheritedEnvDenylist, key) {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // mergeEnv returns base with env set over it. exec uses the last value of a

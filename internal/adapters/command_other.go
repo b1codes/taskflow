@@ -12,3 +12,6 @@ import (
 func shellCommand(ctx context.Context, line string) (*exec.Cmd, error) {
 	return nil, errors.New("command checks need a POSIX shell (/bin/sh)")
 }
+
+// killGroup: shellCommand never starts a command here.
+func killGroup(cmd *exec.Cmd) {}
