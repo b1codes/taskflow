@@ -19,3 +19,11 @@ func shellCommand(ctx context.Context, line string) (*exec.Cmd, error) {
 	}
 	return cmd, nil
 }
+
+// killGroup kills what is left of cmd's process group once its shell has
+// exited. The group's ID can't be taken by another process while any member
+// is alive; once none is, the kill finds nothing (ESRCH), short of the pid
+// being reused in the moment since the shell was reaped.
+func killGroup(cmd *exec.Cmd) {
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
