@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,10 +16,12 @@ import (
 )
 
 // ObligationStatus is the state of one obligation. Waived is set by tf_waive
-// and evaluation never changes it. Attested is set by tf_attest; evaluation
-// then moves the obligation between attested (the claim stands alone) and
-// satisfied (the claim plus passing checks meet the requirement), never back
-// to open.
+// and evaluation never changes it. Attested is set by tf_attest; while the
+// requirement still asks for an attestation, evaluation then moves the
+// obligation between attested (the claim stands alone) and satisfied (the
+// claim plus passing checks meet the requirement), never back to open. Once
+// it no longer asks for one, the attestation lapses: the obligation is open
+// or satisfied by its checks alone.
 type ObligationStatus string
 
 const (
@@ -80,6 +84,17 @@ func (o *Obligation) attested() bool {
 	return o.Status == ObligationAttested || slices.Contains(o.VerifiedLevels, levelAttest)
 }
 
+// standingEvidence is o's evidence while it stands: a waiver's rationale, or
+// an attestation that still counts. A lapsed attestation's evidence is kept
+// on record but not shown, so it isn't mistaken for what meets the
+// requirement now.
+func (o *Obligation) standingEvidence() string {
+	if o.Status == ObligationWaived || o.attested() {
+		return o.Evidence
+	}
+	return ""
+}
+
 // withAttest returns levels plus the attest level.
 func withAttest(levels []string) []string {
 	if slices.Contains(levels, levelAttest) {
@@ -133,7 +148,27 @@ type CommandSpec struct {
 	Fingerprint string
 }
 
-func (c *CommandSpec) runKey() string { return c.Root + "\x00" + c.Line }
+// runKey identifies one run: the same line in the same root with the same
+// env. Specs that differ in any of them are run separately.
+func (c *CommandSpec) runKey() string { return c.Root + "\x00" + c.Line + "\x00" + c.envKey() }
+
+// envKey identifies Env: a digest of its sorted pairs (so no value is
+// stored), "" when it is empty.
+func (c *CommandSpec) envKey() string {
+	if len(c.Env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(c.Env))
+	for k := range c.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k + "\x00" + c.Env[k] + "\x00"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // CommandCheck is one run of a command check: exit status 0 passes.
 type CommandCheck struct {
@@ -151,11 +186,15 @@ type CommandCheck struct {
 	RanAt  time.Time `json:"ran_at"`
 	// Fingerprint is the spec's when it ran.
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// Env is the spec's envKey: a run counts only for the env it ran with.
+	Env string `json:"env,omitempty"`
 }
 
-// runs reports whether c is a run of spec.
+// runs reports whether c is a run of spec: the same line, root, and env. A
+// run recorded without an env (before Env was kept) is a run only of a spec
+// with none.
 func (c *CommandCheck) runs(spec *CommandSpec) bool {
-	return c != nil && spec != nil && c.Command == spec.Line && c.Root == spec.Root
+	return c != nil && spec != nil && c.Command == spec.Line && c.Root == spec.Root && c.Env == spec.envKey()
 }
 
 // current reports whether c, a run of spec, ran against the state spec would
@@ -421,8 +460,12 @@ type mergeResult struct {
 //   - a new key is inserted as open or satisfied, and as planned when its
 //     subject was planned;
 //   - waived obligations are left alone (sticky);
-//   - attested ones are recomputed attested ⇄ satisfied: the attestation
-//     stands, and passing checks complete it;
+//   - attested ones are recomputed attested ⇄ satisfied while the finding
+//     still carries an attest prompt: the attestation stands, and passing
+//     checks complete it. Without one (the requirement no longer asks for
+//     an attestation, e.g. its command check now runs) the attestation
+//     lapses and they are recomputed open ⇄ satisfied like the rest, without
+//     the attest level; the evidence stays on record but isn't shown;
 //   - other existing ones are recomputed open ⇄ satisfied (a void one that
 //     is found again comes back);
 //   - stored keys that weren't found are voided (e.g. the file was reverted),
@@ -520,7 +563,12 @@ func mergeObligations(sessionID string, stored []*Obligation, ev *Evaluation, no
 		}
 		switch {
 		case o.Status == ObligationWaived:
-		case o.attested():
+		case o.attested() && f.AttestPrompt != "":
+			// The attestation stands only while the requirement asks for
+			// one. Once it doesn't (e.g. attest_when: no_command now that
+			// its command runs, or an inherited attestation), the default
+			// case decides by the checks alone and drops the attest level,
+			// as Attest would refuse such a finding.
 			levels, next := withAttest(levels), ObligationAttested
 			if checksPassed {
 				next = ObligationSatisfied
@@ -741,23 +789,36 @@ func (s *Service) writeMerge(ctx context.Context, st *completenessState, mr *mer
 // ahead (Stop, after the completion gate). The merge is nil when there is
 // nothing to write. With run set and command checks enabled, the findings'
 // command checks are run first (runCommandChecks), so the merge has their
-// results.
+// results. Runs can take minutes, so the obligations are then read again and
+// the merge is made against that read: a waiver or attestation made while
+// they ran is kept rather than overwritten from the read before. A failed
+// re-read leaves the state unchecked (readErr), with nothing to write.
 func (s *Service) evaluateUnsaved(ctx context.Context, sess *Session, run bool) (*completenessState, *mergeResult, error) {
 	st, err := s.tryEvaluateCompleteness(ctx, sess, false)
 	if st == nil || err != nil || st.readErr != "" {
 		return st, nil, err
 	}
+	stored := st.obligations
 	var runs []CommandCheck
 	if run && st.eval.Error == "" && st.eval.CommandsEnabled {
 		runs = s.runCommandChecks(ctx, sess, st.eval, st.obligations)
+		if len(runs) > 0 {
+			fresh, err := s.store.ListObligations(ctx, sess.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[session] failed to list obligations for session %s after running command checks: %v\n", sess.ID, err)
+				return &completenessState{eval: st.eval, runs: runs, readErr: "stored obligations couldn't be read after the command checks ran: " + err.Error()}, nil, nil
+			}
+			stored = fresh
+		}
 	}
-	merged, mr := mergeEvaluation(sess, st.obligations, st.eval)
+	merged, mr := mergeEvaluation(sess, stored, st.eval)
 	merged.runs = runs
 	return merged, mr, nil
 }
 
 // runCommandChecks runs the command checks of ev's findings, once per
-// distinct command line and root, and attaches each result to its findings.
+// distinct command line, root, and env (runKey), and attaches each result to
+// the findings with that spec.
 // Waived obligations' checks aren't run. It returns the runs.
 func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evaluation, stored []*Obligation) []CommandCheck {
 	waived := map[string]bool{}
@@ -793,6 +854,7 @@ func (s *Service) runCommandChecks(ctx context.Context, sess *Session, ev *Evalu
 	// change made while it ran makes it stale too.
 	for i := range runs {
 		runs[i].Fingerprint = specs[i].Fingerprint
+		runs[i].Env = specs[i].envKey()
 	}
 	for i := range ev.Findings {
 		f := &ev.Findings[i]
@@ -858,7 +920,7 @@ func (st *completenessState) view(o *Obligation, withStatus bool) ObligationView
 	}
 	if withStatus {
 		v.Status = o.Status
-		v.Evidence = o.Evidence
+		v.Evidence = o.standingEvidence()
 	}
 	return v
 }
@@ -1012,7 +1074,7 @@ func (st *completenessState) report(sessionID string) *CompletenessReport {
 // whether or not they have a fingerprint.
 func (st *completenessState) ranNow(c *CommandCheck) bool {
 	for i := range st.runs {
-		if r := &st.runs[i]; r.Command == c.Command && r.Root == c.Root && r.RanAt.Equal(c.RanAt) {
+		if r := &st.runs[i]; r.Command == c.Command && r.Root == c.Root && r.Env == c.Env && r.RanAt.Equal(c.RanAt) {
 			return true
 		}
 	}
@@ -1092,8 +1154,8 @@ func (st *completenessState) reportTable() string {
 			verified = strings.Join(o.VerifiedLevels, ", ") + " ✓"
 		}
 		evidence := "—"
-		if o.Evidence != "" {
-			evidence = o.Evidence
+		if e := o.standingEvidence(); e != "" {
+			evidence = e
 		} else if c, spec := o.CommandCheck, st.commands[o.ID]; c != nil && spec != nil {
 			result := c.result()
 			if c.Passed && !c.current(spec) && !st.ranNow(c) {

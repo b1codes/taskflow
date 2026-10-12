@@ -140,7 +140,9 @@ func TestMergeObligations(t *testing.T) {
 	t.Run("waived and attested are sticky", func(t *testing.T) {
 		waived, attested := stored("r", "story", "A", ObligationWaived), stored("r", "e2e", "A", ObligationAttested)
 		gone := stored("r", "story", "B", ObligationWaived)
-		mergeObligations("s", []*Obligation{waived, attested, gone}, evalWith(finding("r", "story", "A", false), finding("r", "e2e", "A", true)), now)
+		e2e := finding("r", "e2e", "A", false)
+		e2e.AttestPrompt = "Name the spec" // an attestation stands while it is asked for
+		mergeObligations("s", []*Obligation{waived, attested, gone}, evalWith(finding("r", "story", "A", false), e2e), now)
 		if waived.Status != ObligationWaived || attested.Status != ObligationAttested {
 			t.Errorf("sticky statuses changed: %s, %s", waived.Status, attested.Status)
 		}

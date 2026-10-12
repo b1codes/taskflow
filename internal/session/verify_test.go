@@ -18,6 +18,9 @@ func suiteFinding() CompletenessFinding {
 	return f
 }
 
+// suiteEnv is suiteFinding's env as a run records it.
+var suiteEnv = (&CommandSpec{Env: map[string]string{"CI": "true"}}).envKey()
+
 func commandEval(findings ...CompletenessFinding) *Evaluation {
 	ev := evalWith(findings...)
 	ev.CommandsEnabled = true
@@ -41,7 +44,7 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 
 	t.Run("a passing run satisfies it and adds the command level", func(t *testing.T) {
 		f := suiteFinding()
-		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Env: suiteEnv, Passed: true}
 		mr := mergeObligations("s", nil, commandEval(f), now)
 		o := mr.obligations[0]
 		if o.Status != ObligationSatisfied || !slices.Equal(o.VerifiedLevels, []string{levelCommand}) || o.CommandCheck == nil {
@@ -53,7 +56,7 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 		pass := func(fingerprint string) *Obligation {
 			o := stored("regression-suite", "suite", "web", ObligationSatisfied)
 			o.VerifiedLevels = []string{levelCommand}
-			o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true, Fingerprint: fingerprint}
+			o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Env: suiteEnv, Passed: true, Fingerprint: fingerprint}
 			return o
 		}
 		o := pass("state-1")
@@ -91,7 +94,7 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 	t.Run("a fresh pass counts without a fingerprint", func(t *testing.T) {
 		f := suiteFinding()
 		f.Command.Fingerprint = ""
-		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Env: suiteEnv, Passed: true}
 		mr := mergeObligations("s", nil, commandEval(f), now)
 		if o := mr.obligations[0]; o.Status != ObligationSatisfied {
 			t.Errorf("obligation = %+v", o)
@@ -100,7 +103,7 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 
 	t.Run("a failing run reopens it", func(t *testing.T) {
 		o := stored("regression-suite", "suite", "web", ObligationSatisfied)
-		o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+		o.CommandCheck = &CommandCheck{Command: "pnpm test", Root: "frontend", Env: suiteEnv, Passed: true}
 		f := suiteFinding()
 		run := failRun(*f.Command)
 		f.CommandResult = &run
@@ -113,7 +116,7 @@ func TestMergeObligations_CommandChecks(t *testing.T) {
 	t.Run("a failing structural check isn't rescued by the command", func(t *testing.T) {
 		f := suiteFinding()
 		f.Satisfied, f.ChecksPassed = false, false
-		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Passed: true}
+		f.CommandResult = &CommandCheck{Command: "pnpm test", Root: "frontend", Env: suiteEnv, Passed: true}
 		mr := mergeObligations("s", nil, commandEval(f), now)
 		if o := mr.obligations[0]; o.Status != ObligationOpen {
 			t.Errorf("obligation = %+v", o)
@@ -136,7 +139,7 @@ func TestService_Verify(t *testing.T) {
 	t.Run("runs each command once and records the results", func(t *testing.T) {
 		contract := finding("react-screen", "contract", "src/A.tsx", true)
 		contract.ChecksPassed = true
-		contract.Command = &CommandSpec{Line: "pnpm test", Root: "frontend", Fingerprint: "state-1"} // same run as the suite
+		contract.Command = &CommandSpec{Line: "pnpm test", Root: "frontend", Env: map[string]string{"CI": "true"}, Fingerprint: "state-1"} // same run as the suite
 		ev := &fakeEvaluator{eval: commandEval(suiteFinding(), contract)}
 		srv, store, sid := start(t, ev)
 
