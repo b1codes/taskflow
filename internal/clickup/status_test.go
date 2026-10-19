@@ -227,6 +227,57 @@ func TestResolveStatusForRole_Defaults(t *testing.T) {
 			want:     "Closed",
 		},
 		{
+			name: "complete skips cancelled closed status to pick complete closed status",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "cancelled", "type": "closed", "orderindex": 1},
+				{"status": "complete", "type": "closed", "orderindex": 2}
+			]`,
+			role: RoleComplete,
+			want: "complete",
+		},
+		{
+			name: "complete skips canceled closed status and fails when no completion status exists",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "in progress", "type": "custom", "orderindex": 1},
+				{"status": "canceled", "type": "closed", "orderindex": 2}
+			]`,
+			role:    RoleComplete,
+			wantErr: ErrNoMatchingStatus,
+		},
+		{
+			name: "complete skips dropped done status to pick complete done status",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "dropped", "type": "done", "orderindex": 1},
+				{"status": "complete", "type": "done", "orderindex": 2}
+			]`,
+			role: RoleComplete,
+			want: "complete",
+		},
+		{
+			name: "complete prefers complete/completed/done hint over earlier generic done status",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "shipped", "type": "done", "orderindex": 1},
+				{"status": "completed", "type": "done", "orderindex": 2}
+			]`,
+			role: RoleComplete,
+			want: "completed",
+		},
+		{
+			name: "complete falls back to custom complete when closed is only cancelled",
+			statuses: `[
+				{"status": "to do", "type": "open", "orderindex": 0},
+				{"status": "in progress", "type": "custom", "orderindex": 1},
+				{"status": "complete", "type": "custom", "orderindex": 2},
+				{"status": "cancelled", "type": "closed", "orderindex": 3}
+			]`,
+			role: RoleComplete,
+			want: "complete",
+		},
+		{
 			name:     "archive without closed status leaves the task alone",
 			statuses: `[{"status": "to do", "type": "open", "orderindex": 0}, {"status": "complete", "type": "done", "orderindex": 1}]`,
 			role:     RoleArchive,
@@ -279,6 +330,7 @@ func TestResolveStatusForRole_RespectsCurrentStatus(t *testing.T) {
 	const (
 		inProgress = `{"status": "in progress", "type": "custom"}`
 		inReview   = `{"status": "in review", "type": "custom"}`
+		testingQA  = `{"status": "testing/qa", "type": "custom"}`
 		complete   = `{"status": "complete", "type": "done"}`
 		cancelled  = `{"status": "cancelled", "type": "closed"}`
 	)
@@ -296,7 +348,10 @@ func TestResolveStatusForRole_RespectsCurrentStatus(t *testing.T) {
 		{"archive doesn't cancel a completed task", complete, RoleArchive, ""},
 		{"archive leaves a cancelled task", cancelled, RoleArchive, ""},
 		{"complete leaves a completed task", complete, RoleComplete, ""},
-		{"complete moves a task out of review", inReview, RoleComplete, "complete"},
+		{"complete leaves a cancelled task", cancelled, RoleComplete, ""},
+		{"complete leaves a task in review", inReview, RoleComplete, ""},
+		{"complete leaves a task in QA", testingQA, RoleComplete, ""},
+		{"complete moves a task in progress to complete", inProgress, RoleComplete, "complete"},
 		{"archive cancels a task in progress", inProgress, RoleArchive, "cancelled"},
 		{"reopen moves a completed task back to work", complete, RoleReopen, "in progress"},
 		{"reopen moves a cancelled task back to work", cancelled, RoleReopen, "in progress"},
@@ -304,7 +359,8 @@ func TestResolveStatusForRole_RespectsCurrentStatus(t *testing.T) {
 		{"reopen leaves a task in review", inReview, RoleReopen, ""},
 		{"reopen leaves a task already in progress", inProgress, RoleReopen, ""},
 		{"review moves a task in progress to review", inProgress, RoleReview, "in review"},
-		{"review moves a task in QA back to review", `{"status": "testing/qa", "type": "custom"}`, RoleReview, "in review"},
+		{"review leaves a task already in review", inReview, RoleReview, ""},
+		{"review leaves a task in QA", testingQA, RoleReview, ""},
 		{"review leaves a completed task", complete, RoleReview, ""},
 		{"review leaves a cancelled task", cancelled, RoleReview, ""},
 	}
@@ -328,6 +384,78 @@ func TestResolveStatusForRole_RespectsCurrentStatus(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("ResolveStatusForRole failed: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestResolveTargetStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		current string
+		target  string
+		want    string
+		wantErr error
+	}{
+		{
+			name:    "explicit complete moves a task out of review",
+			current: `{"status": "in review", "type": "custom"}`,
+			target:  "complete",
+			want:    "complete",
+		},
+		{
+			name:    "explicit testing/qa moves a task out of review",
+			current: `{"status": "in review", "type": "custom"}`,
+			target:  "Testing/QA",
+			want:    "testing/qa",
+		},
+		{
+			name:    "in_review alias resolves to in review",
+			current: `{"status": "in progress", "type": "custom"}`,
+			target:  "in_review",
+			want:    "in review",
+		},
+		{
+			name:    "already in target status skips change",
+			current: `{"status": "in review", "type": "custom"}`,
+			target:  "in review",
+			wantErr: ErrSkipStatusChange,
+		},
+		{
+			name:    "leaves a completed task alone",
+			current: `{"status": "complete", "type": "done"}`,
+			target:  "in review",
+			wantErr: ErrSkipStatusChange,
+		},
+		{
+			name:    "unknown target status returns ErrNoMatchingStatus",
+			current: `{"status": "in progress", "type": "custom"}`,
+			target:  "nonexistent-status",
+			wantErr: ErrNoMatchingStatus,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := newTaskStatusServer(t, "task-1", "list-1", tt.current, developmentTaskListStatuses, nil, nil)
+			client := New("api-key").WithBaseURL(server.URL)
+
+			got, err := ResolveTargetStatus(ctx, newMemStore(t), client, "task-1", tt.target)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("expected error %v, got %q, %v", tt.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveTargetStatus failed: %v", err)
 			}
 			if got != tt.want {
 				t.Errorf("expected %q, got %q", tt.want, got)
