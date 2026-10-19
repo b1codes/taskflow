@@ -13,9 +13,10 @@ import (
 )
 
 var (
-	stopSummary string
-	stopStatus  string
-	stopForce   bool
+	stopSummary          string
+	stopStatus           string
+	stopTargetTaskStatus string
+	stopForce            bool
 )
 
 var stopCmd = &cobra.Command{
@@ -43,7 +44,7 @@ var stopCmd = &cobra.Command{
 			targetStatus = "COMPLETED"
 		}
 
-		res, err := srv.Stop(cmd.Context(), sessionID, stopSummary, targetStatus, cfg.Git.AutoContext, stopForce)
+		res, err := srv.StopWithTaskStatus(cmd.Context(), sessionID, stopSummary, targetStatus, stopTargetTaskStatus, cfg.Git.AutoContext, stopForce)
 		if errors.Is(err, session.ErrIncompleteSession) || errors.Is(err, session.ErrCompletenessUnchecked) {
 			return fmt.Errorf("%w\nA human can complete it anyway with --force (recorded as a decision on the task)", err)
 		}
@@ -90,7 +91,8 @@ var stopCmd = &cobra.Command{
 
 func init() {
 	stopCmd.Flags().StringVarP(&stopSummary, "summary", "s", "", "Markdown summary of final achievements before stopping")
-	stopCmd.Flags().StringVarP(&stopStatus, "status", "t", "completed", "Target status: completed, paused, archived")
+	stopCmd.Flags().StringVarP(&stopStatus, "status", "t", "completed", "Target status: completed (or in_review), paused, archived (or abandoned)")
+	stopCmd.Flags().StringVar(&stopTargetTaskStatus, "target-task-status", "", "Optional ClickUp status override for the task (e.g. 'in review', 'testing/qa', 'complete')")
 	stopCmd.Flags().BoolVar(&stopForce, "force", false, "Complete even when the completion gate blocks it (records a decision naming the open obligations)")
 
 	rootCmd.AddCommand(stopCmd)

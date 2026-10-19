@@ -107,12 +107,13 @@ func TestMCPServer_Handlers(t *testing.T) {
 		t.Fatalf("handleList returned error: %s", listRes.Content[0].(mcp.TextContent).Text)
 	}
 
-	// 5. Test tf_stop handler
+	// 5. Test tf_stop handler (including target_task_status, in_review, and abandoned)
 	stopReq := mcp.CallToolRequest{}
 	stopReq.Params.Arguments = map[string]any{
-		"session_id": sessionID,
-		"summary":    "all done",
-		"status":     "completed",
+		"session_id":         sessionID,
+		"summary":            "all done",
+		"status":             "completed",
+		"target_task_status": "in review",
 	}
 
 	stopRes, err := srv.handleStop(ctx, stopReq)
@@ -121,6 +122,29 @@ func TestMCPServer_Handlers(t *testing.T) {
 	}
 	if stopRes.IsError {
 		t.Fatalf("handleStop returned error: %s", stopRes.Content[0].(mcp.TextContent).Text)
+	}
+
+	// Test status="in_review" and status="abandoned" via MCP handleStop
+	for _, tc := range []struct {
+		taskID     string
+		statusArg  string
+		wantStatus string
+	}{
+		{"task-mcp-review", "in_review", "COMPLETED"},
+		{"task-mcp-abandon", "abandoned", "ARCHIVED"},
+	} {
+		startOut := callTool(t, "tf_start", srv.handleStart, map[string]any{
+			"task_id":      tc.taskID,
+			"project_path": t.TempDir(),
+		})
+		sid, _ := startOut["session_id"].(string)
+		stopOut := callTool(t, "tf_stop", srv.handleStop, map[string]any{
+			"session_id": sid,
+			"status":     tc.statusArg,
+		})
+		if got, _ := stopOut["new_status"].(string); got != tc.wantStatus {
+			t.Errorf("tf_stop(status=%q) new_status = %q, want %q", tc.statusArg, got, tc.wantStatus)
+		}
 	}
 }
 

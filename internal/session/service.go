@@ -172,12 +172,39 @@ func (s *Service) queueSync(ctx context.Context, taskID, operation string, paylo
 }
 
 // enqueueStatus queues a ClickUp status change for a lifecycle role (start,
-// reopen, complete, archive). The sync worker maps the role onto a status of
-// the task's list, so no status names or types are decided here.
+// reopen, complete, review, archive). The sync worker maps the role onto a
+// status of the task's list, so no status names or types are decided here.
 func (s *Service) enqueueStatus(ctx context.Context, taskID string, role StatusRole) {
 	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
 		Role StatusRole `json:"role"`
 	}{Role: role})
+}
+
+// enqueueTargetStatus queues an explicit ClickUp target status requested by
+// the caller on stop.
+func (s *Service) enqueueTargetStatus(ctx context.Context, taskID string, role StatusRole, targetStatus string) {
+	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
+		Role         StatusRole `json:"role,omitempty"`
+		TargetStatus string     `json:"target_status"`
+	}{Role: role, TargetStatus: targetStatus})
+}
+
+// normalizeStopTarget maps a caller's target status string (from CLI or MCP)
+// to the session Status and an optional StatusRole override (such as RoleReview
+// when status="in_review"/"review", or RoleArchive when status="abandoned"/"cancelled").
+func normalizeStopTarget(targetStatus string) (Status, StatusRole) {
+	switch strings.ToUpper(strings.TrimSpace(targetStatus)) {
+	case "", "COMPLETED", "COMPLETE", "DONE":
+		return StatusCompleted, ""
+	case "IN_REVIEW", "IN REVIEW", "REVIEW":
+		return StatusCompleted, RoleReview
+	case "PAUSED", "PAUSE":
+		return StatusPaused, ""
+	case "ARCHIVED", "ARCHIVE", "ABANDONED", "ABANDON", "CANCELLED", "CANCELED", "CANCEL":
+		return StatusArchived, ""
+	default:
+		return Status(targetStatus), ""
+	}
 }
 
 // stopStatusRole returns the ClickUp status role for a Stop transition, or ""
@@ -698,6 +725,12 @@ func (s *Service) List(ctx context.Context, filter SessionFilter) ([]*SessionSum
 // reminder counts, unless force is set (a human override, recorded as a
 // decision). Pausing and archiving are never gated.
 func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus string, autoGit, force bool) (*StopResult, error) {
+	return s.StopWithTaskStatus(ctx, sessionID, summary, targetStatus, "", autoGit, force)
+}
+
+// StopWithTaskStatus is Stop with an optional explicit ClickUp status override
+// (targetTaskStatus) for the linked task.
+func (s *Service) StopWithTaskStatus(ctx context.Context, sessionID, summary, targetStatus, targetTaskStatus string, autoGit, force bool) (*StopResult, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session: %w", err)
@@ -706,10 +739,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		return nil, fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
 	}
 
-	tStatus := Status(targetStatus)
-	if tStatus == "" {
-		tStatus = StatusCompleted
-	}
+	tStatus, roleOverride := normalizeStopTarget(targetStatus)
 
 	if err := ValidateTransition(sess.Status, tStatus); err != nil {
 		return nil, fmt.Errorf("invalid transition: %w", err)
@@ -732,6 +762,10 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 
 	fromStatus := sess.Status
 	role := stopStatusRole(fromStatus, tStatus)
+	if roleOverride != "" && role != "" {
+		role = roleOverride
+	}
+	targetTaskStatus = strings.TrimSpace(targetTaskStatus)
 	res := &StopResult{SessionID: sessionID, Status: tStatus}
 	// The gate runs before anything is written, so a blocked stop leaves the
 	// session as it was, its obligations and their reminder counts included.
@@ -753,6 +787,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		res.Gate = gate
 		if gateRole != "" && role != "" {
 			role = gateRole
+			// The review gate prevents an incomplete session from marking the
+			// ClickUp task complete, even if targetTaskStatus was requested.
+			targetTaskStatus = ""
 		}
 	}
 
@@ -782,7 +819,10 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 	}
 
 	// 1. Enqueue status update
-	if role != "" {
+	switch {
+	case targetTaskStatus != "" && role != "":
+		s.enqueueTargetStatus(ctx, sess.TaskID, role, targetTaskStatus)
+	case role != "":
 		s.enqueueStatus(ctx, sess.TaskID, role)
 	}
 
