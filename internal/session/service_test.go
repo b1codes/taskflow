@@ -1074,4 +1074,46 @@ func TestService_StatusRoles(t *testing.T) {
 			t.Errorf("expected UPDATE_STATUS payloads %v, got %v", want, updatePayloads)
 		}
 	})
+
+	// A target only rides on a completing stop: elsewhere it would be dropped
+	// (pausing) or move an archived task past the completion gate.
+	for _, tc := range []struct {
+		name   string
+		first  string // stops the session once before the stop under test
+		status string
+	}{
+		{"pausing", "", "PAUSED"},
+		{"archiving", "", "ARCHIVED"},
+		{"abandoning", "", "abandoned"},
+		{"archiving a completed session", "COMPLETED", "ARCHIVED"},
+	} {
+		t.Run("StopWithTaskStatus refuses a target when "+tc.name, func(t *testing.T) {
+			store := newMockStore()
+			srv := NewService(store, &mockGit{}, nil)
+
+			res, err := srv.Start(ctx, "task-target-refused", t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+			sid := res.Session.ID
+			if tc.first != "" {
+				if _, err := srv.Stop(ctx, sid, "", tc.first, false, false); err != nil {
+					t.Fatalf("Stop(%s) failed: %v", tc.first, err)
+				}
+			}
+			before := store.sessions[sid].Status
+			roles := store.statusRoles(t)
+
+			_, err = srv.StopWithTaskStatus(ctx, sid, "", tc.status, "complete", false, false)
+			if !errors.Is(err, ErrTargetTaskStatus) {
+				t.Fatalf("expected ErrTargetTaskStatus, got %v", err)
+			}
+			if got := store.sessions[sid].Status; got != before {
+				t.Errorf("session status = %s, want it left %s", got, before)
+			}
+			if got := store.statusRoles(t); !slices.Equal(got, roles) {
+				t.Errorf("roles = %v, want %v (nothing queued)", got, roles)
+			}
+		})
+	}
 }

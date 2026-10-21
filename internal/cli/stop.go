@@ -92,7 +92,7 @@ var stopCmd = &cobra.Command{
 func init() {
 	stopCmd.Flags().StringVarP(&stopSummary, "summary", "s", "", "Markdown summary of final achievements before stopping")
 	stopCmd.Flags().StringVarP(&stopStatus, "status", "t", "completed", "Target status: completed (or in_review), paused, archived (or abandoned)")
-	stopCmd.Flags().StringVar(&stopTargetTaskStatus, "target-task-status", "", "Optional ClickUp status override for the task (e.g. 'in review', 'testing/qa', 'complete')")
+	stopCmd.Flags().StringVar(&stopTargetTaskStatus, "target-task-status", "", "ClickUp status to move the task to when completing (e.g. 'in review', 'testing/qa'); falls back to the default when the list has none")
 	stopCmd.Flags().BoolVar(&stopForce, "force", false, "Complete even when the completion gate blocks it (records a decision naming the open obligations)")
 
 	rootCmd.AddCommand(stopCmd)
