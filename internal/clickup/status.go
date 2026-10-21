@@ -107,11 +107,19 @@ func statusEntries(listID string, statuses []ListStatus) []*store.CacheEntry {
 // back to the default with a warning. Returns ErrSkipStatusChange when the
 // task should keep its current status.
 func ResolveStatusForRole(ctx context.Context, st store.Store, client *Client, taskID string, role StatusRole, overrides map[StatusRole]string) (string, error) {
+	return ResolveTargetStatus(ctx, st, client, taskID, role, "", overrides)
+}
+
+// ResolveTargetStatus is ResolveStatusForRole with an explicit target status
+// the caller asked for (see resolveTarget), which takes the place of the
+// role's status_map entry and default; "" resolves the role alone. A target
+// the role can't use falls back to the role, with a warning.
+func ResolveTargetStatus(ctx context.Context, st store.Store, client *Client, taskID string, role StatusRole, target string, overrides map[StatusRole]string) (string, error) {
 	task, err := client.GetTask(ctx, taskID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get task: %w", err)
 	}
-	name, _, err := resolveStatusForTask(ctx, st, client, task, role, overrides, false)
+	name, _, err := resolveStatusForTask(ctx, st, client, task, role, target, overrides, false)
 	return name, err
 }
 
@@ -126,6 +134,12 @@ func ResolveStatusForRole(ctx context.Context, st store.Store, client *Client, t
 // the refreshed statuses resolve to the same name, won't be fixed by fetching
 // them again. A 400 that ends the update wraps ErrStatusRejected.
 func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID string, role StatusRole, overrides map[StatusRole]string) error {
+	return ApplyTargetStatus(ctx, st, client, taskID, role, "", overrides)
+}
+
+// ApplyTargetStatus is ApplyStatusRole with an explicit target status (see
+// ResolveTargetStatus); "" applies the role alone.
+func ApplyTargetStatus(ctx context.Context, st store.Store, client *Client, taskID string, role StatusRole, target string, overrides map[StatusRole]string) error {
 	task, err := client.GetTask(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to get task: %w", err)
@@ -141,7 +155,7 @@ func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID
 		return nil
 	}
 
-	name, fresh, err := resolveStatusForTask(ctx, st, client, task, role, overrides, false)
+	name, fresh, err := resolveStatusForTask(ctx, st, client, task, role, target, overrides, false)
 	if err != nil {
 		return err
 	}
@@ -153,7 +167,7 @@ func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID
 	// The rejected update left the task where it was, so the task fetched
 	// above still holds its current status.
 	rejected := err
-	retryName, _, err := resolveStatusForTask(ctx, st, client, task, role, overrides, true)
+	retryName, _, err := resolveStatusForTask(ctx, st, client, task, role, target, overrides, true)
 	if err != nil {
 		return err
 	}
@@ -164,13 +178,22 @@ func ApplyStatusRole(ctx context.Context, st store.Store, client *Client, taskID
 	return update(retryName)
 }
 
-// resolveStatusForTask is ResolveStatusForRole for an already fetched task, so
-// ApplyStatusRole can re-resolve without fetching the task again.
+// resolveStatusForTask is ResolveTargetStatus for an already fetched task, so
+// ApplyTargetStatus can re-resolve without fetching the task again.
 // forceRefresh bypasses the status cache. fresh reports whether the list's
 // statuses were fetched from ClickUp during this call, i.e. whether fetching
 // them again could change the result.
-func resolveStatusForTask(ctx context.Context, st store.Store, client *Client, task *Task, role StatusRole, overrides map[StatusRole]string, forceRefresh bool) (name string, fresh bool, err error) {
-	if err := checkRoleApplies(role, task.Status); err != nil {
+func resolveStatusForTask(ctx context.Context, st store.Store, client *Client, task *Task, role StatusRole, target string, overrides map[StatusRole]string, forceRefresh bool) (name string, fresh bool, err error) {
+	// A target that names a status only needs the task not done or closed;
+	// one the role falls back from, or that names a role, is held to that
+	// role's check once it is resolved, below.
+	target = strings.TrimSpace(target)
+	if target == "" {
+		err = checkRoleApplies(role, task.Status)
+	} else {
+		err = checkTargetApplies(role, target, task.Status)
+	}
+	if err != nil {
 		return "", false, err
 	}
 
@@ -188,7 +211,31 @@ func resolveStatusForTask(ctx context.Context, st store.Store, client *Client, t
 		}
 	}
 
-	if key, want := overrideForRole(overrides, role); want != "" {
+	if target != "" {
+		// A target names a status someone asked for, so a miss against the
+		// cache is worth one refetch: the status may be newer than the cache.
+		if !fresh && findTargetStatus(statuses, target) == nil && targetAliasRole(target) == "" {
+			if statuses, fresh, err = listStatuses(ctx, st, client, listID, true); err != nil {
+				return "", false, err
+			}
+		}
+		var alias StatusRole
+		var why string
+		name, alias, why = resolveTarget(statuses, role, target)
+		switch {
+		case alias != "":
+			role = alias
+		case name == "":
+			fmt.Fprintf(os.Stderr, "[clickup] target status %q for task %s %s; using role %q\n", target, task.ID, why, role)
+		}
+		if name == "" {
+			if err := checkRoleApplies(role, task.Status); err != nil {
+				return "", fresh, err
+			}
+		}
+	}
+
+	if key, want := overrideForRole(overrides, role); name == "" && want != "" {
 		name = findStatus(statuses, want)
 		// An override names a status someone configured on purpose, so a
 		// miss against the cache is worth one refetch before falling back:
@@ -232,6 +279,57 @@ func findStatus(statuses []*store.CacheEntry, name string) string {
 		}
 	}
 	return ""
+}
+
+// findTargetStatus returns the list's status named target (matched
+// case-insensitively, "_" also read as a space so "in_review" finds "in
+// review"), or nil.
+func findTargetStatus(statuses []*store.CacheEntry, target string) *store.CacheEntry {
+	for _, want := range []string{target, strings.ReplaceAll(target, "_", " ")} {
+		for _, s := range statuses {
+			if strings.EqualFold(s.Name, want) {
+				return s
+			}
+		}
+	}
+	return nil
+}
+
+// targetAliasRole returns the role a target names when it is a role's name
+// rather than a status's ("review", "completed", "cancelled"), or "".
+func targetAliasRole(target string) StatusRole {
+	switch strings.Join(statusWords(target), " ") {
+	case "review", "in review":
+		return RoleReview
+	case "complete", "completed", "done":
+		return RoleComplete
+	case "archive", "archived", "abandon", "abandoned", "cancel", "cancelled", "canceled":
+		return RoleArchive
+	}
+	return ""
+}
+
+// resolveTarget resolves an explicit target status for role: the list's
+// status of that name, else a role alias (see targetAliasRole), which then
+// resolves as its role does, status_map included. Only complete may be
+// pointed at a done or closed status, or at another role: the review gate
+// holds a task back from being finished, and naming the status it holds the
+// task back from mustn't get past it. Returns the status name, or the alias
+// role, or neither and why role is used instead.
+func resolveTarget(statuses []*store.CacheEntry, role StatusRole, target string) (name string, alias StatusRole, why string) {
+	if s := findTargetStatus(statuses, target); s != nil {
+		if role != RoleComplete && (s.StatusType == "done" || s.StatusType == "closed") {
+			return "", "", fmt.Sprintf("is a %s status, which role %q doesn't move a task to", s.StatusType, role)
+		}
+		return s.Name, "", ""
+	}
+	if a := targetAliasRole(target); a != "" {
+		if role != RoleComplete && a != role {
+			return "", "", fmt.Sprintf("names role %q, which role %q doesn't move a task to", a, role)
+		}
+		return "", a, ""
+	}
+	return "", "", "isn't on the list"
 }
 
 // overrideForRole returns the status_map key and status name pinned for
@@ -291,8 +389,10 @@ func forgetOverrideMissing(listID string, key StatusRole, want string) {
 //	reopen   → from open, done, or closed: a new session on a finished task
 //	           puts it back to work; a task in progress or in review (custom)
 //	           is still being worked and is left alone
-//	complete → not from done or closed
-//	review   → not from done or closed: someone already finished the task
+//	complete → not from done or closed; a task in review or QA is finished
+//	           from there (to leave it in review, stop as in_review)
+//	review   → not from done, closed, or a review/QA stage: someone already
+//	           handed the task off for review/QA or finished it
 //	archive  → not from done or closed, so a finished task is never cancelled
 func checkRoleApplies(role StatusRole, current TaskStatus) error {
 	var applies bool
@@ -301,13 +401,30 @@ func checkRoleApplies(role StatusRole, current TaskStatus) error {
 		applies = current.Type == "open"
 	case RoleReopen:
 		applies = current.Type == "open" || current.Type == "done" || current.Type == "closed"
-	case RoleComplete, RoleReview, RoleArchive:
+	case RoleComplete, RoleArchive:
 		applies = current.Type != "done" && current.Type != "closed"
+	case RoleReview:
+		applies = current.Type != "done" && current.Type != "closed" &&
+			!(current.Type == "custom" && isReviewStage(statusWords(current.Status)))
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownStatusRole, role)
 	}
 	if !applies {
 		return fmt.Errorf("task is %q (%s), leaving it for role %q: %w", current.Status, current.Type, role, ErrSkipStatusChange)
+	}
+	return nil
+}
+
+// checkTargetApplies is checkRoleApplies for an explicit target status: the
+// caller chose where the task goes, so it may move the task from any status
+// but done or closed. A target that falls back to a role is checked again as
+// that role.
+func checkTargetApplies(role StatusRole, target string, current TaskStatus) error {
+	if _, err := ParseStatusRole(string(role)); err != nil {
+		return err
+	}
+	if current.Type == "done" || current.Type == "closed" {
+		return fmt.Errorf("task is %q (%s), leaving it for target %q: %w", current.Status, current.Type, target, ErrSkipStatusChange)
 	}
 	return nil
 }
@@ -319,17 +436,29 @@ var (
 	// startStatusHints name a custom status as the list's working status, in
 	// priority order: a later "in progress" beats an earlier "doing".
 	startStatusHints = []string{"progress", "doing", "wip", "working", "development", "developing", "develop", "active"}
+	// completeStatusHints name a done or closed status as the list's completion
+	// status, in priority order: "complete"/"completed"/"done" beats a generic
+	// status of the same type.
+	completeStatusHints = []string{"complete", "completed", "done"}
 	// preWorkWords mark statuses for work that hasn't started yet. Lists
 	// often add custom ones ("ready for development", "backlog"), which start
 	// must never pick. "to do" is matched as a phrase by isPreWork.
 	preWorkWords = []string{"ready", "todo", "backlog", "planned", "queued", "next", "new", "open"}
 	// notStartPrefixes mark custom statuses that come after work starts.
 	notStartPrefixes = []string{"review", "block", "qa", "test", "hold", "wait", "await", "approv"}
+	// reviewStagePrefixes mark custom statuses where finished work is being
+	// reviewed, tested, or approved before final completion. Review doesn't
+	// move a task already in one of these stages back to review.
+	reviewStagePrefixes = []string{"review", "qa", "test", "approv"}
 	// archivePrefixes mark a closed status as abandoned rather than finished.
 	// ClickUp's default lists close finished tasks as "complete", so archiving
 	// to just any closed status would report abandoned work as done.
 	archivePrefixes = []string{"cancel", "abandon", "wont", "drop", "reject", "obsolete", "duplicate", "archiv"}
 )
+
+func isReviewStage(words []string) bool {
+	return hasWordWithPrefix(words, reviewStagePrefixes)
+}
 
 // statusWords lowercases a status name and splits it into words on anything
 // but letters and digits. Apostrophes are dropped first so "won't" reads as
@@ -367,7 +496,8 @@ func isPreWork(words []string) bool {
 // defaultStatusForRole picks a status from statuses (sorted by orderindex):
 //
 //	start, reopen → see startStatus
-//	complete      → first done, else first closed
+//	complete      → see completeStatus (first done, else closed, preferring
+//	                complete/completed/done and excluding cancel/archive names)
 //	review        → first custom status with the whole word "review" ("in
 //	                review", "Code Review"), else none: the task keeps its
 //	                status rather than being reported done
@@ -388,10 +518,7 @@ func defaultStatusForRole(statuses []*store.CacheEntry, role StatusRole) string 
 	case RoleStart, RoleReopen:
 		return startStatus(statuses)
 	case RoleComplete:
-		if name := firstOfType("done", nil); name != "" {
-			return name
-		}
-		return firstOfType("closed", nil)
+		return completeStatus(statuses)
 	case RoleReview:
 		return firstOfType("custom", func(words []string) bool {
 			return slices.Contains(words, "review")
@@ -402,6 +529,53 @@ func defaultStatusForRole(statuses []*store.CacheEntry, role StatusRole) string 
 		})
 	}
 	return ""
+}
+
+// completeStatus picks the completion status for RoleComplete:
+//  1. A "done" status not named like a cancellation/archive (archivePrefixes),
+//     preferring completeStatusHints ("complete", "completed", "done") in
+//     priority order before falling back to the first non-archive "done" status.
+//  2. Otherwise, a "closed" status not named like a cancellation/archive,
+//     again preferring completeStatusHints before falling back to the first
+//     non-archive "closed" status.
+//
+// Otherwise none. A custom status is never picked, even one named
+// "complete": reopen only moves a task out of open, done, or closed, so a
+// task completed to a custom status would stay there through later work.
+func completeStatus(statuses []*store.CacheEntry) string {
+	pickFromType := func(statusType string) string {
+		type candidate struct {
+			name  string
+			words []string
+		}
+		var candidates []candidate
+		for _, s := range statuses {
+			if s.StatusType != statusType {
+				continue
+			}
+			words := statusWords(s.Name)
+			if hasWordWithPrefix(words, archivePrefixes) {
+				continue
+			}
+			candidates = append(candidates, candidate{s.Name, words})
+		}
+		for _, hint := range completeStatusHints {
+			for _, c := range candidates {
+				if slices.Contains(c.words, hint) {
+					return c.name
+				}
+			}
+		}
+		if len(candidates) > 0 {
+			return candidates[0].name
+		}
+		return ""
+	}
+
+	if name := pickFromType("done"); name != "" {
+		return name
+	}
+	return pickFromType("closed")
 }
 
 // startStatus picks the working status for start and reopen from the custom

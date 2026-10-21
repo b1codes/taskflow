@@ -110,7 +110,8 @@ func (s *Server) registerTools() {
 		mcp.WithDescription("Stop or pause the session. Completing it runs the completeness command checks (when enabled), and with required obligations open goes through the project's completion gate: it may move the ClickUp task to review, or (gate: block) refuse until each one is done, attested, or waived"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("The session UUID to stop")),
 		mcp.WithString("summary", mcp.Description("Optional final markdown summary of achievements")),
-		mcp.WithString("status", mcp.Description("Target status: completed, paused, archived (defaults to completed)")),
+		mcp.WithString("status", mcp.Description("Target status: completed (or in_review/review to complete the session but move the ClickUp task to review, e.g. when it awaits a PR review; completed moves it to complete even from review), paused, archived (or abandoned/cancelled to move the ClickUp task to a cancel-like status). Defaults to completed")),
+		mcp.WithString("target_task_status", mcp.Description("Optional ClickUp status to move the task to when completing (e.g. 'in review', 'testing/qa'); only with status completed or in_review. Falls back to the default when the list has no such status, and the review gate never lets it move the task to a done/closed status")),
 	), s.handleStop)
 
 	s.mcpServer.AddTool(mcp.NewTool("tf_completeness",
@@ -303,6 +304,7 @@ func (s *Server) handleStop(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 	summary := request.GetString("summary", "")
 	statusParam := request.GetString("status", "completed")
+	targetTaskStatus := request.GetString("target_task_status", "")
 
 	targetStatus := strings.ToUpper(statusParam)
 	if targetStatus == "" {
@@ -311,7 +313,7 @@ func (s *Server) handleStop(ctx context.Context, request mcp.CallToolRequest) (*
 
 	// MCP has no override for the block gate: an agent gets past it only by
 	// doing, attesting, or waiving the work.
-	res, err := s.service.Stop(ctx, sessionID, summary, targetStatus, s.config.Git.AutoContext, false)
+	res, err := s.service.StopWithTaskStatus(ctx, sessionID, summary, targetStatus, targetTaskStatus, s.config.Git.AutoContext, false)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

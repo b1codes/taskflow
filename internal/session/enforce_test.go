@@ -124,6 +124,22 @@ func TestService_Gate(t *testing.T) {
 		}
 	})
 
+	t.Run("review keeps an explicit target, held to review by the worker", func(t *testing.T) {
+		srv, store, sid := start(t, &fakeEvaluator{eval: screenEval()}, "")
+		if _, err := srv.StopWithTaskStatus(ctx, sid, "", "COMPLETED", "testing/qa", false, false); err != nil {
+			t.Fatalf("StopWithTaskStatus: %v", err)
+		}
+		var last string
+		for _, op := range store.syncOps {
+			if op.Operation == "UPDATE_STATUS" {
+				last = op.Payload
+			}
+		}
+		if want := `{"role":"review","target_status":"testing/qa"}`; last != want {
+			t.Errorf("UPDATE_STATUS payload = %s, want %s", last, want)
+		}
+	})
+
 	t.Run("report completes", func(t *testing.T) {
 		srv, store, sid := start(t, &fakeEvaluator{eval: screenEval()}, GateReport)
 		res, err := srv.Stop(ctx, sid, "", "COMPLETED", false, false)

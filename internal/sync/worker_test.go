@@ -700,6 +700,10 @@ func TestWorker_UpdateStatus_ResolvesRoles(t *testing.T) {
 		{"status_map reopen override", SyncPayload{Role: "reopen"}, config.StatusMapConfig{Start: "in progress", Reopen: "testing/qa"}, "", "testing/qa"},
 		{"review", SyncPayload{Role: "review"}, config.StatusMapConfig{}, "", "in review"},
 		{"status_map review override", SyncPayload{Role: "review"}, config.StatusMapConfig{Review: "testing/qa"}, "", "testing/qa"},
+		{"explicit target_status override", SyncPayload{Role: "complete", TargetStatus: "in review"}, config.StatusMapConfig{}, "", "in review"},
+		{"unknown target_status falls back to the role", SyncPayload{Role: "complete", TargetStatus: "QA"}, config.StatusMapConfig{}, "", "complete"},
+		{"target_status role alias honors status_map", SyncPayload{Role: "complete", TargetStatus: "review"}, config.StatusMapConfig{Review: "testing/qa"}, "", "testing/qa"},
+		{"review won't follow a target_status to done", SyncPayload{Role: "review", TargetStatus: "complete"}, config.StatusMapConfig{}, "", "in review"},
 	}
 
 	for i, tt := range tests {

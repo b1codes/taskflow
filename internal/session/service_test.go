@@ -1005,4 +1005,115 @@ func TestService_StatusRoles(t *testing.T) {
 			t.Errorf("expected roles %v, got %v", want, got)
 		}
 	})
+
+	for _, status := range []string{"IN_REVIEW", "in_review", "review"} {
+		t.Run("stopping with "+status+" marks session completed and queues review", func(t *testing.T) {
+			store := newMockStore()
+			srv := NewService(store, &mockGit{}, nil)
+
+			res, err := srv.Start(ctx, "task-in-review", t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+			stopRes, err := srv.Stop(ctx, res.Session.ID, "", status, false, false)
+			if err != nil {
+				t.Fatalf("Stop(%s) failed: %v", status, err)
+			}
+			if stopRes.Status != StatusCompleted {
+				t.Errorf("expected session status COMPLETED, got %s", stopRes.Status)
+			}
+			want := []StatusRole{RoleStart, RoleReview}
+			if got := store.statusRoles(t); !slices.Equal(got, want) {
+				t.Errorf("expected roles %v, got %v", want, got)
+			}
+		})
+	}
+
+	for _, status := range []string{"ABANDONED", "abandoned", "cancelled", "canceled"} {
+		t.Run("stopping with "+status+" archives session and queues archive", func(t *testing.T) {
+			store := newMockStore()
+			srv := NewService(store, &mockGit{}, nil)
+
+			res, err := srv.Start(ctx, "task-abandoned", t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+			stopRes, err := srv.Stop(ctx, res.Session.ID, "", status, false, false)
+			if err != nil {
+				t.Fatalf("Stop(%s) failed: %v", status, err)
+			}
+			if stopRes.Status != StatusArchived {
+				t.Errorf("expected session status ARCHIVED, got %s", stopRes.Status)
+			}
+			want := []StatusRole{RoleStart, RoleArchive}
+			if got := store.statusRoles(t); !slices.Equal(got, want) {
+				t.Errorf("expected roles %v, got %v", want, got)
+			}
+		})
+	}
+
+	t.Run("StopWithTaskStatus queues target_status override", func(t *testing.T) {
+		store := newMockStore()
+		srv := NewService(store, &mockGit{}, nil)
+
+		res, err := srv.Start(ctx, "task-target-status", t.TempDir(), false)
+		if err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		if _, err := srv.StopWithTaskStatus(ctx, res.Session.ID, "", "COMPLETED", "testing/qa", false, false); err != nil {
+			t.Fatalf("StopWithTaskStatus failed: %v", err)
+		}
+		var updatePayloads []string
+		for _, op := range store.syncOps {
+			if op.Operation == "UPDATE_STATUS" {
+				updatePayloads = append(updatePayloads, op.Payload)
+			}
+		}
+		want := []string{`{"role":"start"}`, `{"role":"complete","target_status":"testing/qa"}`}
+		if !slices.Equal(updatePayloads, want) {
+			t.Errorf("expected UPDATE_STATUS payloads %v, got %v", want, updatePayloads)
+		}
+	})
+
+	// A target only rides on a completing stop: elsewhere it would be dropped
+	// (pausing) or move an archived task past the completion gate.
+	for _, tc := range []struct {
+		name   string
+		first  string // stops the session once before the stop under test
+		status string
+	}{
+		{"pausing", "", "PAUSED"},
+		{"archiving", "", "ARCHIVED"},
+		{"abandoning", "", "abandoned"},
+		{"archiving a completed session", "COMPLETED", "ARCHIVED"},
+	} {
+		t.Run("StopWithTaskStatus refuses a target when "+tc.name, func(t *testing.T) {
+			store := newMockStore()
+			srv := NewService(store, &mockGit{}, nil)
+
+			res, err := srv.Start(ctx, "task-target-refused", t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+			sid := res.Session.ID
+			if tc.first != "" {
+				if _, err := srv.Stop(ctx, sid, "", tc.first, false, false); err != nil {
+					t.Fatalf("Stop(%s) failed: %v", tc.first, err)
+				}
+			}
+			before := store.sessions[sid].Status
+			roles := store.statusRoles(t)
+
+			_, err = srv.StopWithTaskStatus(ctx, sid, "", tc.status, "complete", false, false)
+			if !errors.Is(err, ErrTargetTaskStatus) {
+				t.Fatalf("expected ErrTargetTaskStatus, got %v", err)
+			}
+			if got := store.sessions[sid].Status; got != before {
+				t.Errorf("session status = %s, want it left %s", got, before)
+			}
+			if got := store.statusRoles(t); !slices.Equal(got, roles) {
+				t.Errorf("roles = %v, want %v (nothing queued)", got, roles)
+			}
+		})
+	}
 }

@@ -26,8 +26,11 @@ type Worker struct {
 
 type SyncPayload struct {
 	CommentText string `json:"comment_text,omitempty"`
-	// Role is the lifecycle role (start, complete, archive) for UPDATE_STATUS.
+	// Role is the lifecycle role (start, complete, review, archive) for UPDATE_STATUS.
 	Role string `json:"role,omitempty"`
+	// TargetStatus is an explicit ClickUp status the caller asked for on
+	// stop, resolved for Role (see clickup.ResolveTargetStatus).
+	TargetStatus string `json:"target_status,omitempty"`
 	// StatusType is the pre-role UPDATE_STATUS payload; still read so ops
 	// queued by an older taskflow version resolve after upgrading.
 	StatusType string `json:"status_type,omitempty"`
@@ -353,7 +356,7 @@ func (w *Worker) updateStatus(ctx context.Context, taskID string, payload SyncPa
 		return err
 	}
 
-	err = clickup.ApplyStatusRole(ctx, w.store, w.clickup, taskID, role, w.statusMap)
+	err = clickup.ApplyTargetStatus(ctx, w.store, w.clickup, taskID, role, payload.TargetStatus, w.statusMap)
 	if errors.Is(err, clickup.ErrSkipStatusChange) {
 		fmt.Fprintf(os.Stderr, "[sync] leaving task %s status unchanged: %v\n", taskID, err)
 		return nil

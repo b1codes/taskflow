@@ -172,12 +172,39 @@ func (s *Service) queueSync(ctx context.Context, taskID, operation string, paylo
 }
 
 // enqueueStatus queues a ClickUp status change for a lifecycle role (start,
-// reopen, complete, archive). The sync worker maps the role onto a status of
-// the task's list, so no status names or types are decided here.
-func (s *Service) enqueueStatus(ctx context.Context, taskID string, role StatusRole) {
+// reopen, complete, review, archive). The sync worker maps the role onto a
+// status of the task's list, so no status names or types are decided here.
+// targetStatus is an explicit status the caller asked for on stop, which the
+// worker resolves for the role (falling back to the role when it can't).
+func (s *Service) enqueueStatus(ctx context.Context, taskID string, role StatusRole, targetStatus string) {
 	s.enqueueSync(ctx, taskID, "UPDATE_STATUS", struct {
-		Role StatusRole `json:"role"`
-	}{Role: role})
+		Role         StatusRole `json:"role"`
+		TargetStatus string     `json:"target_status,omitempty"`
+	}{Role: role, TargetStatus: targetStatus})
+}
+
+// ErrTargetTaskStatus means a stop named a ClickUp target status it can't
+// apply: only a stop that completes the session moves the task.
+var ErrTargetTaskStatus = errors.New("target task status only applies when completing a session")
+
+// normalizeStopTarget maps a caller's target status string (from CLI or MCP)
+// to the session Status and an optional StatusRole override: RoleReview for
+// "in_review"/"review", which completes the session but moves the task to
+// review. "abandoned"/"cancelled" are spellings of ARCHIVED, whose role
+// (archive) needs no override.
+func normalizeStopTarget(targetStatus string) (Status, StatusRole) {
+	switch strings.ToUpper(strings.TrimSpace(targetStatus)) {
+	case "", "COMPLETED", "COMPLETE", "DONE":
+		return StatusCompleted, ""
+	case "IN_REVIEW", "IN REVIEW", "REVIEW":
+		return StatusCompleted, RoleReview
+	case "PAUSED", "PAUSE":
+		return StatusPaused, ""
+	case "ARCHIVED", "ARCHIVE", "ABANDONED", "ABANDON", "CANCELLED", "CANCELED", "CANCEL":
+		return StatusArchived, ""
+	default:
+		return Status(targetStatus), ""
+	}
 }
 
 // stopStatusRole returns the ClickUp status role for a Stop transition, or ""
@@ -337,7 +364,7 @@ func (s *Service) Start(ctx context.Context, taskID, projectPath string, autoGit
 		fmt.Fprintf(os.Stderr, "[session] warning: failed to write session lock in %s: %v\n", projectPath, err)
 	}
 
-	s.enqueueStatus(ctx, sess.TaskID, role)
+	s.enqueueStatus(ctx, sess.TaskID, role, "")
 
 	// 6. Build contract
 	contract, err := s.BuildAgenticContract(ctx, sess, gitCtx, isResumed)
@@ -698,6 +725,16 @@ func (s *Service) List(ctx context.Context, filter SessionFilter) ([]*SessionSum
 // reminder counts, unless force is set (a human override, recorded as a
 // decision). Pausing and archiving are never gated.
 func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus string, autoGit, force bool) (*StopResult, error) {
+	return s.StopWithTaskStatus(ctx, sessionID, summary, targetStatus, "", autoGit, force)
+}
+
+// StopWithTaskStatus is Stop with an explicit ClickUp status for the linked
+// task (targetTaskStatus, "" for none), which the sync worker resolves for
+// the stop's role (see clickup.ResolveTargetStatus). Only a stop that
+// completes the session takes one (else ErrTargetTaskStatus, before anything
+// is written), and under the review gate it can't move the task to a done or
+// closed status.
+func (s *Service) StopWithTaskStatus(ctx context.Context, sessionID, summary, targetStatus, targetTaskStatus string, autoGit, force bool) (*StopResult, error) {
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session: %w", err)
@@ -706,13 +743,23 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		return nil, fmt.Errorf("failed to get session: %w", ErrSessionNotFound)
 	}
 
-	tStatus := Status(targetStatus)
-	if tStatus == "" {
-		tStatus = StatusCompleted
-	}
+	tStatus, roleOverride := normalizeStopTarget(targetStatus)
 
 	if err := ValidateTransition(sess.Status, tStatus); err != nil {
 		return nil, fmt.Errorf("invalid transition: %w", err)
+	}
+
+	fromStatus := sess.Status
+	role := stopStatusRole(fromStatus, tStatus)
+	if roleOverride != "" && role != "" {
+		role = roleOverride
+	}
+	// A target status rides on the completing role, which the gate below
+	// decides; any other stop either leaves the task alone or archives it,
+	// and a target there would be ignored or get the task past the gate.
+	targetTaskStatus = strings.TrimSpace(targetTaskStatus)
+	if targetTaskStatus != "" && (tStatus != StatusCompleted || role == "") {
+		return nil, fmt.Errorf("%w (stopping %s as %s)", ErrTargetTaskStatus, sess.Status, tStatus)
 	}
 
 	// A finished session's obligations are final; only evaluate work that
@@ -730,8 +777,6 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		}
 	}
 
-	fromStatus := sess.Status
-	role := stopStatusRole(fromStatus, tStatus)
 	res := &StopResult{SessionID: sessionID, Status: tStatus}
 	// The gate runs before anything is written, so a blocked stop leaves the
 	// session as it was, its obligations and their reminder counts included.
@@ -752,6 +797,9 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 		}
 		res.Gate = gate
 		if gateRole != "" && role != "" {
+			// The target goes with the review role, which the worker never
+			// lets move the task to a done or closed status, so a target
+			// that is itself a review/QA stage is still honored.
 			role = gateRole
 		}
 	}
@@ -783,7 +831,7 @@ func (s *Service) Stop(ctx context.Context, sessionID, summary, targetStatus str
 
 	// 1. Enqueue status update
 	if role != "" {
-		s.enqueueStatus(ctx, sess.TaskID, role)
+		s.enqueueStatus(ctx, sess.TaskID, role, targetTaskStatus)
 	}
 
 	// 2. Enqueue session summary comment
