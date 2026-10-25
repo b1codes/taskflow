@@ -118,6 +118,12 @@ taskflow init
 
 Taskflow exposes its capabilities over stdio via the Model Context Protocol (MCP).
 
+In the configs below, replace `/absolute/path/to/taskflow` with the full path to your binary. MCP clients don't expand `~` or `$HOME`, and apps launched outside a terminal don't see your shell's `PATH`. After `go install`, print the path with:
+
+```bash
+echo "$(go env GOPATH)/bin/taskflow"
+```
+
 ### Antigravity Integration
 
 Add Taskflow to your global Antigravity MCP configuration (`~/.gemini/config/mcp_config.json`):
@@ -126,7 +132,7 @@ Add Taskflow to your global Antigravity MCP configuration (`~/.gemini/config/mcp
 {
   "mcpServers": {
     "taskflow": {
-      "command": "/Users/brandonlamer-connolly/devkits/go/bin/taskflow",
+      "command": "/absolute/path/to/taskflow",
       "args": ["serve"],
       "env": {
         "CLICKUP_API_KEY": "pk_your_clickup_api_key"
@@ -144,7 +150,7 @@ Add Taskflow to your Claude MCP config (e.g. `claude_desktop_config.json`):
 {
   "mcpServers": {
     "taskflow": {
-      "command": "taskflow",
+      "command": "/absolute/path/to/taskflow",
       "args": ["serve"]
     }
   }

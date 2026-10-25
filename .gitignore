@@ -28,6 +28,12 @@ go.work.sum
 # env file
 .env
 
+# Personal agent context (b1CodingTool local layer and its compiled outputs)
+.agents/local/
+CLAUDE.local.md
+AGENTS.override.md
+.agents/rules/local.md
+
 # Editor/IDE
 # .idea/
 # .vscode/
